@@ -2238,7 +2238,8 @@ The model contains all inputs needed to render the graphical header."
       (:mode-name . ,mode-name)
       (:directory . ,default-directory)
       (:frame-width . ,(frame-pixel-width))
-      (:font-height . ,(default-font-height))
+      (:font-height . ,(frame-char-height))
+      (:font-size . ,(font-get (face-attribute 'default :font) :size))
       (:background-mode . ,(frame-parameter nil 'background-mode))
       (:status-frame . ,(agent-shell--status-frame))
       (:qualifier . ,qualifier)
@@ -2294,18 +2295,23 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                               (setq agent-shell--header-cache (make-hash-table :test #'equal)))
                             (map-elt agent-shell--header-cache cache-key))))
              (or cached
-                 (let* ((image-height (* 3 (map-elt header-model :font-height)))
+                 (let* ((char-height (map-elt header-model :font-height))
+                        (font-size (map-elt header-model :font-size))
+                        (has-bindings (or bindings qualifier))
+                        (image-height (* 3 char-height))
                         (image-width image-height)
-                        (text-height 25)
+                        (text-height char-height)
                         (row-spacing 0)  ; Spacing between icon/text rows and bindings row
                         (icon-text-row-height image-height)
-                        (bindings-row-height (if (or bindings qualifier) text-height 0))
-                        (total-height (+ icon-text-row-height bindings-row-height 10))
+                        (bindings-row-height (if has-bindings text-height 0))
+                        (total-height (+ icon-text-row-height bindings-row-height text-height))
                         ;; Y positions for each row (baseline positions for text)
                         (icon-y 0)
-                        (icon-text-y text-height)
-                        ;; Bindings positioned right after the bottom text (2 text lines) plus spacing
-                        (bindings-y (+ (* 3 text-height) row-spacing))
+                        (icon-text-y (if has-bindings
+                                         char-height
+                                       (+ char-height (/ (- char-height font-size) 2))))
+                        ;; Bindings positioned below the icon area
+                        (bindings-y (+ image-height font-size row-spacing))
                         (svg (svg-create (map-elt header-model :frame-width) total-height))
                         (icon-filename
                          (if (map-elt header-model :icon-name)
@@ -2321,7 +2327,8 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                    ;; Top text line
                    (svg--append svg (let ((text-node (dom-node 'text
                                                                `((x . ,(+ image-width 10))
-                                                                 (y . ,icon-text-y)))))
+                                                                 (y . ,icon-text-y)
+                                                                 (font-size . ,font-size)))))
                                       ;; Agent name
                                       (dom-append-child text-node
                                                         (dom-node 'tspan
@@ -2366,12 +2373,14 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                    ;; Bottom text line
                    (svg-text svg (string-remove-suffix "/" (abbreviate-file-name (map-elt header-model :directory)))
                              :x (+ image-width 10) :y (+ icon-text-y text-height)
+                             :font-size font-size
                              :fill (face-attribute 'font-lock-string-face :foreground))
                    ;; Bindings row (last row if bindings or qualifier present)
                    (when (or bindings qualifier)
                      (svg--append svg (let ((text-node (dom-node 'text
                                                                  `((x . 0)
-                                                                   (y . ,bindings-y))))
+                                                                   (y . ,bindings-y)
+                                                                   (font-size . ,font-size))))
                                             (first t))
                                         ;; Add qualifier if present
                                         (when qualifier
