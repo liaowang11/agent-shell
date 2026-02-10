@@ -342,6 +342,10 @@ NAVIGATION controls navigability:
     (when body
       (when (or label-left label-right)
         (insert "\n\n"))
+      ;; Drop any leading body newlines as newlines are
+      ;; already inserted between labels and body.
+      (when (string-prefix-p "\n" body)
+        (setq body (string-trim-left body "\n")))
       ;; Never leave more than two trailing newlines.
       (when (string-suffix-p "\n\n" body)
         (setq body (concat (string-trim-right body) "\n\n")))
