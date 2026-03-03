@@ -1356,14 +1356,21 @@ COMMAND, when present, may be a shell command string or an argv vector."
                  ;; block-id must be the same as the one used as
                  ;; agent-shell--update-fragment param by "session/request_permission".
                  (agent-shell--delete-fragment :state state :block-id (format "permission-%s" (map-nested-elt acp-notification '(params update toolCallId)))))
-               (let ((tool-call-labels (agent-shell-make-tool-call-label
-                                        state (map-nested-elt acp-notification '(params update toolCallId)))))
+               (let* ((tool-call-labels (agent-shell-make-tool-call-label state (map-nested-elt acp-notification '(params update toolCallId))))
+                      (saved-command (map-nested-elt state `(:tool-calls
+                                                             ,(map-nested-elt acp-notification '(params update toolCallId))
+                                                             :command)))
+                      ;; Prepend fenced command to body.
+                      (command-block (when saved-command
+                                      (concat "```console\n" saved-command "\n```"))))
                  (agent-shell--update-fragment
                   :state state
                   :block-id (map-nested-elt acp-notification '(params update toolCallId))
                   :label-left (map-elt tool-call-labels :status)
                   :label-right (map-elt tool-call-labels :title)
-                  :body (string-trim body-text)
+                  :body (if command-block
+                            (concat command-block "\n\n" (string-trim body-text))
+                          (string-trim body-text))
                   :expanded agent-shell-tool-use-expand-by-default)))
              (map-put! state :last-entry-type "tool_call_update")))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "available_commands_update")
@@ -2073,23 +2080,29 @@ With INCLUDE-PROJECT
 
 Returns propertized labels in :status and :title propertized."
   (when-let ((tool-call (map-nested-elt state `(:tool-calls ,tool-call-id))))
-    `((:status . ,(agent-shell--make-status-kind-label
-                   :status (map-elt tool-call :status)
-                   :kind (map-elt tool-call :kind)))
-      (:title . ,(let ((title (when-let ((text (agent-shell--shorten-paths
-                                                (map-elt tool-call :title))))
-                                ;; Strip kind prefix from title to avoid
-                                ;; redundancy "[read] Read file.el" becomes
-                                ;; "[read] file.el"
-                                (if (and (map-elt tool-call :kind)
-                                         (string-match-p (concat "\\`" (regexp-quote
-                                                                       (map-elt tool-call :kind)) " ")
-                                                         (downcase text)))
-                                    (string-trim-left (substring text (length (map-elt tool-call :kind))))
-                                  text)))
-                       (description (agent-shell--shorten-paths
-                                     (map-elt tool-call :description))))
-                   (cond ((and title description
+    (let* ((title (when-let ((text (agent-shell--shorten-paths
+                                    (map-elt tool-call :title)))
+                            ;; Execute commands go to body instead; use description as title.
+                            ((not (equal (map-elt tool-call :kind) "execute"))))
+                    ;; Strip kind prefix from title to avoid
+                    ;; redundancy "[read] Read file.el" becomes
+                    ;; "[read] file.el"
+                    (if (and (map-elt tool-call :kind)
+                             (string-match-p (concat "\\`" (regexp-quote
+                                                           (map-elt tool-call :kind)) " ")
+                                             (downcase text)))
+                        (string-trim-left (substring text (length (map-elt tool-call :kind))))
+                      text)))
+           (description (or (agent-shell--shorten-paths
+                             (map-elt tool-call :description))
+                            ;; Fall back to the first line of the command when
+                            ;; description is missing for execute tool calls.
+                            (when (equal (map-elt tool-call :kind) "execute")
+                              (seq-first (split-string (or (map-elt tool-call :title) "") "\n"))))))
+      `((:status . ,(agent-shell--make-status-kind-label
+                     :status (map-elt tool-call :status)
+                     :kind (map-elt tool-call :kind)))
+        (:title . ,(cond ((and title description
                                (not (equal (string-remove-prefix "`" (string-remove-suffix "`" (string-trim title)))
                                            (string-remove-prefix "`" (string-remove-suffix "`" (string-trim description))))))
                           (concat
@@ -2364,10 +2377,12 @@ by default, RENDER-BODY-IMAGES to enable inline image rendering in body."
   ;; Convert non-standard multiline single-backtick code spans to fenced
   ;; code blocks so markdown-overlays can recognize them as source blocks,
   ;; but only for labels that start with `.
-  (when (and label-right (string-match-p
-                          (rx "`" (zero-or-more (not (any "\n`")))
-                              "\n")
-                          label-right))
+  (when (and label-right
+             (not (string-match-p (rx "```") label-right))
+             (string-match-p
+              (rx "`" (zero-or-more (not (any "\n`")))
+                  "\n")
+              label-right))
     (setq label-right
           (replace-regexp-in-string
            (rx "`"
@@ -4415,17 +4430,24 @@ For example:
                    map))
          (title (let* ((title (map-nested-elt acp-request '(params toolCall title)))
                        (command (agent-shell--tool-call-command-to-string
-                                 (map-nested-elt acp-request '(params toolCall rawInput command)))))
-                  ;; Some agents don't include the command in the
-                  ;; permission/tool call title, so it's hard to know
-                  ;; what the permission is actually allowing.
-                  ;; Display command if needed.
-                  (if (and (stringp title)
-                           (stringp command)
-                           (not (string-empty-p command))
-                           (string-match-p (regexp-quote command) title))
-                      title
-                    (or command title))))
+                                 (map-nested-elt acp-request '(params toolCall rawInput command))))
+                       ;; Some agents don't include the command in the
+                       ;; permission/tool call title, so it's hard to know
+                       ;; what the permission is actually allowing.
+                       ;; Display command if needed.
+                       (text (if (and (stringp title)
+                                      (stringp command)
+                                      (not (string-empty-p command))
+                                      (string-match-p (regexp-quote command) title))
+                                 title
+                               (or command title))))
+                  ;; Fence execute commands so markdown-overlays
+                  ;; renders them verbatim, not as markdown.
+                  (if (and text
+                           (equal text command)
+                           (equal (map-nested-elt acp-request '(params toolCall kind)) "execute"))
+                      (concat "```console\n" text "\n```")
+                    text)))
          (diff-button (when diff
                         (agent-shell--make-permission-button
                          :text "View (v)"
@@ -4515,8 +4537,9 @@ MESSAGE-TEXT: Optional message to display after sending the response."
     ;; block-id must be the same as the one used as
     ;; agent-shell--update-fragment param by "session/request_permission".
     (agent-shell--delete-fragment :state state :block-id (format "permission-%s" tool-call-id))
-    (map-put! state :tool-calls
-              (map-delete (map-elt state :tool-calls) tool-call-id))
+    ;; Note: Tool call data is no longer deleted here intentionally.
+    ;; Subsequent tool_call_update notifications still need the data.
+    ;; It gets cleared at end of turn with all tool calls.
     (agent-shell--emit-event
      :event 'permission-response
      :data (list (cons :request-id request-id)
@@ -4811,7 +4834,8 @@ Returns an alist with insertion details or nil otherwise:
                 (insert text)
                 (setq insert-end (point))
                 (narrow-to-region insert-start insert-end)
-                (let ((markdown-overlays-highlight-blocks agent-shell-highlight-blocks))
+                (let ((markdown-overlays-highlight-blocks agent-shell-highlight-blocks)
+                      (markdown-overlays-render-images nil))
                   (markdown-overlays-put))))
             (when submit
               (shell-maker-submit)))
