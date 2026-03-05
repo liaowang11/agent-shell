@@ -608,7 +608,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-session-resume nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
-        (cons :active-request nil)
+        (cons :active-request-count 0)
         (cons :pending-requests nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
@@ -1156,7 +1156,7 @@ COMMAND, when present, may be a shell command string or an argv vector."
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
            ;; Notification is out of context (session/prompt finished).
            ;; Cannot derive where to display, so show in minibuffer.
-           (if (not (map-elt state :active-request))
+           (if (zerop (map-elt state :active-request-count))
                (message "%s %s (stale, consider reporting to ACP agent)"
                         (agent-shell--make-status-kind-label
                          :status (map-nested-elt acp-notification '(params update status))
@@ -1208,7 +1208,7 @@ COMMAND, when present, may be a shell command string or an argv vector."
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_thought_chunk")
            ;; Notification is out of context (session/prompt finished).
            ;; Cannot derive where to display, so show in minibuffer.
-           (if (not (map-elt state :active-request))
+           (if (zerop (map-elt state :active-request-count))
                (message "%s %s (stale, consider reporting to ACP agent): %s"
                         agent-shell-thought-process-icon
                         (propertize "Thought process" 'face font-lock-doc-markup-face)
@@ -1238,7 +1238,7 @@ COMMAND, when present, may be a shell command string or an argv vector."
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_message_chunk")
            ;; Notification is out of context (session/prompt finished).
            ;; Cannot derive where to display, so show in minibuffer.
-           (if (not (map-elt state :active-request))
+           (if (zerop (map-elt state :active-request-count))
                (message "Agent message (stale, consider reporting to ACP agent): %s"
                         (truncate-string-to-width (map-nested-elt acp-notification '(params update content text)) 100))
              (unless (equal (map-elt state :last-entry-type) "agent_message_chunk")
@@ -1298,7 +1298,7 @@ COMMAND, when present, may be a shell command string or an argv vector."
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call_update")
            ;; Notification is out of context (session/prompt finished).
            ;; Cannot derive where to display, so show in minibuffer.
-           (if (not (map-elt state :active-request))
+           (if (zerop (map-elt state :active-request-count))
                (message "%s %s (stale, consider reporting to ACP agent)"
                         (agent-shell--make-status-kind-label
                          :status (map-nested-elt acp-notification '(params update status))
@@ -3285,24 +3285,26 @@ DATA is an optional alist of event-specific data."
     nil))
 
 (cl-defun agent-shell--send-request (&key state client request buffer on-success on-failure sync)
-  "Send ACP REQUEST, tracking it in STATE as :active-request.
+  "Send ACP REQUEST, tracking it in STATE via :active-request-count.
 
-Wraps `acp-send-request' so that :active-request is non-nil while a
-request is in-flight and cleared on success or failure.
+Wraps `acp-send-request' so that :active-request-count is incremented
+while a request is in-flight and decremented on success or failure.
 
 CLIENT, REQUEST, BUFFER, ON-SUCCESS, ON-FAILURE, and SYNC are passed
 through to `acp-send-request'."
-  (map-put! state :active-request request)
+  (map-put! state :active-request-count (1+ (map-elt state :active-request-count)))
   (acp-send-request
    :client client
    :request request
    :buffer buffer
    :on-success (lambda (acp-response)
-                 (map-put! state :active-request nil)
+                 (map-put! state :active-request-count
+                           (1- (map-elt state :active-request-count)))
                  (when on-success
                    (funcall on-success acp-response)))
    :on-failure (lambda (acp-error raw-message)
-                 (map-put! state :active-request nil)
+                 (map-put! state :active-request-count
+                           (1- (map-elt state :active-request-count)))
                  (when on-failure
                    (funcall on-failure acp-error raw-message)))
    :sync sync))

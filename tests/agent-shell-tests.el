@@ -447,7 +447,7 @@
                              (cons :prompt-capabilities '((:embedded-context . t)))
                              (cons :buffer (current-buffer))
                              (cons :last-entry-type nil)
-                             (cons :active-request nil))))
+                             (cons :active-request-count 0))))
 
     ;; Mock acp-send-request to capture what gets sent;
     ;; stub viewport--buffer to avoid interactive shell-buffer prompt in batch.
@@ -481,7 +481,7 @@
                              (cons :prompt-capabilities '((:embedded-context . t)))
                              (cons :buffer (current-buffer))
                              (cons :last-entry-type nil)
-                             (cons :active-request nil))))
+                             (cons :active-request-count 0))))
 
     ;; Mock build-content-blocks to throw an error;
     ;; stub viewport--buffer to avoid interactive shell-buffer prompt in batch.
@@ -1028,7 +1028,7 @@ code block content
                                  (:modes . nil)))
                     (:supports-session-list . t)
                     (:supports-session-load . t)
-                    (:active-request . nil)
+                    (:active-request-count . 0)
                     (:event-subscriptions . nil))))
       (setq-local agent-shell--state state)
       (cl-letf (((symbol-function 'agent-shell--state)
@@ -1094,7 +1094,7 @@ code block content
                                  (:modes . nil)))
                     (:supports-session-list . t)
                     (:supports-session-load . t)
-                    (:active-request . nil)
+                    (:active-request-count . 0)
                     (:event-subscriptions . nil))))
       (setq-local agent-shell--state state)
       (cl-letf (((symbol-function 'agent-shell--state)
@@ -1199,7 +1199,7 @@ code block content
                                  (:modes . nil)))
                     (:supports-session-list . t)
                     (:supports-session-load . t)
-                    (:active-request . nil)
+                    (:active-request-count . 0)
                     (:event-subscriptions . nil))))
       (setq-local agent-shell--state state)
       (cl-letf (((symbol-function 'agent-shell--state)
