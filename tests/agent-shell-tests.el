@@ -726,6 +726,88 @@ code block content
   (should (= (agent-shell--longest-backtick-run "has ```` four and ``` three") 4))
   (should (= (agent-shell--longest-backtick-run "``````") 6)))
 
+(ert-deftest agent-shell--indent-markdown-headers-test ()
+  "Test `agent-shell--indent-markdown-headers'."
+  ;; Text without headers is unchanged.
+  (should (equal (agent-shell--indent-markdown-headers "no headers here")
+                 "no headers here"))
+  ;; Simple H1 becomes H3.
+  (should (equal (agent-shell--indent-markdown-headers "# Foo")
+                 "### Foo"))
+  ;; H2 becomes H4.
+  (should (equal (agent-shell--indent-markdown-headers "## Bar")
+                 "#### Bar"))
+  ;; H4 becomes H6.
+  (should (equal (agent-shell--indent-markdown-headers "#### Deep")
+                 "###### Deep"))
+  ;; H5 is capped at H6.
+  (should (equal (agent-shell--indent-markdown-headers "##### Five")
+                 "###### Five"))
+  ;; H6 stays at H6.
+  (should (equal (agent-shell--indent-markdown-headers "###### Six")
+                 "###### Six"))
+  ;; Mixed content with multiple headers.
+  (should (equal (agent-shell--indent-markdown-headers
+                  "some text\n# Heading 1\nmore text\n## Heading 2\nend")
+                 "some text\n### Heading 1\nmore text\n#### Heading 2\nend"))
+  ;; Headers inside code blocks are left unchanged.
+  (should (equal (agent-shell--indent-markdown-headers
+                  "before\n```\n# code comment\n## also code\n```\nafter")
+                 "before\n```\n# code comment\n## also code\n```\nafter"))
+  ;; Headers outside code blocks are indented, inside are not.
+  (should (equal (agent-shell--indent-markdown-headers
+                  "# Top\n```\n# Inside\n```\n# Bottom")
+                 "### Top\n```\n# Inside\n```\n### Bottom"))
+  ;; Code blocks with 4+ backticks.
+  (should (equal (agent-shell--indent-markdown-headers
+                  "````\n# Inside\n````\n# Outside")
+                 "````\n# Inside\n````\n### Outside"))
+  ;; Nested code blocks (inner fence shorter than outer).
+  (should (equal (agent-shell--indent-markdown-headers
+                  "````\n```\n# Inside\n```\n````\n# Outside")
+                 "````\n```\n# Inside\n```\n````\n### Outside"))
+  ;; Nil input returns empty string.
+  (should (equal (agent-shell--indent-markdown-headers nil) ""))
+  ;; Empty string.
+  (should (equal (agent-shell--indent-markdown-headers "") ""))
+  ;; Hash without space is not a header.
+  (should (equal (agent-shell--indent-markdown-headers "#not-a-header")
+                 "#not-a-header"))
+  ;; Simulated LLM output with mixed headers and code blocks.
+  ;; This is the primary transcript use case: an agent response containing
+  ;; its own markdown structure that must be indented to stay below the
+  ;; transcript's ## section headers.
+  (should (equal (agent-shell--indent-markdown-headers
+                  (concat "Here's my analysis:\n"
+                          "# Summary\n"
+                          "Some text\n"
+                          "## Details\n"
+                          "More text\n"
+                          "```elisp\n"
+                          "# this is a comment in code\n"
+                          "(defun foo () nil)\n"
+                          "```\n"
+                          "### Conclusion\n"
+                          "Final thoughts"))
+                 (concat "Here's my analysis:\n"
+                          "### Summary\n"
+                          "Some text\n"
+                          "#### Details\n"
+                          "More text\n"
+                          "```elisp\n"
+                          "# this is a comment in code\n"
+                          "(defun foo () nil)\n"
+                          "```\n"
+                          "##### Conclusion\n"
+                          "Final thoughts")))
+  ;; Tool call entries (### Tool Call) are NOT passed through this function
+  ;; because they are code-generated, not LLM output.  Verify that if
+  ;; they hypothetically were, they would be indented -- this confirms the
+  ;; function is agnostic and the correct behavior comes from applying it
+  ;; only to LLM text.
+  (should (equal (agent-shell--indent-markdown-headers "### Tool Call [completed]: grep")
+                 "##### Tool Call [completed]: grep")))
+
 (ert-deftest agent-shell-mcp-servers-test ()
   "Test `agent-shell-mcp-servers' function normalization."
   ;; Test with nil

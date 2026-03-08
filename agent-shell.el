@@ -1220,7 +1220,8 @@ COMMAND, when present, may be a shell command string or an argv vector."
                 :text (format "## Agent's Thoughts (%s)\n\n" (format-time-string "%F %T"))
                 :file-path agent-shell--transcript-file))
              (agent-shell--append-transcript
-              :text (map-nested-elt acp-notification '(params update content text))
+              :text (agent-shell--indent-markdown-headers
+                     (map-nested-elt acp-notification '(params update content text)))
               :file-path agent-shell--transcript-file)
              (agent-shell--update-fragment
               :state state
@@ -1246,8 +1247,13 @@ COMMAND, when present, may be a shell command string or an argv vector."
                (agent-shell--append-transcript
                 :text (format "\n## Agent (%s)\n\n" (format-time-string "%F %T"))
                 :file-path agent-shell--transcript-file))
+             ;; Indent markdown headers in LLM output so they nest
+             ;; below the transcript's ## section headers.  Applied
+             ;; per-chunk: if a header is split across chunks it may
+             ;; not be indented (graceful degradation).
              (agent-shell--append-transcript
-              :text (map-nested-elt acp-notification '(params update content text))
+              :text (agent-shell--indent-markdown-headers
+                     (map-nested-elt acp-notification '(params update content text)))
               :file-path agent-shell--transcript-file)
              (agent-shell--update-fragment
               :state state
@@ -1269,7 +1275,9 @@ COMMAND, when present, may be a shell command string or an argv vector."
                 :text (format "## User (%s)\n\n" (format-time-string "%F %T"))
                 :file-path agent-shell--transcript-file))
              (agent-shell--append-transcript
-              :text (format "> %s\n" (map-nested-elt acp-notification '(params update content text)))
+              :text (format "> %s\n"
+                            (agent-shell--indent-markdown-headers
+                             (map-nested-elt acp-notification '(params update content text))))
               :file-path agent-shell--transcript-file)
              (agent-shell--update-text
               :state state
@@ -4112,7 +4120,7 @@ If FILE-PATH is not an image, returns nil."
     (agent-shell--append-transcript
      :text (format "## User (%s)\n\n%s\n\n"
                    (format-time-string "%F %T")
-                   prompt)
+                   (agent-shell--indent-markdown-headers prompt))
      :file-path agent-shell--transcript-file)
 
     (when-let ((viewport-buffer (agent-shell-viewport--buffer
@@ -5789,6 +5797,45 @@ Returns the file path, or nil if disabled."
         (error
          (message "Failed to initialize transcript: %S" err))))
     filepath))
+
+(defun agent-shell--indent-markdown-headers (text)
+  "Indent markdown headers in TEXT by 2 levels for transcript hierarchy.
+
+Increases the level of all markdown headers while leaving content
+inside code blocks unchanged.  Headers are capped at level 6
+since markdown doesn't support deeper levels.
+
+For example:
+
+  (agent-shell--indent-markdown-headers \"# Foo\")
+    => \"### Foo\"
+  (agent-shell--indent-markdown-headers \"##### Deep\")
+    => \"###### Deep\""
+  (unless (stringp text)
+    (setq text (or text "")))
+  (let ((lines (split-string text "\n"))
+        (in-code-block nil)
+        (result nil))
+    (dolist (line lines)
+      (cond
+       ;; Toggle code block state on fence lines (3+ backticks).
+       ((string-match "\\`\\(```+\\)" line)
+        (if in-code-block
+            (when (>= (length (match-string 1 line)) in-code-block)
+              (setq in-code-block nil))
+          (setq in-code-block (length (match-string 1 line))))
+        (push line result))
+       ;; Outside code blocks, indent header lines.
+       ((and (not in-code-block)
+             (string-match "\\`\\(#+\\) " line))
+        (let* ((hashes (match-string 1 line))
+               (new-level (min 6 (+ (length hashes) 2)))
+               (new-hashes (make-string new-level ?#)))
+          (push (replace-regexp-in-string "\\`#+ " (concat new-hashes " ") line)
+                result)))
+       (t (push line result))))
+    (mapconcat #'identity (nreverse result) "\n")))
+
 
 (cl-defun agent-shell--append-transcript (&key text file-path)
   "Append TEXT to the transcript at FILE-PATH."
