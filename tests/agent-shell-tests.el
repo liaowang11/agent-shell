@@ -447,7 +447,7 @@
                              (cons :prompt-capabilities '((:embedded-context . t)))
                              (cons :buffer (current-buffer))
                              (cons :last-entry-type nil)
-                             (cons :active-request-count 0))))
+                             (cons :active-requests nil))))
 
     ;; Mock acp-send-request to capture what gets sent;
     ;; stub viewport--buffer to avoid interactive shell-buffer prompt in batch.
@@ -481,7 +481,7 @@
                              (cons :prompt-capabilities '((:embedded-context . t)))
                              (cons :buffer (current-buffer))
                              (cons :last-entry-type nil)
-                             (cons :active-request-count 0))))
+                             (cons :active-requests nil))))
 
     ;; Mock build-content-blocks to throw an error;
     ;; stub viewport--buffer to avoid interactive shell-buffer prompt in batch.
@@ -514,6 +514,47 @@
         (should prompt)
         ;; Should be a single text block with the original prompt
         (should (equal prompt '[((type . "text") (text . "Test prompt with @file.txt"))]))))))
+
+(ert-deftest agent-shell--send-command-emits-turn-complete-event-test ()
+  "Test `agent-shell--send-command' emits turn-complete on success."
+  (let ((received-events nil)
+        (captured-on-success nil)
+        (agent-shell--state (list (cons :buffer (current-buffer))
+                                  (cons :event-subscriptions nil)
+                                  (cons :client 'test-client)
+                                  (cons :session (list (cons :id "test-session")))
+                                  (cons :last-entry-type nil)
+                                  (cons :tool-calls nil)
+                                  (cons :usage (list (cons :total-tokens 0)))))
+        (agent-shell-show-busy-indicator nil)
+        (agent-shell-show-usage-at-turn-end nil))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq captured-on-success (plist-get args :on-success))))
+              ((symbol-function 'shell-maker-finish-output)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--process-pending-request)
+               (lambda (&rest _))))
+      (agent-shell-subscribe-to
+       :shell-buffer (current-buffer)
+       :event 'turn-complete
+       :on-event (lambda (event)
+                   (push event received-events)))
+      (agent-shell--send-command
+       :prompt "Hello"
+       :shell-buffer (current-buffer))
+      ;; Simulate the ACP response arriving
+      (should captured-on-success)
+      (funcall captured-on-success
+               `((stopReason . "end_turn")
+                 (usage . ((totalTokens . 1500)))))
+      (should (= (length received-events) 1))
+      (let ((data (map-elt (car received-events) :data)))
+        (should (equal (map-elt data :stop-reason) "end_turn"))
+        (should (equal (map-elt (map-elt data :usage) :total-tokens)
+                       1500))))))
 
 (ert-deftest agent-shell--format-diff-as-text-test ()
   "Test `agent-shell--format-diff-as-text' function."
@@ -725,6 +766,88 @@ code block content
   (should (= (agent-shell--longest-backtick-run "```elisp\n(foo)\n```") 3))
   (should (= (agent-shell--longest-backtick-run "has ```` four and ``` three") 4))
   (should (= (agent-shell--longest-backtick-run "``````") 6)))
+
+(ert-deftest agent-shell--indent-markdown-headers-test ()
+  "Test `agent-shell--indent-markdown-headers'."
+  ;; Text without headers is unchanged.
+  (should (equal (agent-shell--indent-markdown-headers "no headers here")
+                 "no headers here"))
+  ;; Simple H1 becomes H3.
+  (should (equal (agent-shell--indent-markdown-headers "# Foo")
+                 "### Foo"))
+  ;; H2 becomes H4.
+  (should (equal (agent-shell--indent-markdown-headers "## Bar")
+                 "#### Bar"))
+  ;; H4 becomes H6.
+  (should (equal (agent-shell--indent-markdown-headers "#### Deep")
+                 "###### Deep"))
+  ;; H5 is capped at H6.
+  (should (equal (agent-shell--indent-markdown-headers "##### Five")
+                 "###### Five"))
+  ;; H6 stays at H6.
+  (should (equal (agent-shell--indent-markdown-headers "###### Six")
+                 "###### Six"))
+  ;; Mixed content with multiple headers.
+  (should (equal (agent-shell--indent-markdown-headers
+                  "some text\n# Heading 1\nmore text\n## Heading 2\nend")
+                 "some text\n### Heading 1\nmore text\n#### Heading 2\nend"))
+  ;; Headers inside code blocks are left unchanged.
+  (should (equal (agent-shell--indent-markdown-headers
+                  "before\n```\n# code comment\n## also code\n```\nafter")
+                 "before\n```\n# code comment\n## also code\n```\nafter"))
+  ;; Headers outside code blocks are indented, inside are not.
+  (should (equal (agent-shell--indent-markdown-headers
+                  "# Top\n```\n# Inside\n```\n# Bottom")
+                 "### Top\n```\n# Inside\n```\n### Bottom"))
+  ;; Code blocks with 4+ backticks.
+  (should (equal (agent-shell--indent-markdown-headers
+                  "````\n# Inside\n````\n# Outside")
+                 "````\n# Inside\n````\n### Outside"))
+  ;; Nested code blocks (inner fence shorter than outer).
+  (should (equal (agent-shell--indent-markdown-headers
+                  "````\n```\n# Inside\n```\n````\n# Outside")
+                 "````\n```\n# Inside\n```\n````\n### Outside"))
+  ;; Nil input returns empty string.
+  (should (equal (agent-shell--indent-markdown-headers nil) ""))
+  ;; Empty string.
+  (should (equal (agent-shell--indent-markdown-headers "") ""))
+  ;; Hash without space is not a header.
+  (should (equal (agent-shell--indent-markdown-headers "#not-a-header")
+                 "#not-a-header"))
+  ;; Simulated LLM output with mixed headers and code blocks.
+  ;; This is the primary transcript use case: an agent response containing
+  ;; its own markdown structure that must be indented to stay below the
+  ;; transcript's ## section headers.
+  (should (equal (agent-shell--indent-markdown-headers
+                  (concat "Here's my analysis:\n"
+                          "# Summary\n"
+                          "Some text\n"
+                          "## Details\n"
+                          "More text\n"
+                          "```elisp\n"
+                          "# this is a comment in code\n"
+                          "(defun foo () nil)\n"
+                          "```\n"
+                          "### Conclusion\n"
+                          "Final thoughts"))
+                 (concat "Here's my analysis:\n"
+                          "### Summary\n"
+                          "Some text\n"
+                          "#### Details\n"
+                          "More text\n"
+                          "```elisp\n"
+                          "# this is a comment in code\n"
+                          "(defun foo () nil)\n"
+                          "```\n"
+                          "##### Conclusion\n"
+                          "Final thoughts")))
+  ;; Tool call entries (### Tool Call) are NOT passed through this function
+  ;; because they are code-generated, not LLM output.  Verify that if
+  ;; they hypothetically were, they would be indented -- this confirms the
+  ;; function is agnostic and the correct behavior comes from applying it
+  ;; only to LLM text.
+  (should (equal (agent-shell--indent-markdown-headers "### Tool Call [completed]: grep")
+                 "##### Tool Call [completed]: grep")))
 
 (ert-deftest agent-shell-mcp-servers-test ()
   "Test `agent-shell-mcp-servers' function normalization."
@@ -1054,6 +1177,37 @@ code block content
                                "context from source"))))
           (kill-buffer shell-buffer))))))
 
+(ert-deftest agent-shell--on-request-emits-permission-request-event-test ()
+  "Test `agent-shell--on-request' emits permission-request event."
+  (let ((received-events nil)
+        (agent-shell--state (list (cons :buffer (current-buffer))
+                                  (cons :event-subscriptions nil)
+                                  (cons :tool-calls nil)
+                                  (cons :last-entry-type nil))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _))))
+      (agent-shell-subscribe-to
+       :shell-buffer (current-buffer)
+       :event 'permission-request
+       :on-event (lambda (event)
+                   (push event received-events)))
+      (agent-shell--on-request
+       :state agent-shell--state
+       :acp-request `((id . "req-123")
+                      (method . "session/request_permission")
+                      (params . ((toolCall . ((toolCallId . "tc-456")
+                                              (title . "Run command")
+                                              (status . "pending")
+                                              (kind . "bash")))))))
+      (should (= (length received-events) 1))
+      (let ((data (map-elt (car received-events) :data)))
+        (should (equal (map-elt data :request-id) "req-123"))
+        (should (equal (map-elt data :tool-call-id) "tc-456"))
+        (should (equal (map-elt (map-elt data :tool-call) :title)
+                       "Run command"))))))
+
 (ert-deftest agent-shell--initiate-session-prefers-list-and-load-when-supported ()
   "Test `agent-shell--initiate-session' prefers session/list + session/load."
   (with-temp-buffer
@@ -1067,7 +1221,7 @@ code block content
                                  (:modes . nil)))
                     (:supports-session-list . t)
                     (:supports-session-load . t)
-                    (:active-request-count . 0)
+                    (:active-requests)
                     (:event-subscriptions . nil))))
       (setq-local agent-shell--state state)
       (cl-letf (((symbol-function 'agent-shell--state)
@@ -1133,7 +1287,7 @@ code block content
                                  (:modes . nil)))
                     (:supports-session-list . t)
                     (:supports-session-load . t)
-                    (:active-request-count . 0)
+                    (:active-requests)
                     (:event-subscriptions . nil))))
       (setq-local agent-shell--state state)
       (cl-letf (((symbol-function 'agent-shell--state)
@@ -1238,7 +1392,7 @@ code block content
                                  (:modes . nil)))
                     (:supports-session-list . t)
                     (:supports-session-load . t)
-                    (:active-request-count . 0)
+                    (:active-requests)
                     (:event-subscriptions . nil))))
       (setq-local agent-shell--state state)
       (cl-letf (((symbol-function 'agent-shell--state)
@@ -1599,6 +1753,176 @@ code block content
         (let ((header (agent-shell--make-header agent-shell--state)))
           (should-not (string-match-p "test-session-id"
                                       (substring-no-properties header))))))))
+
+;;; Tests for agent-shell--dot-subdir-in-repo
+
+(ert-deftest agent-shell--dot-subdir-in-repo-returns-path-test ()
+  "Test that `agent-shell--dot-subdir-in-repo' returns the correct path."
+  (cl-letf (((symbol-function 'agent-shell-cwd)
+             (lambda () "/home/user/myproject")))
+    (should (equal (agent-shell--dot-subdir-in-repo "screenshots")
+                   "/home/user/myproject/.agent-shell/screenshots"))))
+
+;;; Tests for agent-shell--dot-subdir
+
+(ert-deftest agent-shell--dot-subdir-creates-directory-test ()
+  "Test that `agent-shell--dot-subdir' creates the directory."
+  (let* ((temp-dir (make-temp-file "agent-shell-test" t))
+         (expected-dir (expand-file-name ".agent-shell/screenshots" temp-dir)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () temp-dir))
+                  ((symbol-function 'agent-shell--ensure-gitignore) #'ignore))
+          (let ((agent-shell-dot-subdir-function #'agent-shell--dot-subdir-in-repo))
+            (agent-shell--dot-subdir "screenshots")
+            (should (file-directory-p expected-dir))))
+      (delete-directory temp-dir t))))
+
+(ert-deftest agent-shell--dot-subdir-returns-path-test ()
+  "Test that `agent-shell--dot-subdir' returns the resolved path."
+  (let* ((temp-dir (make-temp-file "agent-shell-test" t))
+         (expected-dir (expand-file-name ".agent-shell/screenshots" temp-dir)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () temp-dir))
+                  ((symbol-function 'agent-shell--ensure-gitignore) #'ignore))
+          (let ((agent-shell-dot-subdir-function #'agent-shell--dot-subdir-in-repo))
+            (should (equal (agent-shell--dot-subdir "screenshots") expected-dir))))
+      (delete-directory temp-dir t))))
+
+(ert-deftest agent-shell--dot-subdir-noop-if-directory-exists-test ()
+  "Test that `agent-shell--dot-subdir' does not error if the directory already exists."
+  (let* ((temp-dir (make-temp-file "agent-shell-test" t))
+         (expected-dir (expand-file-name ".agent-shell/screenshots" temp-dir)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () temp-dir))
+                  ((symbol-function 'agent-shell--ensure-gitignore) #'ignore))
+          (let ((agent-shell-dot-subdir-function #'agent-shell--dot-subdir-in-repo))
+            (make-directory expected-dir t)
+            (should (equal (agent-shell--dot-subdir "screenshots") expected-dir))
+            (should (file-directory-p expected-dir))))
+      (delete-directory temp-dir t))))
+
+(ert-deftest agent-shell--dot-subdir-uses-configured-function-test ()
+  "Test that `agent-shell--dot-subdir' delegates to `agent-shell-dot-subdir-function'."
+  (let* ((temp-dir (make-temp-file "agent-shell-test" t))
+         (custom-called-with nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () temp-dir))
+                  ((symbol-function 'agent-shell--ensure-gitignore) #'ignore))
+          (let ((agent-shell-dot-subdir-function
+                 (lambda (subdir)
+                   (setq custom-called-with subdir)
+                   (expand-file-name subdir temp-dir))))
+            (agent-shell--dot-subdir "screenshots")
+            (should (equal custom-called-with "screenshots"))))
+      (delete-directory temp-dir t))))
+
+(ert-deftest agent-shell--dot-subdir-errors-if-function-not-callable-test ()
+  "Test that `agent-shell--dot-subdir' errors when `agent-shell-dot-subdir-function' is not a function."
+  (let ((agent-shell-dot-subdir-function "not-a-function"))
+    (should-error (agent-shell--dot-subdir "screenshots") :type 'error)))
+
+(ert-deftest agent-shell--dot-subdir-errors-if-function-returns-non-string-test ()
+  "Test that `agent-shell--dot-subdir' errors when `agent-shell-dot-subdir-function' returns a non-string."
+  (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () "/tmp")))
+    (let ((agent-shell-dot-subdir-function (lambda (_subdir) nil)))
+      (should-error (agent-shell--dot-subdir "screenshots") :type 'error))
+    (let ((agent-shell-dot-subdir-function (lambda (_subdir) 42)))
+      (should-error (agent-shell--dot-subdir "screenshots") :type 'error))))
+
+(ert-deftest agent-shell--dot-subdir-errors-if-function-returns-blank-string-test ()
+  "Test that `agent-shell--dot-subdir' errors when `agent-shell-dot-subdir-function' returns a blank string."
+  (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () "/tmp")))
+    (let ((agent-shell-dot-subdir-function (lambda (_subdir) "  ")))
+      (should-error (agent-shell--dot-subdir "screenshots") :type 'error))))
+
+(ert-deftest agent-shell--on-request-calls-permission-request-handler-test ()
+  "Test `agent-shell--on-request' calls handler and :respond auto-approves."
+  (with-temp-buffer
+    (let* ((responded-option-id nil)
+           (handler-received nil)
+           (agent-shell-permission-responder-function
+            (lambda (request)
+              (setq handler-received request)
+              (when-let ((opt (seq-find
+                               (lambda (o) (equal (map-elt o :kind) "allow_once"))
+                               (map-elt request :options))))
+                (funcall (map-elt request :respond)
+                         (map-elt opt :option-id)))))
+           (state `((:buffer . ,(current-buffer))
+                    (:client . test-client)
+                    (:tool-calls . nil)
+                    (:last-entry-type . nil)
+                    (:event-subscriptions . nil))))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () state))
+                ((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell-jump-to-latest-permission-button-row)
+                 (lambda ()))
+                ((symbol-function 'agent-shell--make-tool-call-permission-text)
+                 (lambda (&rest _) "mock"))
+                ((symbol-function 'agent-shell-viewport--buffer)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'agent-shell--send-permission-response)
+                 (lambda (&rest args)
+                   (setq responded-option-id (plist-get args :option-id)))))
+        (agent-shell--on-request
+         :state state
+         :acp-request `((id . "req-1")
+                        (method . "session/request_permission")
+                        (params . ((toolCall . ((toolCallId . "tc-1")
+                                                (title . "Read file")
+                                                (status . "pending")
+                                                (kind . "read")))
+                                   (options . [((kind . "allow_once")
+                                                (name . "Allow")
+                                                (optionId . "opt-allow"))
+                                               ((kind . "reject_once")
+                                                (name . "Reject")
+                                                (optionId . "opt-reject"))])))))
+        (should handler-received)
+        (should (equal (map-elt (map-elt handler-received :tool-call) :kind) "read"))
+        (should (equal (map-elt (map-elt handler-received :tool-call) :title) "Read file"))
+        (should (= (length (map-elt handler-received :options)) 2))
+        (should (equal responded-option-id "opt-allow"))))))
+
+(ert-deftest agent-shell--on-request-handler-nil-leaves-prompt-test ()
+  "Test `agent-shell--on-request' leaves interactive prompt when handler returns nil."
+  (with-temp-buffer
+    (let* ((responded nil)
+           (agent-shell-permission-responder-function
+            (lambda (_request) nil))
+           (state `((:buffer . ,(current-buffer))
+                    (:client . test-client)
+                    (:tool-calls . nil)
+                    (:last-entry-type . nil)
+                    (:event-subscriptions . nil))))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () state))
+                ((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest _)))
+                ((symbol-function 'agent-shell-jump-to-latest-permission-button-row)
+                 (lambda ()))
+                ((symbol-function 'agent-shell--make-tool-call-permission-text)
+                 (lambda (&rest _) "mock"))
+                ((symbol-function 'agent-shell-viewport--buffer)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'agent-shell--send-permission-response)
+                 (lambda (&rest _)
+                   (setq responded t))))
+        (agent-shell--on-request
+         :state state
+         :acp-request `((id . "req-1")
+                        (method . "session/request_permission")
+                        (params . ((toolCall . ((toolCallId . "tc-1")
+                                                (title . "Run command")
+                                                (status . "pending")
+                                                (kind . "execute")))
+                                   (options . [((kind . "allow_once")
+                                                (name . "Allow")
+                                                (optionId . "opt-allow"))])))))
+        (should-not responded)
+        (should (equal (map-elt state :last-entry-type) "session/request_permission"))))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

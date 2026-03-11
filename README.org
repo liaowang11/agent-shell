@@ -479,6 +479,25 @@ Optional: to prevent the agent running inside the container to access your local
 (setq agent-shell-text-file-capabilities nil)
 #+end_src
 
+*** Data storage location
+
+By default, agent-shell stores per-project data (transcripts, screenshots, etc.) under a =.agent-shell/= directory in the project root, and automatically adds that directory to =.gitignore= the first time it is created.  This is a one-time operation: removing the entry from =.gitignore= will not cause it to be re-added.
+
+You can change where this data is stored by setting =agent-shell-dot-subdir-function= to a custom function.  The function receives one argument, SUBDIR (e.g. ="screenshots"=), and must return the absolute path to that subdirectory (without creating it).
+
+For example, to store data under =user-emacs-directory= instead of the project tree, flattening the project path into a directory name:
+
+#+begin_src emacs-lisp
+(defun my/agent-shell-dot-subdir (subdir)
+  (let* ((cwd (string-remove-suffix "/" (agent-shell-cwd)))
+         (sanitized (replace-regexp-in-string "/" "-" (string-remove-prefix "/" cwd))))
+    (expand-file-name subdir (locate-user-emacs-file (concat "agent-shell/" sanitized)))))
+
+(setopt agent-shell-dot-subdir-function #'my/agent-shell-dot-subdir)
+#+end_src
+
+This stores data at a path like =~/.emacs.d/agent-shell/home-user-src-myproject/screenshots/=.
+
 *** Inhibiting minor modes during file writes
 
 Some minor modes (for example, =aggressive-indent-mode=) can interfere with an agent's edits.  Agent Shell can temporarily disable selected per-buffer minor modes while applying edits.
