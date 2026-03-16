@@ -132,7 +132,7 @@ Example usage to set a custom Anthropic API base URL:
   :group 'agent-shell)
 
 (defun agent-shell-anthropic-make-claude-code-config ()
-  "Create a Claude Code agent configuration.
+  "Create a Claude Agent configuration.
 
 Returns an agent configuration alist using `agent-shell-make-agent-config'."
   (agent-shell-make-agent-config
@@ -152,7 +152,7 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    :install-instructions "See https://github.com/zed-industries/claude-agent-acp for installation."))
 
 (defun agent-shell-anthropic-start-claude-code ()
-  "Start an interactive Claude Code agent shell."
+  "Start an interactive Claude Agent shell."
   (interactive)
   (agent-shell--dwim :config (agent-shell-anthropic-make-claude-code-config)
                      :new-shell t))

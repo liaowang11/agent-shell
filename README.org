@@ -392,7 +392,7 @@ You can select and start any of the known agent shells (see =agent-shell-agent-c
 
 Start a specific agent shell session directly:
 
-- =M-x agent-shell-anthropic-start-claude-code= - Start a Claude Code agent session
+- =M-x agent-shell-anthropic-start-claude-code= - Start a Claude Agent session
 - =M-x agent-shell-auggie-start-agent= - Start an Auggie agent session
 - =M-x agent-shell-openai-start-codex= - Start a Codex agent session
 - =M-x agent-shell-google-start-gemini= - Start a Gemini agent session
@@ -705,7 +705,7 @@ always go to Evil modes if you need to with ~C-z~).
 |-----------------+---------------------------------------------------------+-------------------------------------------------------------------------------|
 |                 | agent-shell                                             | Start or reuse an existing agent shell.                                       |
 |                 | agent-shell--display-buffer                             | Toggle agent SHELL-BUFFER display.                                            |
-|                 | agent-shell-anthropic-start-claude-code                 | Start an interactive Claude Code agent shell.                                 |
+|                 | agent-shell-anthropic-start-claude-code                 | Start an interactive Claude Agent shell.                                      |
 |                 | agent-shell-auggie-start-agent                          | Start an interactive Auggie agent shell.                                      |
 |                 | agent-shell-clear-buffer                                | Clear the current shell buffer.                                               |
 |                 | agent-shell-completion-mode                             | Toggle agent shell completion with @ or / prefix.                             |

@@ -413,8 +413,8 @@ on the system is used."
   "Format to use when generating agent shell buffer names.
 
 Each element can be:
-- Default: For example \='Claude Code Agent @ My Project\='
-- Kebab case: For example \='claude-code-agent @ my-project\='
+- Default: For example \='Claude Agent @ My Project\='
+- Kebab case: For example \='claude-agent @ my-project\='
 - A function: Called with agent name and project name."
   :type '(choice (const :tag "Default" default)
                  (const :tag "Kebab case" kebab-case)
