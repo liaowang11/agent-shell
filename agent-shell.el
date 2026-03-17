@@ -953,7 +953,14 @@ If currently visiting an `agent-shell', transfer latest input."
       (progn
         ;; Clear shell prompt as it's now
         ;; transferred to the compose buffer.
-        (comint-kill-input)
+        ;; Use delete-region to point-max rather than comint-kill-input
+        ;; which only deletes to point.  Text appended after point
+        ;; (e.g. attachments inserted via save-excursion) would otherwise
+        ;; survive and get duplicated on viewport submission.
+        (delete-region
+         (or (marker-position comint-accum-marker)
+             (process-mark (get-buffer-process (current-buffer))))
+         (point-max))
         (agent-shell-viewport--show-buffer :override input))
     (agent-shell-viewport--show-buffer)))
 
