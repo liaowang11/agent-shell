@@ -3429,7 +3429,10 @@ variable (see makunbound)"))
   (when-let* (((map-elt state :buffer))
               (viewport-buffer (agent-shell-viewport--buffer
                                 :shell-buffer (map-elt state :buffer)
-                                :existing-only t)))
+                                :existing-only t))
+              ((with-current-buffer viewport-buffer
+                 (and (derived-mode-p 'agent-shell-viewport-view-mode)
+                      (agent-shell-viewport--showing-latest-p)))))
     (with-current-buffer viewport-buffer
       (agent-shell-ui-delete-fragment :namespace-id (map-elt state :request-count) :block-id block-id :no-undo t)))
   (with-current-buffer (map-elt state :buffer)
@@ -3495,7 +3498,8 @@ turn)."
                                 :shell-buffer (map-elt state :buffer)
                                 :existing-only t))
               ((with-current-buffer viewport-buffer
-                 (derived-mode-p 'agent-shell-viewport-view-mode))))
+                 (and (derived-mode-p 'agent-shell-viewport-view-mode)
+                      (agent-shell-viewport--showing-latest-p)))))
     (with-current-buffer viewport-buffer
       (let ((inhibit-read-only t)
             (auto-scroll (shell-maker--should-auto-scroll-p)))
@@ -3658,7 +3662,8 @@ APPEND and CREATE-NEW control update behavior."
                                   :shell-buffer (map-elt state :buffer)
                                   :existing-only t))
                 ((with-current-buffer viewport-buffer
-                   (derived-mode-p 'agent-shell-viewport-view-mode))))
+                   (and (derived-mode-p 'agent-shell-viewport-view-mode)
+                        (agent-shell-viewport--showing-latest-p)))))
       (with-current-buffer viewport-buffer
         (let ((inhibit-read-only t))
           (agent-shell-ui-update-text
