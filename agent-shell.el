@@ -5359,7 +5359,8 @@ variable (see makunbound)"))
               ;; Fragment deletion only makes sense when viewport is
               ;; displaying conversation, never while it's an active compose buffer.
               ((with-current-buffer viewport-buffer
-                 (derived-mode-p 'agent-shell-viewport-view-mode))))
+                 (and (derived-mode-p 'agent-shell-viewport-view-mode)
+                      (agent-shell-viewport--showing-latest-p)))))
     (with-current-buffer viewport-buffer
       (agent-shell-ui-delete-fragment :namespace-id (map-elt state :request-count) :block-id block-id :no-undo t)))
   (with-current-buffer (map-elt state :buffer)
@@ -5577,7 +5578,8 @@ with GROUP-EXPANDED as the group's initial fold state."
                                 :shell-buffer (map-elt state :buffer)
                                 :existing-only t))
               ((with-current-buffer viewport-buffer
-                 (derived-mode-p 'agent-shell-viewport-view-mode))))
+                 (and (derived-mode-p 'agent-shell-viewport-view-mode)
+                      (agent-shell-viewport--showing-latest-p)))))
     (with-current-buffer viewport-buffer
       (let ((buffer-undo-list t)
             (inhibit-read-only t)
@@ -5759,7 +5761,8 @@ which mid-turn is past whatever the user is typing."
                                   :shell-buffer (map-elt state :buffer)
                                   :existing-only t))
                 ((with-current-buffer viewport-buffer
-                   (derived-mode-p 'agent-shell-viewport-view-mode))))
+                   (and (derived-mode-p 'agent-shell-viewport-view-mode)
+                        (agent-shell-viewport--showing-latest-p)))))
       (with-current-buffer viewport-buffer
         (let ((inhibit-read-only t))
           (agent-shell-ui-update-text
@@ -9242,9 +9245,10 @@ reads the buffer's prompt capabilities."
                                   :existing-only t)))
       (with-current-buffer viewport-buffer
         ;; Refresh the viewport to show the just-sent prompt, but only
-        ;; when it's displaying the conversation. Don't interrupt
-        ;; any potential prompt crafting (ie. edit mode).
-        (when (derived-mode-p 'agent-shell-viewport-view-mode)
+        ;; when it's displaying the latest conversation. Don't interrupt
+        ;; prompt crafting (ie. edit mode) or replace history.
+        (when (and (derived-mode-p 'agent-shell-viewport-view-mode)
+                   (agent-shell-viewport--showing-latest-p))
           (agent-shell-viewport--initialize
            :prompt prompt))))
 
@@ -9433,7 +9437,26 @@ Returns a buffer object or nil."
   "Move point to the last interaction in the shell buffer."
   (when-let* ((shell-buffer (agent-shell--shell-buffer)))
     (with-current-buffer shell-buffer
-      (goto-char comint-last-input-start))))
+      ;; Not `comint-last-input-start' alone: a steered prompt is rendered
+      ;; rather than submitted through comint, so that marker still sits on
+      ;; the interaction the steer interrupted.
+      (goto-char (or (when-let* ((position (shell-maker-history-position)))
+                       (agent-shell--prompt-begin-position-at-index
+                        (map-elt position :total)))
+                     comint-last-input-start)))))
+
+(defun agent-shell--prompt-begin-position-at-index (index)
+  "Return the real prompt position at one-based history INDEX, or nil."
+  (when (> index 0)
+    (save-excursion
+      (goto-char (point-min))
+      (let (position)
+        (dotimes (_ index)
+          (setq position
+                (when (shell-maker--re-search-forward-prompt
+                       comint-prompt-regexp)
+                  (match-beginning 0))))
+        position))))
 
 (defun agent-shell--shell-response-start ()
   "Return where the response of the interaction at point begins.
