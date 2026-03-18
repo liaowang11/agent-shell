@@ -833,7 +833,7 @@ Use one of these entry points to create and initialize the viewport buffer:
 (setopt agent-shell-prefer-viewport-interaction t)
 #+end_src
 
-In edit mode, =C-c C-c= sends or queues the prompt and switches to view mode when viewport interaction is preferred.  Use =C-u C-c C-c= to send or queue while keeping the compose buffer open, =C-c C-p= to peek at the latest interaction without losing the draft, =C-c C-k= to cancel, and =C-c C-h= for help.
+In edit mode, =C-c C-c= sends or queues the prompt and switches to view mode when viewport interaction is preferred.  Use =C-u C-c C-c= to send or queue while keeping the compose buffer open, =C-c C-p= to return to the page you were reading without losing the draft (=r= resumes it), =C-c C-k= to cancel, and =C-c C-h= for help.
 
 In view mode, use =r= to compose a reply, =R= to quote the response in a reply, =b= / =f= to move between interactions, =p= / =n= to move between items, =?= for help, and =q= to bury the viewport.
 
