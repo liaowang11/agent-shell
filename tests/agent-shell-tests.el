@@ -2051,6 +2051,197 @@ code block content
       (let ((agent-shell-show-context-usage-indicator nil))
         (should-not (agent-shell--context-usage-indicator))))))
 
+(ert-deftest agent-shell-viewport-next-page-allows-busy-history-navigation-test ()
+  "Test `agent-shell-viewport-next-page' allows history navigation while busy."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (initialized nil)
+        (updated-header nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (insert "older prompt\n\nlatest prompt\n")
+            (goto-char (point-max)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) '(2 . 2)))
+                      ((symbol-function 'comint-previous-prompt)
+                       (lambda (&rest _)
+                         (goto-char (point-min))))
+                      ((symbol-function 'shell-maker-next-command-and-response)
+                       (lambda (backwards)
+                         (should backwards)
+                         '("older prompt" . "older response")))
+                      ((symbol-function 'agent-shell-viewport--initialize)
+                       (lambda (&rest args)
+                         (setq initialized args)))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda ()
+                         (setq updated-header t))))
+              (should (equal (agent-shell-viewport-next-page :backwards t)
+                             '("older prompt" . "older response")))
+              (should (equal initialized
+                             '(:prompt "older prompt"
+                               :response "older response")))
+              (should updated-header))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-showing-latest-reads-history-position-alist-test ()
+  "Test `agent-shell-viewport--showing-latest-p' reads history position alists."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-view-mode))
+          (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 2) (:total . 2)))))
+            (should (agent-shell-viewport--showing-latest-p))))
+      (kill-buffer viewport-buffer))))
+
+(ert-deftest agent-shell--update-text-skips-history-viewport-test ()
+  "Test `agent-shell--update-text' skips viewport mirroring for older history."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (viewport-calls 0)
+        (shell-calls 0)
+        (original-derived-mode-p (symbol-function 'derived-mode-p)))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local comint-last-output-start (make-marker))
+            (setq-local comint-use-prompt-regexp t))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 1) (:total . 2))))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest modes)
+                       (cond ((eq (current-buffer) shell-buffer)
+                              (memq 'agent-shell-mode modes))
+                             ((eq (current-buffer) viewport-buffer)
+                              (memq 'agent-shell-viewport-view-mode modes))
+                             (t
+                              (apply original-derived-mode-p modes)))))
+                    ((symbol-function 'agent-shell-ui-update-text)
+                     (lambda (&rest _)
+                       (if (eq (current-buffer) viewport-buffer)
+                           (cl-incf viewport-calls)
+                         (cl-incf shell-calls))
+                       nil)))
+            (with-current-buffer shell-buffer
+              (agent-shell--update-text
+               :state `((:buffer . ,shell-buffer)
+                        (:request-count . 7))
+               :block-id "chunk"
+               :text "partial response"
+               :append t))
+            (should (= viewport-calls 0))
+            (should (= shell-calls 1))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--update-fragment-skips-history-viewport-test ()
+  "Test `agent-shell--update-fragment' skips viewport mirroring for older history."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (viewport-calls 0)
+        (shell-calls 0)
+        (original-derived-mode-p (symbol-function 'derived-mode-p)))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local comint-last-output-start (make-marker))
+            (setq-local comint-use-prompt-regexp t))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 1) (:total . 2))))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest modes)
+                       (cond ((eq (current-buffer) shell-buffer)
+                              (memq 'agent-shell-mode modes))
+                             ((eq (current-buffer) viewport-buffer)
+                              (memq 'agent-shell-viewport-view-mode modes))
+                             (t
+                              (apply original-derived-mode-p modes)))))
+                    ((symbol-function 'agent-shell-ui-update-fragment)
+                     (lambda (&rest _)
+                       (if (eq (current-buffer) viewport-buffer)
+                           (cl-incf viewport-calls)
+                         (cl-incf shell-calls))
+                       nil)))
+            (with-current-buffer shell-buffer
+              (agent-shell--update-fragment
+               :state `((:buffer . ,shell-buffer)
+                        (:request-count . 7))
+               :block-id "tool-call"
+               :body "Running tool"
+               :append t))
+            (should (= viewport-calls 0))
+            (should (= shell-calls 1))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--delete-fragment-skips-history-viewport-test ()
+  "Test `agent-shell--delete-fragment' skips viewport mirroring for older history."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (viewport-calls 0)
+        (shell-calls 0)
+        (original-derived-mode-p (symbol-function 'derived-mode-p)))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 1) (:total . 2))))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest modes)
+                       (cond ((eq (current-buffer) shell-buffer)
+                              (memq 'agent-shell-mode modes))
+                             ((eq (current-buffer) viewport-buffer)
+                              (memq 'agent-shell-viewport-view-mode modes))
+                             (t
+                              (apply original-derived-mode-p modes)))))
+                    ((symbol-function 'agent-shell-ui-delete-fragment)
+                     (lambda (&rest _)
+                       (if (eq (current-buffer) viewport-buffer)
+                           (cl-incf viewport-calls)
+                         (cl-incf shell-calls))
+                       nil)))
+            (with-current-buffer shell-buffer
+              (agent-shell--delete-fragment
+               :state `((:buffer . ,shell-buffer)
+                        (:request-count . 7))
+               :block-id "tool-call"))
+            (should (= viewport-calls 0))
+            (should (= shell-calls 1))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
 ;;; Tests for agent-shell--permission-title
 
 (ert-deftest agent-shell--permission-title-read-shows-filename-test ()
