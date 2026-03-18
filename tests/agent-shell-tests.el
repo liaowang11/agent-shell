@@ -1171,6 +1171,40 @@ compose buffer keeps its draft in place and stays in edit mode."
           ;; No snapshot is needed since nothing was wiped.
           (should-not agent-shell-viewport--compose-snapshot))))))
 
+(ert-deftest agent-shell--send-command-preserves-viewport-history-test ()
+  "Sending a queued command must not replace a historical interaction."
+  (let ((agent-shell-show-busy-indicator nil)
+        (agent-shell--state (list (cons :buffer (current-buffer))
+                                  (cons :event-subscriptions nil)
+                                  (cons :client 'test-client)
+                                  (cons :session (list (cons :id "test-session")
+                                                       (cons :title "a title")))
+                                  (cons :last-entry-type nil)
+                                  (cons :tool-calls nil)
+                                  (cons :idle-timer nil)))
+        initialized)
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--append-transcript)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell-viewport--showing-latest-p)
+               (lambda () nil))
+              ((symbol-function 'agent-shell-viewport--initialize)
+               (lambda (&rest _) (setq initialized t))))
+      (with-temp-buffer
+        (let ((viewport-buffer (current-buffer)))
+          (setq-local major-mode 'agent-shell-viewport-view-mode)
+          (insert "historical interaction")
+          (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer)))
+            (agent-shell--send-command
+             :prompt "queued prompt"
+             :shell-buffer (current-buffer)))
+          (should-not initialized)
+          (should (equal (buffer-string) "historical interaction")))))))
+
 (ert-deftest agent-shell-viewport-compose-send-and-dismiss-test ()
   "Composed prompts are sent, cleared, and dismissed or kept.
 
@@ -4495,6 +4529,454 @@ Scaling an exact cent overshoots it, for example (* 0.07 100) is
                          (agent-shell--svg-fill-color 'agent-shell-secondary))
                  svg-data))))))
 
+(ert-deftest agent-shell-viewport-next-page-allows-busy-history-navigation-test ()
+  "Test `agent-shell-viewport-next-page' allows history navigation while busy."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (latest-prompt-begin nil)
+        (initialized nil)
+        (updated-header nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (insert "older prompt\n\nlatest prompt\n")
+            (goto-char (point-min))
+            (forward-line 2)
+            (setq latest-prompt-begin (point))
+            (goto-char (point-max)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) '((:current . 2) (:total . 2))))
+                      ((symbol-function 'shell-maker--prompt-begin-position)
+                       (lambda () latest-prompt-begin))
+                      ((symbol-function 'shell-maker-next-command-and-response)
+                       (lambda (backwards &rest _)
+                         (should backwards)
+                         '("older prompt" . "older response")))
+                      ((symbol-function 'agent-shell-viewport--initialize)
+                       (lambda (&rest args)
+                         (setq initialized args)
+                         (agent-shell-viewport--update-header)))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda ()
+                         (setq updated-header t))))
+              (should (equal (agent-shell-viewport-next-page :backwards t)
+                             '("older prompt" . "older response")))
+              (should (equal initialized
+                             '(:prompt "older prompt"
+                               :response "older response")))
+              (should updated-header)
+              (should (equal agent-shell-viewport--page-cursor
+                             `((:index . 1) (:point . ,(point))))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-next-page-forward-enters-compose-test ()
+  "Test `agent-shell-viewport-next-page' always enters compose at the last page.
+
+No compose snapshot is parked here -- entering compose must not depend on
+one existing, unlike the pre-unification behavior this replaces."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (switched-to-edit nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) '((:current . 2) (:total . 2))))
+                      ((symbol-function 'agent-shell-viewport-edit-mode)
+                       (lambda () (setq switched-to-edit t)))
+                      ((symbol-function 'agent-shell-viewport--initialize)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-next-page)
+              (should switched-to-edit)
+              (should (equal (map-elt agent-shell-viewport--page-cursor :index) 2)))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-next-page-from-compose-errors-test ()
+  "Test `agent-shell-viewport-next-page' signals a user-error from compose.
+
+The compose page is the terminal page on the forward axis -- there is
+nothing to page forward to."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-edit-mode)))
+          (with-current-buffer viewport-buffer
+            (should-error (agent-shell-viewport-next-page)
+                           :type 'user-error)))
+      (kill-buffer viewport-buffer))))
+
+(ert-deftest agent-shell-viewport-previous-page-first-page-error-test ()
+  "Test `agent-shell-viewport-previous-page' signals a user-error at the first page."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) '((:current . 1) (:total . 3)))))
+              (should-error (agent-shell-viewport-previous-page) :type 'user-error))))
+      (kill-buffer viewport-buffer))))
+
+(defun agent-shell-viewport-tests--insert-interaction (prompt response)
+  "Insert a real PROMPT/RESPONSE interaction at point, comint style.
+Return the buffer position where the prompt began."
+  (let ((prompt-start (point)))
+    (insert (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt)
+            prompt
+            (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t)
+            "\n" response "\n\n")
+    prompt-start))
+
+(defun agent-shell-viewport-tests--make-shell-buffer (interactions)
+  "Create a shell buffer with INTERACTIONS, a list of (prompt . response)."
+  (let ((buffer (generate-new-buffer " *agent-shell shell*"))
+        (last-prompt-start nil))
+    (with-current-buffer buffer
+      (comint-mode)
+      (setq-local major-mode 'agent-shell-mode)
+      (setq-local shell-maker--config
+                  (make-shell-maker-config
+                   :name "agent" :prompt "Claude> " :prompt-regexp "Claude> "))
+      (setq-local comint-use-prompt-regexp t)
+      (setq-local comint-prompt-regexp "Claude> ")
+      (dolist (interaction interactions)
+        (setq last-prompt-start
+              (agent-shell-viewport-tests--insert-interaction
+               (car interaction) (cdr interaction))))
+      ;; A live session always trails the last interaction with a fresh,
+      ;; not-yet-submitted prompt -- `shell-maker-narrow-to-prompt' (used by
+      ;; `agent-shell-viewport-view-last') needs one to find where the last
+      ;; interaction's response ends.
+      (insert (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt))
+      ;; `agent-shell-goto-last-interaction' reads this real comint marker,
+      ;; normally set by `comint-send-input' as each prompt is submitted.
+      (when last-prompt-start
+        (setq comint-last-input-start (copy-marker last-prompt-start)))
+      (goto-char (point-max)))
+    buffer))
+
+(ert-deftest agent-shell-viewport-previous-page-from-compose-returns-to-remembered-page-test ()
+  "Test `agent-shell-viewport-previous-page' returns to the recorded page.
+
+Leaving the compose page must land back where the user was reading, not
+always on the newest interaction.  `agent-shell-viewport-view-last' and
+`agent-shell-viewport-next-page' are stubbed to a tiny current-page state
+machine, since driving the real comint/shell-maker narrowing they use
+needs a live process -- see `agent-shell-viewport-tests--make-shell-buffer'."
+  (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
+                       '(("only question" . "only answer"))))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (current 3)
+        (viewed-last nil)
+        (backward-steps 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-edit-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) `((:current . ,current) (:total . 3))))
+                      ((symbol-function 'agent-shell-viewport-view-last)
+                       (lambda () (setq viewed-last t current 3)))
+                      ((symbol-function 'agent-shell-viewport-next-page)
+                       (lambda (&rest args)
+                         (should (plist-get args :backwards))
+                         (setq backward-steps (1+ backward-steps)
+                               current (1- current))))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (setq agent-shell-viewport--page-cursor '((:index . 2) (:point . 1)))
+              (insert "my draft")
+              (agent-shell-viewport-previous-page)
+              (should viewed-last)
+              (should (equal backward-steps 1))
+              (should (equal current 2))
+              (should (equal agent-shell-viewport--compose-snapshot
+                             '((:content . "my draft") (:location . 9)))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-previous-page-from-compose-falls-back-to-last-page-test ()
+  "Test `agent-shell-viewport-previous-page' goes to the newest page absent a cursor."
+  (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
+                       '(("only question" . "only answer"))))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (viewed-last nil)
+        (backward-steps 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-edit-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport-view-last)
+                       (lambda () (setq viewed-last t)))
+                      ((symbol-function 'agent-shell-viewport-next-page)
+                       (lambda (&rest _) (setq backward-steps (1+ backward-steps))))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (should-not agent-shell-viewport--page-cursor)
+              (agent-shell-viewport-previous-page)
+              (should viewed-last)
+              (should (equal backward-steps 0)))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-goto-last-interaction-past-steered-prompt-test ()
+  "Test `agent-shell-goto-last-interaction' lands on the newest page.
+
+A steered prompt is rendered by the client rather than submitted through
+comint, so `comint-last-input-start' still marks the interaction it
+steered.  Going by that marker opens page 2 of 3, and leaving the compose
+page then returns there instead of to the newest page."
+  (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
+                       '(("first" . "one")
+                         ("second" . "two")
+                         ("[steer] third" . "three")))))
+    (unwind-protect
+        (with-current-buffer shell-buffer
+          (setq comint-last-input-start
+                (copy-marker (agent-shell--prompt-begin-position-at-index 2)))
+          (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                     (lambda (&rest _) shell-buffer)))
+            (agent-shell-goto-last-interaction))
+          (should (equal (point)
+                         (agent-shell--prompt-begin-position-at-index 3)))
+          (should (equal (shell-maker-history-position)
+                         '((:current . 3) (:total . 3)))))
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-previous-page-from-compose-requires-history-test ()
+  "Test `agent-shell-viewport-previous-page' errors from compose with no history."
+  (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer nil))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-edit-mode)
+            (should-error (agent-shell-viewport-previous-page) :type 'user-error)))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport--update-header-position-label-blank-on-compose-page-test ()
+  "Test the header omits a page count on the compose page.
+
+`status' already renders \"Edit\" there, and there's only one compose
+page to disambiguate, so a position label would just repeat it."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (captured-position 'unset))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-edit-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell--make-header)
+                       (lambda (_state &rest args)
+                         (setq captured-position (plist-get args :position))
+                         ""))
+                      ((symbol-function 'agent-shell--state) (lambda () nil)))
+              (agent-shell-viewport--update-header)
+              (should-not captured-position))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-showing-latest-reads-history-position-alist-test ()
+  "Test `agent-shell-viewport--showing-latest-p' reads history position alists."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-view-mode))
+          (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 2) (:total . 2)))))
+            (should (agent-shell-viewport--showing-latest-p))))
+      (kill-buffer viewport-buffer))))
+
+(ert-deftest agent-shell--update-text-skips-history-viewport-test ()
+  "Test `agent-shell--update-text' skips viewport mirroring for older history."
+  (let (;; Neither buffer holds a live prompt, and where the shell writes
+        ;; is not under test: only whether the viewport is written to at
+        ;; all.
+        (agent-shell-persistent-prompt-enabled nil)
+        (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (viewport-calls 0)
+        (shell-calls 0)
+        (original-derived-mode-p (symbol-function 'derived-mode-p)))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local comint-last-output-start (make-marker))
+            (setq-local comint-use-prompt-regexp t))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 1) (:total . 2))))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest modes)
+                       (cond ((eq (current-buffer) shell-buffer)
+                              (memq 'agent-shell-mode modes))
+                             ((eq (current-buffer) viewport-buffer)
+                              (memq 'agent-shell-viewport-view-mode modes))
+                             (t
+                              (apply original-derived-mode-p modes)))))
+                    ((symbol-function 'agent-shell-ui-update-text)
+                     (lambda (&rest _)
+                       (if (eq (current-buffer) viewport-buffer)
+                           (cl-incf viewport-calls)
+                         (cl-incf shell-calls))
+                       nil)))
+            (with-current-buffer shell-buffer
+              (agent-shell--update-text
+               :state `((:buffer . ,shell-buffer)
+                        (:request-count . 7))
+               :block-id "chunk"
+               :text "partial response"
+               :append t))
+            (should (= viewport-calls 0))
+            (should (= shell-calls 1))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--update-fragment-skips-history-viewport-test ()
+  "Test `agent-shell--update-fragment' skips viewport mirroring for older history."
+  (let (;; Neither buffer holds a live prompt, and where the shell writes
+        ;; is not under test: only whether the viewport is written to at
+        ;; all.
+        (agent-shell-persistent-prompt-enabled nil)
+        (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (viewport-calls 0)
+        (shell-calls 0)
+        (original-derived-mode-p (symbol-function 'derived-mode-p)))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local comint-last-output-start (make-marker))
+            (setq-local comint-use-prompt-regexp t))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 1) (:total . 2))))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest modes)
+                       (cond ((eq (current-buffer) shell-buffer)
+                              (memq 'agent-shell-mode modes))
+                             ((eq (current-buffer) viewport-buffer)
+                              (memq 'agent-shell-viewport-view-mode modes))
+                             (t
+                              (apply original-derived-mode-p modes)))))
+                    ((symbol-function 'agent-shell-ui-update-fragment)
+                     (lambda (&rest _)
+                       (if (eq (current-buffer) viewport-buffer)
+                           (cl-incf viewport-calls)
+                         (cl-incf shell-calls))
+                       nil)))
+            (with-current-buffer shell-buffer
+              (agent-shell--update-fragment
+               :state `((:buffer . ,shell-buffer)
+                        (:request-count . 7))
+               :block-id "tool-call"
+               :body "Running tool"
+               :append t))
+            (should (= viewport-calls 0))
+            (should (= shell-calls 1))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--delete-fragment-skips-history-viewport-test ()
+  "Test `agent-shell--delete-fragment' skips viewport mirroring for older history."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (viewport-calls 0)
+        (shell-calls 0)
+        (original-derived-mode-p (symbol-function 'derived-mode-p)))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 1) (:total . 2))))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest modes)
+                       (cond ((eq (current-buffer) shell-buffer)
+                              (memq 'agent-shell-mode modes))
+                             ((eq (current-buffer) viewport-buffer)
+                              (memq 'agent-shell-viewport-view-mode modes))
+                             (t
+                              (apply original-derived-mode-p modes)))))
+                    ((symbol-function 'agent-shell-ui-delete-fragment)
+                     (lambda (&rest _)
+                       (if (eq (current-buffer) viewport-buffer)
+                           (cl-incf viewport-calls)
+                         (cl-incf shell-calls))
+                       nil)))
+            (with-current-buffer shell-buffer
+              (agent-shell--delete-fragment
+               :state `((:buffer . ,shell-buffer)
+                        (:request-count . 7))
+               :block-id "tool-call"))
+            (should (= viewport-calls 0))
+            (should (= shell-calls 1))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
 ;;; Tests for agent-shell--permission-title
 
 (ert-deftest agent-shell--permission-title-read-shows-filename-test ()
@@ -5621,19 +6103,6 @@ same N."
     (should (equal (map-elt result :steps) 1))
     (should (equal (map-elt result :initialized)
                    '(:prompt "page three" :response "three")))))
-
-(ert-deftest agent-shell-viewport-next-page-n-stops-at-last-reachable-page-test ()
-  "Test an N larger than the remaining history pages as far as it can.
-
-Two interactions remain and N=5, so with no draft parked it stops on
-the last one rather than refusing to move."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :body (lambda () (agent-shell-viewport-next-page :n 5)))))
-    (should (equal (map-elt result :steps) 2))
-    (should-not (map-elt result :entered-edit))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page four" :response "four")))))
 
 (ert-deftest agent-shell-viewport-next-page-n-past-last-enters-compose-test ()
   "Test a prefix jump running past the newest interaction opens the draft.
