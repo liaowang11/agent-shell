@@ -95,14 +95,18 @@
 ;; buffer-local vars. Make snapshot permanent-local.
 (put 'agent-shell-viewport--compose-snapshot 'permanent-local t)
 
-(defvar-local agent-shell-viewport--peek-location nil
-  "Alist with :point and :position of the peeked interaction.
-Saved when replying from a peek and restored by
-`agent-shell-viewport-compose-peek-last', so repeated peeks return to the
-same reading position.  :position is the history position, so it is only
-restored while the peeked interaction is the same one.")
+(defvar-local agent-shell-viewport--page-cursor nil
+  "Alist with :index and :point of the last history page read from compose.
+
+Recorded on every transition from a history page to the compose page (see
+`agent-shell-viewport--enter-compose-page'), and consulted by
+`agent-shell-viewport-previous-page' so leaving the compose page returns to
+the same page and reading position.  :index is a 1-based position counted
+from the oldest page, so it keeps naming the same exchange even after new
+turns extend history -- unlike the full :current/:total position alist,
+which changes out from under a stale comparison.")
 ;; Survives mode switches (edit <-> view) which clear buffer-local vars.
-(put 'agent-shell-viewport--peek-location 'permanent-local t)
+(put 'agent-shell-viewport--page-cursor 'permanent-local t)
 
 (defvar-local agent-shell-viewport--ring-index nil
   "Current index into `comint-input-ring' for history navigation.")
@@ -214,7 +218,7 @@ queued right away, regardless of `agent-shell-viewport-dismiss-on-send'."
     (user-error "Session not ready... please wait"))
   (setq agent-shell-viewport--compose-snapshot nil)
   (setq agent-shell-viewport--ring-index nil)
-  (setq agent-shell-viewport--peek-location nil)
+  (setq agent-shell-viewport--page-cursor nil)
   (cond
    (keep-composing
     (agent-shell-viewport--compose-queue))
@@ -561,27 +565,31 @@ Optionally set its PROMPT and RESPONSE."
                  (not (string-empty-p item)))
                (ring-elements comint-input-ring))) nil t))))
 
-(defun agent-shell-viewport-compose-peek-last ()
-  "Save compose buffer snapshot and peek at the last interaction."
-  (declare (modes agent-shell-viewport-edit-mode))
-  (interactive)
-  (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
-    (user-error "Not in a prompt compose buffer"))
+(defun agent-shell-viewport--leave-compose-page ()
+  "Snapshot the draft and return to the page last read from compose.
+
+Falls back to the newest page, and to its start, when no page was
+recorded to return to.  Called by `agent-shell-viewport-previous-page'
+when it is invoked from the compose page."
   (unless (with-current-buffer (agent-shell-viewport--shell-buffer)
             (shell-maker-history-position))
-    (user-error "No items in history"))
+    (user-error "No history"))
   (setq agent-shell-viewport--compose-snapshot
         `((:content . ,(buffer-string))
           (:location . ,(point))))
-  (agent-shell-viewport-view-last)
-  ;; Return to the previous peek's reading position, but only when the
-  ;; peeked interaction is unchanged.
-  (when-let* ((location agent-shell-viewport--peek-location)
-              ((equal (map-elt location :position)
-                      (agent-shell-viewport--position :force-refresh t)))
-              (pos (map-elt location :point))
-              ((<= (point-min) pos (point-max))))
-    (goto-char pos)))
+  ;; Capture the cursor before `view-last'/`next-page' below overwrite it
+  ;; with the page they land on.
+  (let* ((cursor agent-shell-viewport--page-cursor)
+         (target (map-elt cursor :index)))
+    (agent-shell-viewport-view-last)
+    (while (and target
+                (> (map-elt (agent-shell-viewport--position) :current) target))
+      (agent-shell-viewport-next-page :backwards t))
+    ;; Restore the exact reading point, but only within the page's bounds --
+    ;; a point captured on a differently-sized page could land anywhere.
+    (when-let* ((point (map-elt cursor :point))
+                ((<= (point-min) point (point-max))))
+      (goto-char point))))
 
 (defun agent-shell-viewport-view-last ()
   "Display the last request/response interaction."
@@ -611,6 +619,14 @@ Optionally set its PROMPT and RESPONSE."
      :response (map-elt current :response))
     (goto-char (point-min))
     current))
+
+(cl-defun agent-shell-viewport--showing-latest-p (&key viewport-buffer)
+  "Return non-nil when VIEWPORT-BUFFER is showing the latest interaction."
+  (when-let* ((viewport-buffer (or viewport-buffer (current-buffer)))
+              (position (with-current-buffer viewport-buffer
+                          (agent-shell-viewport--position))))
+    (= (map-elt position :current)
+       (map-elt position :total))))
 
 (defun agent-shell-viewport-next-item (&optional leave-table)
   "Go to next item.
@@ -766,14 +782,19 @@ With EXISTING-ONLY, only return existing buffers without creating."
               (agent-shell-viewport-edit-mode)
               (current-buffer))))))))
 
-(cl-defun agent-shell-viewport--setup-reply (&key quoted-text)
-  "Set up the buffer to compose a reply.
+(cl-defun agent-shell-viewport--enter-compose-page (&key quoted-text)
+  "Switch from a history page to the compose page.
 
-QUOTED-TEXT is inserted as a block quote as part of the reply."
-  ;; Remember the reading position so a later peek can return to it.
-  (setq agent-shell-viewport--peek-location
-        `((:point . ,(point))
-          (:position . ,(agent-shell-viewport--position :force-refresh t))))
+QUOTED-TEXT, when non-nil, is inserted as a block quote as part of the
+draft -- used when replying.  Called with no QUOTED-TEXT when paging
+forward past the newest interaction.
+
+Remembers the page being left so a later `agent-shell-viewport-previous-page'
+can return to it."
+  (when-let* ((pos (agent-shell-viewport--position :force-refresh t)))
+    (setq agent-shell-viewport--page-cursor
+          `((:index . ,(map-elt pos :current))
+            (:point . ,(point)))))
   (with-current-buffer (agent-shell-viewport--shell-buffer)
     (goto-char (point-max)))
   (let ((snapshot agent-shell-viewport--compose-snapshot))
@@ -801,7 +822,7 @@ QUOTED-TEXT is inserted as a block quote as part of the reply."
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)
     (user-error "Not in a shell viewport buffer"))
   (let ((region (map-elt (agent-shell--get-region :deactivate t) :content)))
-    (agent-shell-viewport--setup-reply
+    (agent-shell-viewport--enter-compose-page
      :quoted-text (when region (string-trim region))))
   ;; Setting point isn't enough at times. Force scrolling.
   (set-window-start (selected-window) (point-min)))
@@ -813,7 +834,7 @@ QUOTED-TEXT is inserted as a block quote as part of the reply."
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)
     (user-error "Not in a shell viewport buffer"))
   (let ((response (or (agent-shell-viewport--response) "")))
-    (agent-shell-viewport--setup-reply
+    (agent-shell-viewport--enter-compose-page
      :quoted-text (string-trim (substring-no-properties response)))))
 
 (defun agent-shell-viewport-reply-yes ()
@@ -947,10 +968,18 @@ QUOTED-TEXT is inserted as a block quote as part of the reply."
   (agent-shell-viewport-compose-send))
 
 (defun agent-shell-viewport-previous-page ()
-  "Show previous interaction (request / response)."
-  (declare (modes agent-shell-viewport-view-mode))
+  "Go back one page.
+
+From a history page, shows the preceding interaction.  From the compose
+page, returns to the page last read (or the newest page, when none was
+recorded), snapshotting the draft first."
+  (declare (modes agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
   (interactive)
-  (agent-shell-viewport-next-page :backwards t :start-at-top t))
+  (agent-shell-viewport--ensure-buffer)
+  (if (derived-mode-p 'agent-shell-viewport-edit-mode)
+      (agent-shell-viewport--leave-compose-page)
+    (agent-shell-viewport-next-page :backwards t :start-at-top t)))
 
 (cl-defun agent-shell-viewport-next-page (&key backwards start-at-top)
   "Show next interaction (request / response).
@@ -958,55 +987,42 @@ QUOTED-TEXT is inserted as a block quote as part of the reply."
 If BACKWARDS is non-nil, go to previous interaction.
 If START-AT-TOP is non-nil, position at point-min regardless of direction.
 
-If there are no more next items and a compose snapshot exists, restore the
-buffer from the snapshot and switch to edit mode."
-  (declare (modes agent-shell-viewport-view-mode))
+Paging forward past the newest interaction enters the compose page.
+Called from the compose page itself, there is no next page to show."
+  (declare (modes agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
   (interactive)
-  (unless (derived-mode-p 'agent-shell-viewport-view-mode)
-    (error "Not in a viewport buffer"))
-  (when (agent-shell-viewport--busy-p)
-    (user-error "Busy... please wait"))
-  (let ((shell-buffer (agent-shell-viewport--shell-buffer))
-        (snapshot agent-shell-viewport--compose-snapshot)
-        (pos (agent-shell-viewport--position :force-refresh t)))
-    ;; Check if at last position going forward with a snapshot to restore
-    (if (and (not backwards) snapshot pos
-             (= (map-elt pos :current) (map-elt pos :total)))
-        (progn
-          (agent-shell-viewport-edit-mode)
-          (agent-shell-viewport--initialize)
-          (insert (map-elt snapshot :content))
-          (goto-char (map-elt snapshot :location))
-          (setq agent-shell-viewport--compose-snapshot nil)
-          (cl-return-from agent-shell-viewport-next-page))
+  (agent-shell-viewport--ensure-buffer)
+  (when (derived-mode-p 'agent-shell-viewport-edit-mode)
+    (user-error "No next page"))
+  (let* ((shell-buffer (agent-shell-viewport--shell-buffer))
+         (pos (agent-shell-viewport--position :force-refresh t)))
+    (unless pos
+      (user-error "No history"))
+    (cond
+     ((and (not backwards) (= (map-elt pos :current) (map-elt pos :total)))
+      (agent-shell-viewport--enter-compose-page))
+     ((and backwards (= (map-elt pos :current) 1))
+      (user-error "First page"))
+     (t
       (when-let* ((next (with-current-buffer shell-buffer
-                          (if backwards
-                              (progn
-                                ;; Navigate relative to the interaction
-                                ;; containing point, not wherever point happens
-                                ;; to sit within it.  Without this, switching to
-                                ;; the viewport with point mid-interaction makes
-                                ;; the first backward step land on the current
-                                ;; interaction's prompt instead of the previous
-                                ;; interaction.
-                                (goto-char (shell-maker--prompt-begin-position))
-                                (when (save-excursion
-                                        (let ((orig-line (line-number-at-pos)))
-                                          (comint-previous-prompt 1)
-                                          (= orig-line (line-number-at-pos))))
-                                  (error "No previous page")))
-                            (when (save-excursion
-                                    (let ((orig-line (point)))
-                                      (comint-next-prompt 1)
-                                      (= orig-line (point))))
-                              (error "No next page")))
+                          ;; Navigate relative to the interaction containing
+                          ;; point, not wherever point happens to sit within
+                          ;; it.  Without this, switching to the viewport
+                          ;; with point mid-interaction makes the first
+                          ;; backward step land on the current interaction's
+                          ;; prompt instead of the previous interaction.
+                          (goto-char (shell-maker--prompt-begin-position))
                           (shell-maker-next-command-and-response backwards :trimmed nil))))
         (agent-shell-viewport--initialize
          :prompt (car next) :response (cdr next))
         (goto-char (if start-at-top
                        (point-min)
                      (if backwards (point-max) (point-min))))
-        next))))
+        (setq agent-shell-viewport--page-cursor
+              `((:index . ,(+ (map-elt pos :current) (if backwards -1 1)))
+                (:point . ,(point))))
+        next)))))
 
 (defun agent-shell-viewport-set-session-model ()
   "Set session model."
@@ -1196,7 +1212,7 @@ VIEWPORT-BUFFER is the viewport buffer to check."
 (defvar agent-shell-viewport-edit-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'agent-shell-viewport-compose-send)
-    (define-key map (kbd "C-c C-p") #'agent-shell-viewport-compose-peek-last)
+    (define-key map (kbd "C-c C-p") #'agent-shell-viewport-previous-page)
     (define-key map (kbd "C-c C-k") #'agent-shell-viewport-compose-cancel)
     (define-key map (kbd "C-c C-h") #'agent-shell-viewport-compose-help-menu)
     (define-key map (kbd "C-<tab>") #'agent-shell-viewport-cycle-session-mode)
@@ -1268,11 +1284,9 @@ VIEWPORT-BUFFER is the viewport buffer to check."
                         ((:function . agent-shell-backward-up-item)
                          (:description . "Up to table's first cell"))
                         ((:function . agent-shell-viewport-next-page)
-                         (:description . "Next page")
-                         (:if-not . agent-shell-viewport--busy-p))
+                         (:description . "Next page"))
                         ((:function . agent-shell-viewport-previous-page)
-                         (:description . "Previous Page")
-                         (:if-not . agent-shell-viewport--busy-p))
+                         (:description . "Previous Page"))
                         ((:function . agent-shell-other-buffer)
                          (:description . "Switch to shell")
                          (:transient . nil))
@@ -1364,7 +1378,7 @@ VIEWPORT-BUFFER is the viewport buffer to check."
                          (:description . "Submit"))
                         ((:function . agent-shell-viewport-compose-cancel)
                          (:description . "Cancel"))
-                        ((:function . agent-shell-viewport-compose-peek-last)
+                        ((:function . agent-shell-viewport-previous-page)
                          (:description . "Previous Page")))))
               (apply #'vector ""
                      (agent-shell-viewport--make-transient-group
@@ -1424,9 +1438,13 @@ Returns only suffixes whose function has a binding in KEYMAP."
 Automatically determines position, status, key hints and menu keys based
 on current major mode."
   (agent-shell-viewport--ensure-buffer)
-  (let* ((pos (or (agent-shell-viewport--position)
-                  (list (cons :current 1) (cons :total 1))))
-         (position-label (format "%d/%d" (map-elt pos :current) (map-elt pos :total)))
+  ;; No position label on the compose page: `status' already says "Edit"
+  ;; there, and a page count has nothing left to disambiguate once there's
+  ;; only one compose page to be on.
+  (let* ((position-label (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
+                           (let ((pos (or (agent-shell-viewport--position)
+                                          (list (cons :current 1) (cons :total 1)))))
+                             (format "%d/%d" (map-elt pos :current) (map-elt pos :total)))))
          (status (cond
                   ((and (agent-shell-viewport--busy-p)
                         (derived-mode-p 'agent-shell-viewport-edit-mode))
@@ -1448,7 +1466,7 @@ on current major mode."
                                                    agent-shell-viewport-edit-mode-map t)))
                         (:description . "Cancel"))
                       `((:key . ,(key-description (where-is-internal
-                                                   'agent-shell-viewport-compose-peek-last
+                                                   'agent-shell-viewport-previous-page
                                                    agent-shell-viewport-edit-mode-map t)))
                         (:description . "Previous Page"))
                       `((:key . ,(key-description (where-is-internal
