@@ -510,6 +510,13 @@ Optionally set its PROMPT and RESPONSE."
     (goto-char (point-min))
     current))
 
+(cl-defun agent-shell-viewport--showing-latest-p (&key viewport-buffer)
+  "Return non-nil when VIEWPORT-BUFFER is showing the latest interaction."
+  (when-let* ((viewport-buffer (or viewport-buffer (current-buffer)))
+              (position (with-current-buffer viewport-buffer
+                          (agent-shell-viewport--position))))
+    (= (car position) (cdr position))))
+
 (defun agent-shell-viewport-next-item ()
   "Go to next item.
 
@@ -773,8 +780,6 @@ buffer from the snapshot and switch to edit mode."
   (interactive)
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)
     (error "Not in a viewport buffer"))
-  (when (agent-shell-viewport--busy-p)
-    (user-error "Busy... please wait"))
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
         (snapshot agent-shell-viewport--compose-snapshot)
         (pos (agent-shell-viewport--position :force-refresh t)))
