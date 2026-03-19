@@ -45,11 +45,14 @@
 (declare-function agent-shell--get-region "agent-shell")
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
 (declare-function agent-shell--make-header "agent-shell")
+(declare-function agent-shell--session-mode-line-format "agent-shell")
 (declare-function agent-shell--context "agent-shell")
 (declare-function agent-shell--shell-buffer "agent-shell")
 (declare-function agent-shell--start "agent-shell")
 (declare-function agent-shell--state "agent-shell")
 (declare-function agent-shell--filter-buffer-substring "agent-shell")
+(declare-function agent-shell-viewport--help-menu "agent-shell-viewport")
+(declare-function agent-shell-viewport--compose-help-menu "agent-shell-viewport")
 (declare-function agent-shell-buffers "agent-shell")
 (declare-function agent-shell-copy-session-id "agent-shell")
 (declare-function agent-shell-cycle-session-mode "agent-shell")
@@ -1168,21 +1171,47 @@ Returns only suffixes whose function has a binding in KEYMAP."
                           (list :if-not pred)))))
             commands)))
 
+(defun agent-shell-viewport--qualifier ()
+  "Return the viewport qualifier string for the current buffer."
+  (let* ((pos (or (agent-shell-viewport--position)
+                  (list (cons :current 1) (cons :total 1))))
+         (pos-label (format "%d/%d" (map-elt pos :current) (map-elt pos :total))))
+    (cond
+     ((agent-shell-viewport--busy-p)
+      (format "[%s][Busy]" pos-label))
+     ((derived-mode-p 'agent-shell-viewport-edit-mode)
+      (format "[%s][Edit]" pos-label))
+     ((derived-mode-p 'agent-shell-viewport-view-mode)
+      (format "[%s][View]" pos-label)))))
+
+(defun agent-shell-viewport--mode-line-format ()
+  "Return the viewport mode-line format.
+
+Includes the associated shell session details followed by the viewport
+position and state qualifier."
+  (when-let* (((or (derived-mode-p 'agent-shell-viewport-view-mode)
+                   (derived-mode-p 'agent-shell-viewport-edit-mode)))
+              ((memq agent-shell-header-style '(text none nil)))
+              (shell-buffer (agent-shell-viewport--shell-buffer)))
+    (concat (with-current-buffer shell-buffer
+              (agent-shell--session-mode-line-format agent-shell--state))
+            (when-let ((qualifier (agent-shell-viewport--qualifier)))
+              (propertize (format " %s" qualifier)
+                          'face 'font-lock-comment-face
+                          'help-echo "Viewport position and state")))))
+
+(defun agent-shell-viewport--setup-modeline ()
+  "Set up the viewport modeline."
+  (setq-local mode-line-misc-info
+              (append mode-line-misc-info
+                      '((:eval (agent-shell-viewport--mode-line-format))))))
+
 (defun agent-shell-viewport--update-header ()
   "Update header and mode line based on `agent-shell-header-style'.
 
 Automatically determines qualifier and bindings based on current major mode."
   (agent-shell-viewport--ensure-buffer)
-  (let* ((pos (or (agent-shell-viewport--position)
-                  (list (cons :current 1) (cons :total 1))))
-         (pos-label (format "%d/%d" (map-elt pos :current) (map-elt pos :total)))
-         (qualifier (cond
-                     ((agent-shell-viewport--busy-p)
-                      (format "[%s][Busy]" pos-label))
-                     ((derived-mode-p 'agent-shell-viewport-edit-mode)
-                      (format "[%s][Edit]" pos-label))
-                     ((derived-mode-p 'agent-shell-viewport-view-mode)
-                      (format "[%s][View]" pos-label))))
+  (let* ((qualifier (agent-shell-viewport--qualifier))
          (bindings (cond
                     ((derived-mode-p 'agent-shell-viewport-edit-mode)
                      (list
@@ -1241,7 +1270,9 @@ Automatically determines qualifier and bindings based on current major mode."
                             (agent-shell--make-header (agent-shell--state)
                                                       :qualifier qualifier
                                                       :bindings bindings))))))
-      (setq-local header-line-format header))))
+      (setq-local header-line-format header)
+      (when (memq agent-shell-header-style '(text none nil))
+        (force-mode-line-update)))))
 
 (defvar-local agent-shell-viewport--clean-up t)
 
@@ -1293,6 +1324,7 @@ For example, offer to kill associated shell session."
   (setq buffer-read-only nil)
   (when agent-shell-file-completion-enabled
     (agent-shell-completion-mode +1))
+  (agent-shell-viewport--setup-modeline)
   (agent-shell-viewport--update-header)
   (let ((inhibit-read-only t))
     (erase-buffer))
@@ -1304,6 +1336,7 @@ For example, offer to kill associated shell session."
 \\{agent-shell-viewport-view-mode-map}"
   (cursor-intangible-mode +1)
   (agent-shell-ui-mode +1)
+  (agent-shell-viewport--setup-modeline)
   (agent-shell-viewport--update-header)
   (setq-local filter-buffer-substring-function #'agent-shell--filter-buffer-substring)
   (setq buffer-read-only t)

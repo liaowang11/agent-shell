@@ -2025,6 +2025,143 @@ code block content
 
 ;;; Tests for agent-shell--permission-title
 
+(ert-deftest agent-shell--mode-line-format-includes-session-details-test ()
+  "Test `agent-shell--mode-line-format' preserves shell session details."
+  (with-temp-buffer
+    (setq-local agent-shell--state
+                `((:session . ((:model-id . "gpt-5")
+                               (:models . (((:model-id . "gpt-5")
+                                            (:name . "GPT-5"))))
+                               (:mode-id . "code")
+                               (:modes . (((:id . "code")
+                                           (:name . "Code"))))))))
+    (let ((agent-shell-header-style 'text)
+          (agent-shell-command-prefix '("docker")))
+      (cl-letf (((symbol-function 'derived-mode-p)
+                 (lambda (&rest modes)
+                   (memq 'agent-shell-mode modes)))
+                ((symbol-function 'agent-shell--context-usage-indicator)
+                 (lambda () nil))
+                ((symbol-function 'agent-shell--busy-indicator-frame)
+                 (lambda () " busy")))
+        (should (equal (substring-no-properties (agent-shell--mode-line-format))
+                       " [C] [GPT-5] [Code] busy"))))))
+
+(ert-deftest agent-shell-viewport--mode-line-format-includes-view-qualifier-test ()
+  "Test `agent-shell-viewport--mode-line-format' appends the view qualifier."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local agent-shell--state
+                        `((:session . ((:model-id . "gpt-5")
+                                       (:models . (((:model-id . "gpt-5")
+                                                    (:name . "GPT-5"))))
+                                       (:mode-id . "code")
+                                       (:modes . (((:id . "code")
+                                                   (:name . "Code"))))))))
+            (setq-local agent-shell-command-prefix '("docker")))
+          (let ((agent-shell-header-style 'text))
+            (cl-letf (((symbol-function 'agent-shell--make-header)
+                       (lambda (&rest _) "header"))
+                      ((symbol-function 'agent-shell--state)
+                       (lambda () agent-shell--state))
+                      ((symbol-function 'agent-shell--context-usage-indicator)
+                       (lambda () nil))
+                      ((symbol-function 'agent-shell--busy-indicator-frame)
+                       (lambda () nil))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _)
+                         '((:current . 2) (:total . 5))))
+                      ((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil)))
+              (with-current-buffer viewport-buffer
+                (agent-shell-viewport-view-mode)
+                (should (member '(:eval (agent-shell-viewport--mode-line-format))
+                                mode-line-misc-info))
+                (should (equal
+                         (substring-no-properties
+                          (agent-shell-viewport--mode-line-format))
+                         " [C] [GPT-5] [Code] [2/5][View]"))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport--mode-line-format-includes-edit-qualifier-test ()
+  "Test `agent-shell-viewport--mode-line-format' appends the edit qualifier."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local agent-shell--state
+                        `((:session . ((:model-id . "gpt-5")
+                                       (:models . (((:model-id . "gpt-5")
+                                                    (:name . "GPT-5"))))
+                                       (:mode-id . "code")
+                                       (:modes . (((:id . "code")
+                                                   (:name . "Code")))))))))
+          (let ((agent-shell-header-style 'text))
+            (cl-letf (((symbol-function 'agent-shell--make-header)
+                       (lambda (&rest _) "header"))
+                      ((symbol-function 'agent-shell--state)
+                       (lambda () agent-shell--state))
+                      ((symbol-function 'agent-shell--context-usage-indicator)
+                       (lambda () nil))
+                      ((symbol-function 'agent-shell--busy-indicator-frame)
+                       (lambda () nil))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _)
+                         '((:current . 1) (:total . 1))))
+                      ((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil)))
+              (with-current-buffer viewport-buffer
+                (agent-shell-viewport-edit-mode)
+                (should (member '(:eval (agent-shell-viewport--mode-line-format))
+                                mode-line-misc-info))
+                (should (equal
+                         (substring-no-properties
+                          (agent-shell-viewport--mode-line-format))
+                         " [GPT-5] [Code] [1/1][Edit]"))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport--update-header-forces-mode-line-update-test ()
+  "Test `agent-shell-viewport--update-header' refreshes the modeline."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (forced nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local agent-shell--state
+                        `((:session . ((:model-id . "gpt-5")
+                                       (:models . (((:model-id . "gpt-5")
+                                                    (:name . "GPT-5"))))
+                                       (:mode-id . "code")
+                                       (:modes . (((:id . "code")
+                                                   (:name . "Code")))))))))
+          (let ((agent-shell-header-style 'text))
+            (cl-letf (((symbol-function 'agent-shell--make-header)
+                       (lambda (&rest _) "header"))
+                      ((symbol-function 'agent-shell--state)
+                       (lambda () agent-shell--state))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _)
+                         '((:current . 2) (:total . 5))))
+                      ((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'force-mode-line-update)
+                       (lambda (&optional _) (setq forced t))))
+              (with-current-buffer viewport-buffer
+                (agent-shell-viewport-view-mode)
+                (setq forced nil)
+                (agent-shell-viewport--update-header)
+                (should forced)
+                (should (equal header-line-format "header"))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell--permission-title-read-shows-filename-test ()
   "Test `agent-shell--permission-title' includes filename for read permission.
 Based on ACP traffic from https://github.com/xenodium/agent-shell/issues/415."

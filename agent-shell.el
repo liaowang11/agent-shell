@@ -6117,6 +6117,34 @@ See https://agentclientprotocol.com/protocol/session-modes for details."
               (value (map-nested-elt (agent-shell--state) '(:heartbeat :value))))
     (concat " " (seq-elt frames (mod value (length frames))))))
 
+(defun agent-shell--session-mode-line-format (state)
+  "Return shell session details for the mode line from STATE.
+
+For example, returns \" [C] [Sonnet] [Accept Edits] ░░░ \" when a
+command prefix, model, session mode, and busy indicator are available."
+  (concat (when agent-shell-command-prefix
+            (propertize " [C]"
+                        'face 'font-lock-constant-face
+                        'help-echo "Running in container"))
+          (when-let ((model-name (or (map-elt (seq-find (lambda (model)
+                                                          (string= (map-elt model :model-id)
+                                                                   (map-nested-elt state '(:session :model-id))))
+                                                        (map-nested-elt state '(:session :models)))
+                                              :name)
+                                     (map-nested-elt state '(:session :model-id)))))
+            (propertize (format " [%s]" model-name)
+                        'face 'font-lock-variable-name-face
+                        'help-echo (format "Model: %s" model-name)))
+          (when-let ((mode-name (agent-shell--resolve-session-mode-name
+                                 (map-nested-elt state '(:session :mode-id))
+                                 (agent-shell--get-available-modes state))))
+            (propertize (format " [%s]" mode-name)
+                        'face 'font-lock-type-face
+                        'help-echo (format "Session Mode: %s" mode-name)))
+          (when-let ((indicator (agent-shell--context-usage-indicator)))
+            (concat " " indicator))
+          (agent-shell--busy-indicator-frame)))
+
 (defun agent-shell--mode-line-format ()
   "Return `agent-shell''s mode-line format.
 
@@ -6127,28 +6155,7 @@ For example: \" [C] [Sonnet] [Accept Edits] ░░░ \".
 Shows \" [C]\" when a command prefix is used."
   (when-let* (((derived-mode-p 'agent-shell-mode))
               ((memq agent-shell-header-style '(text none nil))))
-    (concat (when agent-shell-command-prefix
-              (propertize " [C]"
-                          'face 'font-lock-constant-face
-                          'help-echo "Running in container"))
-            (when-let ((model-name (or (map-elt (seq-find (lambda (model)
-                                                            (string= (map-elt model :model-id)
-                                                                     (map-nested-elt (agent-shell--state) '(:session :model-id))))
-                                                          (map-nested-elt (agent-shell--state) '(:session :models)))
-                                                :name)
-                                       (map-nested-elt (agent-shell--state) '(:session :model-id)))))
-              (propertize (format " [%s]" model-name)
-                          'face 'font-lock-variable-name-face
-                          'help-echo (format "Model: %s" model-name)))
-            (when-let ((mode-name (agent-shell--resolve-session-mode-name
-                                   (map-nested-elt (agent-shell--state) '(:session :mode-id))
-                                   (agent-shell--get-available-modes (agent-shell--state)))))
-              (propertize (format " [%s]" mode-name)
-                          'face 'font-lock-type-face
-                          'help-echo (format "Session Mode: %s" mode-name)))
-            (when-let ((indicator (agent-shell--context-usage-indicator)))
-              (concat " " indicator))
-            (agent-shell--busy-indicator-frame))))
+    (agent-shell--session-mode-line-format (agent-shell--state))))
 
 (defun agent-shell--setup-modeline ()
   "Set up the modeline to display session mode.
