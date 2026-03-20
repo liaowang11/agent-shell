@@ -83,6 +83,8 @@
 (defvar agent-shell-session-strategy)
 (defvar agent-shell--state)
 (defvar agent-shell-file-completion-enabled)
+(defvar agent-shell-viewport--help-menu)
+(defvar agent-shell-viewport--compose-help-menu)
 
 (defvar-local agent-shell-viewport--compose-snapshot nil
   "Alist with :content and :location from compose buffer before viewing history.")
@@ -1184,21 +1186,32 @@ Returns only suffixes whose function has a binding in KEYMAP."
      ((derived-mode-p 'agent-shell-viewport-view-mode)
       (format "[%s][View]" pos-label)))))
 
+(defun agent-shell-viewport--page-indicator ()
+  "Return the viewport page indicator string for the current buffer."
+  (let ((pos (or (agent-shell-viewport--position)
+                 (list (cons :current 1) (cons :total 1)))))
+    (format " [%d/%d]" (map-elt pos :current) (map-elt pos :total))))
+
+(defun agent-shell-viewport--mode-line-state ()
+  "Return the viewport state suffix for the current buffer."
+  (when (agent-shell-viewport--busy-p)
+    (propertize " [Busy]"
+                'face 'font-lock-comment-face
+                'help-echo "Viewport is waiting for a response")))
+
 (defun agent-shell-viewport--mode-line-format ()
   "Return the viewport mode-line format.
 
-Includes the associated shell session details followed by the viewport
-position and state qualifier."
+Includes the viewport page indicator followed by the associated shell
+session details and viewport state."
   (when-let* (((or (derived-mode-p 'agent-shell-viewport-view-mode)
                    (derived-mode-p 'agent-shell-viewport-edit-mode)))
               ((memq agent-shell-header-style '(text none nil)))
               (shell-buffer (agent-shell-viewport--shell-buffer)))
-    (concat (with-current-buffer shell-buffer
+    (concat (agent-shell-viewport--page-indicator)
+            (with-current-buffer shell-buffer
               (agent-shell--session-mode-line-format agent-shell--state))
-            (when-let ((qualifier (agent-shell-viewport--qualifier)))
-              (propertize (format " %s" qualifier)
-                          'face 'font-lock-comment-face
-                          'help-echo "Viewport position and state")))))
+            (agent-shell-viewport--mode-line-state))))
 
 (defun agent-shell-viewport--setup-modeline ()
   "Set up the viewport modeline."
