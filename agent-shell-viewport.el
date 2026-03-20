@@ -761,31 +761,41 @@ With EXISTING-ONLY, only return existing buffers without creating."
   (interactive)
   (agent-shell-viewport-next-page :backwards t :start-at-top t))
 
+(defun agent-shell-viewport--page-candidates ()
+  "Return completion candidates for viewport history pages.
+
+Each candidate is a cons of prompt text and page number."
+  (agent-shell-viewport--ensure-buffer)
+  (when-let* ((shell-buffer (agent-shell-viewport--shell-buffer))
+              (history (with-current-buffer shell-buffer
+                         (shell-maker-history)))
+              ((not (seq-empty-p history))))
+    (seq-map-indexed
+     (lambda (item index)
+       (cons (string-trim (or (car item) ""))
+             (1+ index)))
+     history)))
+
 (defun agent-shell-viewport--resolve-page-number (arg)
   "Resolve a target page number from ARG.
 
-When ARG is a number, return it directly. When ARG is a raw universal
-argument like `(4)', prompt with `read-number'. Otherwise, prompt with
-`completing-read'."
-  (let* ((pos (or (agent-shell-viewport--position :force-refresh t)
-                  (user-error "No items in history")))
-         (current (map-elt pos :current))
-         (total (map-elt pos :total))
-         (page (cond
-                ((numberp arg)
-                 arg)
-                ((consp arg)
-                 (read-number (format "Page (1-%d): " total) current))
-                (t
-                 (string-to-number
-                  (completing-read (format "Page (1-%d): " total)
-                                   (mapcar #'number-to-string
-                                           (number-sequence 1 total))
-                                   nil t nil nil
-                                   (number-to-string current)))))))
-    (unless (<= 1 page total)
-      (user-error "Page %d is out of range" page))
-    page))
+When ARG is non-nil, treat it as a numeric prefix argument. Otherwise,
+prompt with completion using prior user inputs."
+  (if arg
+      (let* ((pos (or (agent-shell-viewport--position :force-refresh t)
+                      (user-error "No items in history")))
+             (total (map-elt pos :total))
+             (page (prefix-numeric-value arg)))
+        (unless (<= 1 page total)
+          (user-error "Page %d is out of range" page))
+        page)
+    (let* ((candidates (or (agent-shell-viewport--page-candidates)
+                           (user-error "No items in history")))
+           (selection (completing-read "Page: "
+                                       (mapcar #'car candidates)
+                                       nil t)))
+      (or (cdr (assoc selection candidates))
+          (user-error "Unknown page: %s" selection)))))
 
 (defun agent-shell-viewport--goto-page-in-shell-buffer (page shell-buffer)
   "Move SHELL-BUFFER point to PAGE and return the prompt position."
@@ -815,9 +825,8 @@ argument like `(4)', prompt with `read-number'. Otherwise, prompt with
 (defun agent-shell-viewport-goto-page (arg)
   "Jump to a specific viewport history page.
 
-Without ARG, prompt with completion for the target page. With a numeric
-prefix argument, jump to that page directly. With `C-u', prompt with
-`read-number'."
+Without ARG, prompt with completion for the target page using prior
+user inputs. With a prefix argument, jump to that page directly."
   (declare (modes agent-shell-viewport-view-mode))
   (interactive "P")
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)

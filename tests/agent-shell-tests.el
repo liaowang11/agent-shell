@@ -2077,31 +2077,32 @@ ls -la
                                       (rawInput . ((command . "ls -la")))
                                       (kind . "execute"))))))))))
 
-(ert-deftest agent-shell-viewport--resolve-page-number-prompts-with-completion-test ()
-  "Test `agent-shell-viewport--resolve-page-number' prompts for a page by default."
+(ert-deftest agent-shell-viewport--resolve-page-number-prompts-with-history-test ()
+  "Test `agent-shell-viewport--resolve-page-number' prompts with prompt history."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'agent-shell-viewport--page-candidates)
+               (lambda ()
+                 '(("prompt 1" . 1)
+                   ("prompt 2" . 2)
+                   ("prompt 3" . 3))))
+              ((symbol-function 'completing-read)
+               (lambda (prompt collection &rest _)
+                 (should (equal prompt "Page: "))
+                 (should (equal collection '("prompt 1" "prompt 2" "prompt 3")))
+                 "prompt 3")))
+      (should (= (agent-shell-viewport--resolve-page-number nil) 3)))))
+
+(ert-deftest agent-shell-viewport--resolve-page-number-uses-prefix-argument-test ()
+  "Test `agent-shell-viewport--resolve-page-number' uses prefix args numerically."
   (with-temp-buffer
     (cl-letf (((symbol-function 'agent-shell-viewport--position)
                (lambda (&rest _)
                  '((:current . 2) (:total . 5))))
               ((symbol-function 'completing-read)
-               (lambda (prompt collection &rest _)
-                 (should (equal prompt "Page (1-5): "))
-                 (should (equal collection '("1" "2" "3" "4" "5")))
-                 "4")))
-      (should (= (agent-shell-viewport--resolve-page-number nil) 4)))))
-
-(ert-deftest agent-shell-viewport--resolve-page-number-prompts-with-universal-argument-test ()
-  "Test `agent-shell-viewport--resolve-page-number' reads a number with `C-u'."
-  (with-temp-buffer
-    (cl-letf (((symbol-function 'agent-shell-viewport--position)
                (lambda (&rest _)
-                 '((:current . 2) (:total . 5))))
-              ((symbol-function 'read-number)
-               (lambda (prompt default)
-                 (should (equal prompt "Page (1-5): "))
-                 (should (= default 2))
-                 3)))
-      (should (= (agent-shell-viewport--resolve-page-number '(4)) 3)))))
+                 (should nil))))
+      (should (= (agent-shell-viewport--resolve-page-number '(4)) 4))
+      (should (= (agent-shell-viewport--resolve-page-number 3) 3)))))
 
 (ert-deftest agent-shell-viewport-goto-page-jumps-to-requested-page-test ()
   "Test `agent-shell-viewport-goto-page' jumps to the requested page."
