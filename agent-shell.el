@@ -395,9 +395,12 @@ Assume screenshot file path will be appended to this list."
   (list
    (list (cons :command "wl-paste")
          (cons :save (lambda (file-path)
-                       (let ((exit-code (call-process "wl-paste" nil `(:file ,file-path))))
-                         (unless (zerop exit-code)
-                           (error "Command wl-paste failed with exit code %d" exit-code))))))
+                       (with-temp-buffer
+                         (let* ((coding-system-for-read 'binary)
+                                (exit-code (call-process "wl-paste" nil (list t nil) nil "--type" "image/png")))
+                           (if (zerop exit-code)
+                               (write-region nil nil file-path)
+                             (error "Command wl-paste failed with exit code %d" exit-code)))))))
    (list (cons :command "pngpaste")
          (cons :save (lambda (file-path)
                        (let ((exit-code (call-process "pngpaste" nil nil nil file-path)))
