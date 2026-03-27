@@ -3199,7 +3199,7 @@ Joins all values from the model alist."
   (mapconcat (lambda (pair) (format "%s" (cdr pair)))
              model "|"))
 
-(cl-defun agent-shell--make-header (state &key qualifier bindings)
+(cl-defun agent-shell--make-header (state &key qualifier bindings model-binding mode-binding)
   "Return header text for current STATE.
 
 STATE should contain :agent-config with :icon-name, :buffer-name, and
@@ -3209,7 +3209,11 @@ QUALIFIER: Any text to prefix BINDINGS row with.
 
 BINDINGS is a list of alists defining key bindings to display, each with:
   :key         - Key string (e.g., \"n\")
-  :description - Description to display (e.g., \"next hunk\")"
+  :description - Description to display (e.g., \"next hunk\")
+
+MODEL-BINDING: Optional key description string for the model menu command.
+MODE-BINDING: Optional key description string for the session mode menu command.
+When provided, included in help-echo tooltips."
   (unless state
     (error "STATE is required"))
   (let* ((header-model (agent-shell--make-header-model state :qualifier qualifier :bindings bindings))
@@ -3219,7 +3223,9 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                               (if (map-elt header-model :model-name)
                                   (concat " ➤ " (propertize (map-elt header-model :model-name)
                                                             'font-lock-face 'font-lock-negation-char-face
-                                                            'help-echo "Click to open LLM model menu"
+                                                            'help-echo (concat "Click to open LLM model menu "
+                                                                               (when model-binding
+                                                                                 (propertize model-binding 'face 'help-key-binding)))
                                                             'mouse-face 'mode-line-highlight
                                                             'local-map (let ((map (make-sparse-keymap)))
                                                                          (define-key map [header-line mouse-1]
@@ -3229,7 +3235,9 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                               (if (map-elt header-model :mode-name)
                                   (concat " ➤ " (propertize (map-elt header-model :mode-name)
                                                             'font-lock-face 'font-lock-type-face
-                                                            'help-echo "Click to open session mode menu"
+                                                            'help-echo (concat "Click to open session mode menu "
+                                                                               (when mode-binding
+                                                                                 (propertize mode-binding 'face 'help-key-binding)))
                                                             'mouse-face 'mode-line-highlight
                                                             'local-map (let ((map (make-sparse-keymap)))
                                                                          (define-key map [header-line mouse-1]
@@ -3436,12 +3444,16 @@ Returns a MIME type like \"image/png\" or \"image/jpeg\"."
   "Update header and mode line based on `agent-shell-header-style'."
   (unless (derived-mode-p 'agent-shell-mode)
     (error "Not in a shell"))
-  (cond
-   ((eq agent-shell-header-style 'graphical)
-    (setq header-line-format (agent-shell--make-header (agent-shell--state))))
-   ((memq agent-shell-header-style '(text none nil))
-    (setq header-line-format (agent-shell--make-header (agent-shell--state)))
-    (force-mode-line-update))))
+  (setq header-line-format
+        (agent-shell--make-header (agent-shell--state)
+                                  :model-binding (key-description (where-is-internal
+                                                                   'agent-shell-set-session-model
+                                                                   agent-shell-mode-map t))
+                                  :mode-binding (key-description (where-is-internal
+                                                                  'agent-shell-set-session-mode
+                                                                  agent-shell-mode-map t))))
+  (when (memq agent-shell-header-style '(text none nil))
+    (force-mode-line-update)))
 
 (defun agent-shell--fetch-agent-icon (icon-name)
   "Download icon with ICON-NAME from GitHub, only if it exists, and save as binary.
@@ -6233,7 +6245,11 @@ Shows \" ⧉\" when a command prefix is used."
                                        (map-nested-elt (agent-shell--state) '(:session :model-id)))))
               (concat " " (propertize model-name
                                       'face 'font-lock-negation-char-face
-                                      'help-echo "Click to open LLM model menu"
+                                      'help-echo (concat "Click to open LLM model menu "
+                                                         (propertize (key-description (where-is-internal
+                                                                                       'agent-shell-set-session-model
+                                                                                       agent-shell-mode-map t))
+                                                                     'face 'help-key-binding))
                                       'mouse-face 'mode-line-highlight
                                       'local-map (let ((map (make-sparse-keymap)))
                                                    (define-key map [mode-line mouse-1]
@@ -6244,7 +6260,11 @@ Shows \" ⧉\" when a command prefix is used."
                                    (agent-shell--get-available-modes (agent-shell--state)))))
               (concat " ➤ " (propertize mode-name
                                         'face 'font-lock-type-face
-                                        'help-echo "Click to open session mode menu"
+                                        'help-echo (concat "Click to open session mode menu "
+                                                           (propertize (key-description (where-is-internal
+                                                                                         'agent-shell-set-session-mode
+                                                                                         agent-shell-mode-map t))
+                                                                       'face 'help-key-binding))
                                         'mouse-face 'mode-line-highlight
                                         'local-map (let ((map (make-sparse-keymap)))
                                                      (define-key map [mode-line mouse-1]
