@@ -769,6 +769,82 @@ With EXISTING-ONLY, only return existing buffers without creating."
   (interactive)
   (agent-shell-viewport-next-page :backwards t :start-at-top t))
 
+(defun agent-shell-viewport--page-candidates ()
+  "Return completion candidates for viewport history pages.
+
+Each candidate is a cons of prompt text and page number."
+  (agent-shell-viewport--ensure-buffer)
+  (when-let* ((shell-buffer (agent-shell-viewport--shell-buffer))
+              (history (with-current-buffer shell-buffer
+                         (shell-maker-history)))
+              ((not (seq-empty-p history))))
+    (seq-map-indexed
+     (lambda (item index)
+       (cons (string-trim (or (car item) ""))
+             (1+ index)))
+     history)))
+
+(defun agent-shell-viewport--resolve-page-number (arg)
+  "Resolve a target page number from ARG.
+
+When ARG is non-nil, treat it as a numeric prefix argument. Otherwise,
+prompt with completion using prior user inputs."
+  (if arg
+      (let* ((pos (or (agent-shell-viewport--position :force-refresh t)
+                      (user-error "No items in history")))
+             (total (map-elt pos :total))
+             (page (prefix-numeric-value arg)))
+        (unless (<= 1 page total)
+          (user-error "Page %d is out of range" page))
+        page)
+    (let* ((candidates (or (agent-shell-viewport--page-candidates)
+                           (user-error "No items in history")))
+           (selection (completing-read "Page: "
+                                       (mapcar #'car candidates)
+                                       nil t)))
+      (or (cdr (assoc selection candidates))
+          (user-error "Unknown page: %s" selection)))))
+
+(defun agent-shell-viewport--goto-page-in-shell-buffer (page shell-buffer)
+  "Move SHELL-BUFFER point to PAGE and return the prompt position."
+  (with-current-buffer shell-buffer
+    (let ((prompt-regexp (shell-maker-prompt-regexp shell-maker--config))
+          (count 0)
+          found)
+      (goto-char (point-min))
+      (while (and (not found)
+                  (shell-maker--re-search-forward-prompt prompt-regexp))
+        (let ((prompt-start (match-beginning 0))
+              (chunk-end (save-excursion
+                           (if (shell-maker--re-search-forward-prompt
+                                prompt-regexp)
+                               (match-beginning 0)
+                             (point-max)))))
+          (when (shell-maker--find-marker
+                 "<shell-maker-end-of-prompt>" chunk-end)
+            (setq count (1+ count))
+            (when (= count page)
+              (setq found prompt-start)))))
+      (unless found
+        (user-error "Page %d is out of range" page))
+      (goto-char found)
+      found)))
+
+(defun agent-shell-viewport-goto-page (arg)
+  "Jump to a specific viewport history page.
+
+Without ARG, prompt with completion for the target page using prior
+user inputs. With a prefix argument, jump to that page directly."
+  (declare (modes agent-shell-viewport-view-mode))
+  (interactive "P")
+  (unless (derived-mode-p 'agent-shell-viewport-view-mode)
+    (error "Not in a viewport buffer"))
+  (let* ((page (agent-shell-viewport--resolve-page-number arg))
+         (shell-buffer (agent-shell-viewport--shell-buffer)))
+    (agent-shell-viewport--goto-page-in-shell-buffer page shell-buffer)
+    (agent-shell-viewport-refresh)
+    (agent-shell-viewport--update-header)))
+
 (cl-defun agent-shell-viewport-next-page (&key backwards start-at-top)
   "Show next interaction (request / response).
 
@@ -997,6 +1073,7 @@ VIEWPORT-BUFFER is the viewport buffer to check."
     (define-key map (kbd "p") #'agent-shell-viewport-previous-item)
     (define-key map (kbd "f") #'agent-shell-viewport-next-page)
     (define-key map (kbd "b") #'agent-shell-viewport-previous-page)
+    (define-key map (kbd "g") #'agent-shell-viewport-goto-page)
     (define-key map (kbd "r") #'agent-shell-viewport-reply)
     (define-key map (kbd "y") #'agent-shell-viewport-reply-yes)
     (define-key map (kbd "1") #'agent-shell-viewport-reply-1)
@@ -1105,6 +1182,86 @@ VIEWPORT-BUFFER is the viewport buffer to check."
   (interactive)
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)
     (error "Not in a viewport buffer"))
+  (transient-define-prefix agent-shell-viewport--help-menu ()
+    "`agent-shell' viewport help menu"
+    [:class transient-columns
+            :setup-children
+            (lambda (_)
+              (transient-parse-suffixes
+               'agent-shell-viewport-help-menu
+               (list
+                (apply #'vector "Viewport Help"
+                       (agent-shell-viewport--make-transient-group
+                        agent-shell-viewport-view-mode-map
+                        '(((:function . agent-shell-viewport-next-item)
+                           (:description . "Next item"))
+                          ((:function . agent-shell-viewport-previous-item)
+                           (:description . "Previous item"))
+                          ((:function . agent-shell-viewport-next-page)
+                           (:description . "Next page")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-previous-page)
+                           (:description . "Previous Page")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-goto-page)
+                           (:description . "Go to page")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-other-buffer)
+                           (:description . "Switch to shell")
+                           (:transient . nil))
+                          ((:function . bury-buffer)
+                           (:description . "Close")
+                           (:transient . nil)))))
+                (apply #'vector ""
+                       (agent-shell-viewport--make-transient-group
+                        agent-shell-viewport-view-mode-map
+                        '(((:function . agent-shell-viewport-reply)
+                           (:description . "Reply…")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-reply-yes)
+                           (:description . "Reply \"yes\"")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-reply-more)
+                           (:description . "Reply \"more\"")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-reply-again)
+                           (:description . "Reply \"again\"")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-reply-continue)
+                           (:description . "Reply \"continue\"")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-reply-1)
+                           (:description . "Reply \"1\"")
+                           (:if-not . agent-shell-viewport--busy-p)))))
+                (apply #'vector ""
+                       (agent-shell-viewport--make-transient-group
+                        agent-shell-viewport-view-mode-map
+                        '(((:function . agent-shell-viewport-reply-2)
+                           (:description . "Reply \"2\"")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-reply-3)
+                           (:description . "Reply \"3\"")
+                           (:if-not . agent-shell-viewport--busy-p))
+                          ((:function . agent-shell-viewport-set-session-model)
+                           (:description . "Set model"))
+                          ((:function . agent-shell-viewport-set-session-mode)
+                           (:description . "Set mode"))
+                          ((:function . agent-shell-viewport-cycle-session-mode)
+                           (:description . "Cycle mode"))
+                          ((:function . agent-shell-viewport-interrupt)
+                           (:description . "Interrupt")))))
+                (apply #'vector ""
+                       (agent-shell-viewport--make-transient-group
+                        agent-shell-viewport-view-mode-map
+                        '(((:function . agent-shell-viewport-view-traffic)
+                           (:description . "View traffic"))
+                          ((:function . agent-shell-viewport-view-acp-logs)
+                           (:description . "View logs"))
+                          ((:function . agent-shell-viewport-copy-session-id)
+                           (:description . "Copy session ID"))
+                          ((:function . agent-shell-viewport-open-transcript)
+                           (:description . "Open transcript")))))
+                )))])
   (call-interactively #'agent-shell-viewport--help-menu))
 
 (transient-define-prefix agent-shell-viewport--compose-help-menu ()

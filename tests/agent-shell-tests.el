@@ -2286,7 +2286,9 @@ Based on ACP traffic from https://github.com/xenodium/agent-shell/issues/415."
 (ert-deftest agent-shell--permission-title-execute-fenced-test ()
   "Test `agent-shell--permission-title' fences execute commands."
   (should (equal
-           "```console\nls -la\n```"
+           "```console
+ls -la
+```"
            (agent-shell--permission-title
             :acp-request
             '((params . ((toolCall . ((toolCallId . "tc-1")
@@ -2350,6 +2352,90 @@ that fallback buffer, potentially starting the new shell in the wrong project."
         (kill-buffer other-buffer))
       (when-let ((buf (get-buffer "*test-restart-new-shell*")))
         (kill-buffer buf)))))
+
+(ert-deftest agent-shell-viewport--resolve-page-number-prompts-with-history-test ()
+  "Test `agent-shell-viewport--resolve-page-number' prompts with prompt history."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'agent-shell-viewport--page-candidates)
+               (lambda ()
+                 '(("prompt 1" . 1)
+                   ("prompt 2" . 2)
+                   ("prompt 3" . 3))))
+              ((symbol-function 'completing-read)
+               (lambda (prompt collection &rest _)
+                 (should (equal prompt "Page: "))
+                 (should (equal collection '("prompt 1" "prompt 2" "prompt 3")))
+                 "prompt 3")))
+      (should (= (agent-shell-viewport--resolve-page-number nil) 3)))))
+
+(ert-deftest agent-shell-viewport--resolve-page-number-uses-prefix-argument-test ()
+  "Test `agent-shell-viewport--resolve-page-number' uses prefix args numerically."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'agent-shell-viewport--position)
+               (lambda (&rest _)
+                 '((:current . 2) (:total . 5))))
+              ((symbol-function 'completing-read)
+               (lambda (&rest _)
+                 (should nil))))
+      (should (= (agent-shell-viewport--resolve-page-number '(4)) 4))
+      (should (= (agent-shell-viewport--resolve-page-number 3) 3)))))
+
+(ert-deftest agent-shell-viewport-goto-page-jumps-to-requested-page-test ()
+  "Test `agent-shell-viewport-goto-page' jumps to the requested page."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (initialized nil)
+        (updated-header nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local shell-maker--config 'fake-config)
+            (insert "prompt 1
+prompt 2
+prompt 3
+")
+            (goto-char (point-min)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _)
+                         (with-current-buffer shell-buffer
+                           (pcase (line-number-at-pos)
+                             (1 '((:current . 1) (:total . 3)))
+                             (2 '((:current . 2) (:total . 3)))
+                             (_ '((:current . 3) (:total . 3)))))))
+                      ((symbol-function 'shell-maker-prompt-regexp)
+                       (lambda (_config) "^prompt"))
+                      ((symbol-function 'shell-maker--re-search-forward-prompt)
+                       (lambda (prompt-regexp &optional bound)
+                         (re-search-forward prompt-regexp bound t)))
+                      ((symbol-function 'shell-maker--find-marker)
+                       (lambda (_marker _bound &rest _)
+                         t))
+                      ((symbol-function 'shell-maker--command-and-response-at-point)
+                       (lambda ()
+                         (pcase (line-number-at-pos)
+                           (1 '("prompt 1" . "response 1"))
+                           (2 '("prompt 2" . "response 2"))
+                           (_ '("prompt 3" . "response 3")))))
+                      ((symbol-function 'agent-shell-viewport--initialize)
+                       (lambda (&rest args)
+                         (setq initialized args)))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda ()
+                         (setq updated-header t))))
+              (agent-shell-viewport-goto-page 2)
+              (should (equal initialized
+                             '(:prompt "prompt 2"
+                               :response "response 2")))
+              (should updated-header)
+              (with-current-buffer shell-buffer
+                (should (= (line-number-at-pos) 2))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here
