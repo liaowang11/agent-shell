@@ -52,6 +52,7 @@ We now have a handful of additional packages to extend the =agent-shell= experie
 - [[https://github.com/xenodium/agent-shell-knockknock][agent-shell-knockknock]]: Notifications for =agent-shell= via [[https://github.com/konrad1977/knockknock][knockknock.el]].
 - [[https://github.com/zackattackz/agent-shell-notifications][agent-shell-notifications]]: Desktop notifications for =agent-shell= events.
 - [[https://github.com/ElleNajt/meta-agent-shell][meta-agent-shell]]: Multi-agent coordination system for =agent-shell= with inter-agent communication, task tracking, and project-level dispatching.
+- [[https://github.com/cxa/agent-shell-macext][agent-shell-macext]]: macOS-specific enhancements for =agent-shell=.
 
 * Icons
 
@@ -63,10 +64,10 @@ Thanks to [[https://github.com/lobehub/lobe-icons][Lobe Icons]] for the lovely i
 
 *** Claude Agent SDK
 
-For Anthropic's [[https://platform.claude.com/docs/en/agent-sdk/overview][Claude Agent SDK]] (formerly known as the Claude Code SDK), follow [[https://github.com/zed-industries/claude-agent-acp][Zed's claude-agent-acp instructions]], typically something like:
+For Anthropic's [[https://platform.claude.com/docs/en/agent-sdk/overview][Claude Agent SDK]] (formerly known as the Claude Code SDK), follow [[https://github.com/agentclientprotocol/claude-agent-acp][claude-agent-acp instructions]], typically something like:
 
 #+begin_src bash
-npm install -g @zed-industries/claude-agent-acp
+npm install -g @agentclientprotocol/claude-agent-acp
 #+end_src
 
 *Note:* The =-g= flag is required to install the binary globally so it's available in your PATH. After installation, verify it's available by running =which claude-agent-acp= in your terminal.
@@ -166,7 +167,7 @@ You can install via:
       :ensure-system-package
       ;; Add agent installation configs here
       ((claude . "brew install claude-code")
-       (claude-agent-acp . "npm install -g @zed-industries/claude-agent-acp")))
+       (claude-agent-acp . "npm install -g @agentclientprotocol/claude-agent-acp")))
 #+end_src
 
 This will automatically install the required dependencies ([[https://melpa.org/#/acp][acp.el]] and [[https://melpa.org/#/shell-maker][shell-maker]]).
@@ -815,9 +816,9 @@ Please read through this section before filing issues or feature requests. I won
 - *Your agent-shell config*: Share any relevant =agent-shell= variable settings from your Emacs config.
 - *Profiling data* (for performance issues): Use =M-x profiler-start=, reproduce the issue, then =M-x profiler-report= (and =M-x profiler-stop=). Share the report.
 
-** Why doesn't =agent-shell= offer all slash commands available in CLI agent?
+** Why doesn't =agent-shell= offer all slash commands/skills available in CLI agent?
 
-=agent-shell= can only offer the slash commands advertised by the agent via [[https://agentclientprotocol.com][Agent Client Protocol]]. To view what's exposed by your agent, expand the "Available /commands" section. Is the command you're after missing? Please consider filing a feature-request with the respective agent (ie. Gemini CLI) or their ACP layer (claude-code-acp).
+=agent-shell= can only offer the slash commands/skills advertised by the agent via [[https://agentclientprotocol.com][Agent Client Protocol]]. To view what's exposed by your agent, expand the "Available /commands" section. Is the command you're after missing? Please consider filing a feature-request with the respective agent (ie. Gemini CLI) or their ACP layer (claude-code-acp).
 
 [[file:slash-commands.png]]
 
