@@ -1071,12 +1071,12 @@ OUTGOING-REQUEST-DECORATOR is an optional function passed through to
 (cl-defun agent-shell--config-icon (&key config)
   "Create icon string for CONFIG if available and icons are enabled.
 Returns nil if no icon should be displayed."
-  (and-let* ((graphics-capable (display-graphic-p))
-             (icon-filename (if (map-elt config :icon-name)
+  (and-let* ((icon-filename (if (map-elt config :icon-name)
                                 (agent-shell--fetch-agent-icon
                                  (map-elt config :icon-name))
                               (agent-shell--make-agent-fallback-icon
-                               (map-elt config :buffer-name) 100))))
+                               (map-elt config :buffer-name) 100)))
+             (type-supported (image-supported-file-p icon-filename)))
     (with-temp-buffer
       (insert-image (create-image icon-filename nil nil
                                   :ascent 'center
@@ -3266,7 +3266,7 @@ When provided, included in help-echo tooltips."
       ((or 'none (pred null)) nil)
       ('text text-header)
       ('graphical
-       (if (display-graphic-p)
+       (if (image-type-available-p 'svg)
            ;; +------+
            ;; | icon | Top text line
            ;; |      | Bottom text line
@@ -4671,7 +4671,8 @@ If FILE-PATH is not an image, returns nil."
               (metadata (agent-shell--read-file-content :file-path file-path :shallow t))
               (mime-type (map-elt metadata :mime-type))
               ;; Check if it's an image type
-              (is-image (string-prefix-p "image/" mime-type)))
+              (is-image (string-prefix-p "image/" mime-type))
+              (type-supported (image-supported-file-p file-path)))
     (create-image file-path nil nil :max-width max-width)))
 
 (cl-defun agent-shell--collect-attached-files (content-blocks)
