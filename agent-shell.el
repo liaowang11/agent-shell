@@ -395,9 +395,12 @@ Assume screenshot file path will be appended to this list."
   (list
    (list (cons :command "wl-paste")
          (cons :save (lambda (file-path)
-                       (let ((exit-code (call-process "wl-paste" nil `(:file ,file-path))))
-                         (unless (zerop exit-code)
-                           (error "Command wl-paste failed with exit code %d" exit-code))))))
+                       (with-temp-buffer
+                         (let* ((coding-system-for-read 'binary)
+                                (exit-code (call-process "wl-paste" nil (list t nil) nil "--type" "image/png")))
+                           (if (zerop exit-code)
+                               (write-region nil nil file-path)
+                             (error "Command wl-paste failed with exit code %d" exit-code)))))))
    (list (cons :command "pngpaste")
          (cons :save (lambda (file-path)
                        (let ((exit-code (call-process "pngpaste" nil nil nil file-path)))
@@ -1068,12 +1071,12 @@ OUTGOING-REQUEST-DECORATOR is an optional function passed through to
 (cl-defun agent-shell--config-icon (&key config)
   "Create icon string for CONFIG if available and icons are enabled.
 Returns nil if no icon should be displayed."
-  (and-let* ((graphics-capable (display-graphic-p))
-             (icon-filename (if (map-elt config :icon-name)
+  (and-let* ((icon-filename (if (map-elt config :icon-name)
                                 (agent-shell--fetch-agent-icon
                                  (map-elt config :icon-name))
                               (agent-shell--make-agent-fallback-icon
-                               (map-elt config :buffer-name) 100))))
+                               (map-elt config :buffer-name) 100)))
+             (type-supported (image-supported-file-p icon-filename)))
     (with-temp-buffer
       (insert-image (create-image icon-filename nil nil
                                   :ascent 'center
@@ -1551,7 +1554,10 @@ COMMAND, when present, may be a shell command string or an argv vector."
                                              (agent-shell-experimental--methods))))
                            (map-elt state :active-requests))
              (let ((new-prompt-p (not (equal (map-elt state :last-entry-type)
-                                             "user_message_chunk"))))
+                                             "user_message_chunk")))
+                   (content-text (or (map-nested-elt acp-notification '(params update content text))
+                                     (format "[%s]" (or (map-nested-elt acp-notification '(params update content type))
+                                                        "unknown")))))
                (when new-prompt-p
                  (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
                  (agent-shell--append-transcript
@@ -1559,8 +1565,7 @@ COMMAND, when present, may be a shell command string or an argv vector."
                   :file-path agent-shell--transcript-file))
                (agent-shell--append-transcript
                 :text (format "> %s\n"
-                              (agent-shell--indent-markdown-headers
-                               (map-nested-elt acp-notification '(params update content text))))
+                              (agent-shell--indent-markdown-headers content-text))
                 :file-path agent-shell--transcript-file)
                (agent-shell--update-text
                 :state state
@@ -1571,9 +1576,9 @@ COMMAND, when present, may be a shell command string or an argv vector."
                                    (map-nested-elt
                                     state '(:agent-config :shell-prompt))
                                    'font-lock-face 'comint-highlight-prompt)
-                                  (propertize (map-nested-elt acp-notification '(params update content text))
+                                  (propertize content-text
                                               'font-lock-face 'comint-highlight-input))
-                        (propertize (map-nested-elt acp-notification '(params update content text))
+                        (propertize content-text
                                     'font-lock-face 'comint-highlight-input))
                 :create-new new-prompt-p
                 :append t))
@@ -3201,7 +3206,7 @@ Joins all values from the model alist."
   (mapconcat (lambda (pair) (format "%s" (cdr pair)))
              model "|"))
 
-(cl-defun agent-shell--make-header (state &key qualifier bindings)
+(cl-defun agent-shell--make-header (state &key qualifier bindings model-binding mode-binding)
   "Return header text for current STATE.
 
 STATE should contain :agent-config with :icon-name, :buffer-name, and
@@ -3211,17 +3216,23 @@ QUALIFIER: Any text to prefix BINDINGS row with.
 
 BINDINGS is a list of alists defining key bindings to display, each with:
   :key         - Key string (e.g., \"n\")
-  :description - Description to display (e.g., \"next hunk\")"
+  :description - Description to display (e.g., \"next hunk\")
+
+MODEL-BINDING: Optional key description string for the model menu command.
+MODE-BINDING: Optional key description string for the session mode menu command.
+When provided, included in help-echo tooltips."
   (unless state
     (error "STATE is required"))
   (let* ((header-model (agent-shell--make-header-model state :qualifier qualifier :bindings bindings))
          (text-header (format " %s%s%s @ %s%s%s%s"
-                              (propertize (concat (map-elt header-model :buffer-name) " Agent")
+                              (propertize (map-elt header-model :buffer-name)
                                           'font-lock-face 'font-lock-variable-name-face)
                               (if (map-elt header-model :model-name)
                                   (concat " ➤ " (propertize (map-elt header-model :model-name)
                                                             'font-lock-face 'font-lock-negation-char-face
-                                                            'help-echo "Click to open LLM model menu"
+                                                            'help-echo (concat "Click to open LLM model menu "
+                                                                               (when model-binding
+                                                                                 (propertize model-binding 'face 'help-key-binding)))
                                                             'mouse-face 'mode-line-highlight
                                                             'local-map (let ((map (make-sparse-keymap)))
                                                                          (define-key map [header-line mouse-1]
@@ -3231,7 +3242,9 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                               (if (map-elt header-model :mode-name)
                                   (concat " ➤ " (propertize (map-elt header-model :mode-name)
                                                             'font-lock-face 'font-lock-type-face
-                                                            'help-echo "Click to open session mode menu"
+                                                            'help-echo (concat "Click to open session mode menu "
+                                                                               (when mode-binding
+                                                                                 (propertize mode-binding 'face 'help-key-binding)))
                                                             'mouse-face 'mode-line-highlight
                                                             'local-map (let ((map (make-sparse-keymap)))
                                                                          (define-key map [header-line mouse-1]
@@ -3253,7 +3266,7 @@ BINDINGS is a list of alists defining key bindings to display, each with:
       ((or 'none (pred null)) nil)
       ('text text-header)
       ('graphical
-       (if (display-graphic-p)
+       (if (image-type-available-p 'svg)
            ;; +------+
            ;; | icon | Top text line
            ;; |      | Bottom text line
@@ -3305,7 +3318,7 @@ BINDINGS is a list of alists defining key bindings to display, each with:
                                       (dom-append-child text-node
                                                         (dom-node 'tspan
                                                                   `((fill . ,(face-attribute 'font-lock-variable-name-face :foreground)))
-                                                                  (concat (map-elt header-model :buffer-name) " Agent")))
+                                                                  (map-elt header-model :buffer-name)))
                                       ;; Model name (optional)
                                       (when (map-elt header-model :model-name)
                                         ;; Add separator arrow
@@ -3438,12 +3451,16 @@ Returns a MIME type like \"image/png\" or \"image/jpeg\"."
   "Update header and mode line based on `agent-shell-header-style'."
   (unless (derived-mode-p 'agent-shell-mode)
     (error "Not in a shell"))
-  (cond
-   ((eq agent-shell-header-style 'graphical)
-    (setq header-line-format (agent-shell--make-header (agent-shell--state))))
-   ((memq agent-shell-header-style '(text none nil))
-    (setq header-line-format (agent-shell--make-header (agent-shell--state)))
-    (force-mode-line-update))))
+  (setq header-line-format
+        (agent-shell--make-header (agent-shell--state)
+                                  :model-binding (key-description (where-is-internal
+                                                                   'agent-shell-set-session-model
+                                                                   agent-shell-mode-map t))
+                                  :mode-binding (key-description (where-is-internal
+                                                                  'agent-shell-set-session-mode
+                                                                  agent-shell-mode-map t))))
+  (when (memq agent-shell-header-style '(text none nil))
+    (force-mode-line-update)))
 
 (defun agent-shell--fetch-agent-icon (icon-name)
   "Download icon with ICON-NAME from GitHub, only if it exists, and save as binary.
@@ -4654,7 +4671,8 @@ If FILE-PATH is not an image, returns nil."
               (metadata (agent-shell--read-file-content :file-path file-path :shallow t))
               (mime-type (map-elt metadata :mime-type))
               ;; Check if it's an image type
-              (is-image (string-prefix-p "image/" mime-type)))
+              (is-image (string-prefix-p "image/" mime-type))
+              (type-supported (image-supported-file-p file-path)))
     (create-image file-path nil nil :max-width max-width)))
 
 (cl-defun agent-shell--collect-attached-files (content-blocks)
@@ -5415,57 +5433,55 @@ ACTIONS as per `agent-shell--make-permission-action'."
                 :new (map-elt diff :new)
                 :file (map-elt diff :file)
                 :title (file-name-nondirectory (map-elt diff :file))
-              :on-accept (lambda ()
-                           (interactive)
-                           (let ((action (agent-shell--resolve-permission-choice-to-action
-                                          :choice 'accept
-                                          :actions actions)))
-                             (agent-shell-diff-kill-buffer (current-buffer))
-                             (with-current-buffer shell-buffer
-                               (agent-shell--send-permission-response
-                                :client client
-                                :request-id request-id
-                                :option-id (map-elt action :option-id)
-                                :state state
-                                :tool-call-id tool-call-id
-                                :message-text (map-elt action :option)))))
-              :on-reject (lambda ()
-                           (interactive)
-                           (when (agent-shell-interrupt-confirmed-p)
-                             (agent-shell-diff-kill-buffer (current-buffer))
-                             (with-current-buffer shell-buffer
-                               (agent-shell-interrupt t))))
-              :on-exit (lambda ()
-                         (if-let ((choice (condition-case nil
-                                              (if (y-or-n-p "Accept changes?")
-                                                  'accept
-                                                'reject)
-                                            (quit 'ignore)))
-                                  (action (agent-shell--resolve-permission-choice-to-action
-                                           :choice choice
-                                           :actions actions)))
-                             (progn
-                               (agent-shell--send-permission-response
-                                :client client
-                                :request-id request-id
-                                :option-id (map-elt action :option-id)
-                                :state state
-                                :tool-call-id tool-call-id
-                                :message-text (map-elt action :option))
-                               (when (eq choice 'reject)
-                                 ;; No point in rejecting the change but letting
-                                 ;; the agent continue (it doesn't know why you
-                                 ;; have rejected the change).
-                                 ;; May as well interrupt so you can course-correct.
-                                 (with-current-buffer shell-buffer
-                                   (agent-shell-interrupt t))))
-                           (message "Ignored"))))))
-        ;; Track the diff buffer in tool-call state so it can be
-        ;; cleaned up when the permission is resolved externally.
-        (when-let ((tool-calls (map-elt state :tool-calls)))
-          (map-put! tool-calls tool-call-id
-                    (map-insert (map-elt tool-calls tool-call-id)
-                                :diff-buffer diff-buffer))))))))
+                :on-accept (lambda ()
+                             (interactive)
+                             (let ((action (agent-shell--resolve-permission-choice-to-action
+                                            :choice 'accept
+                                            :actions actions)))
+                               (with-current-buffer shell-buffer
+                                 (agent-shell--send-permission-response
+                                  :client client
+                                  :request-id request-id
+                                  :option-id (map-elt action :option-id)
+                                  :state state
+                                  :tool-call-id tool-call-id
+                                  :message-text (map-elt action :option)))))
+                :on-reject (lambda ()
+                             (interactive)
+                             (when (agent-shell-interrupt-confirmed-p)
+                               (with-current-buffer shell-buffer
+                                 (agent-shell-interrupt t))))
+                :on-exit (lambda ()
+                           (if-let ((choice (condition-case nil
+                                                (if (y-or-n-p "Accept changes?")
+                                                    'accept
+                                                  'reject)
+                                              (quit 'ignore)))
+                                    (action (agent-shell--resolve-permission-choice-to-action
+                                             :choice choice
+                                             :actions actions)))
+                               (progn
+                                 (agent-shell--send-permission-response
+                                  :client client
+                                  :request-id request-id
+                                  :option-id (map-elt action :option-id)
+                                  :state state
+                                  :tool-call-id tool-call-id
+                                  :message-text (map-elt action :option))
+                                 (when (eq choice 'reject)
+                                   ;; No point in rejecting the change but letting
+                                   ;; the agent continue (it doesn't know why you
+                                   ;; have rejected the change).
+                                   ;; May as well interrupt so you can course-correct.
+                                   (with-current-buffer shell-buffer
+                                     (agent-shell-interrupt t))))
+                             (message "Ignored"))))))
+          ;; Track the diff buffer in tool-call state so it can be
+          ;; cleaned up when the permission is resolved externally.
+          (when-let ((tool-calls (map-elt state :tool-calls)))
+            (map-put! tool-calls tool-call-id
+                      (map-insert (map-elt tool-calls tool-call-id)
+                                  :diff-buffer diff-buffer))))))))
 
 (cl-defun agent-shell--make-permission-button (&key text help action keymap navigatable char option)
   "Create a permission button with TEXT, HELP, ACTION, and KEYMAP.
@@ -6237,7 +6253,11 @@ Shows \" ⧉\" when a command prefix is used."
                                        (map-nested-elt (agent-shell--state) '(:session :model-id)))))
               (concat " " (propertize model-name
                                       'face 'font-lock-negation-char-face
-                                      'help-echo "Click to open LLM model menu"
+                                      'help-echo (concat "Click to open LLM model menu "
+                                                         (propertize (key-description (where-is-internal
+                                                                                       'agent-shell-set-session-model
+                                                                                       agent-shell-mode-map t))
+                                                                     'face 'help-key-binding))
                                       'mouse-face 'mode-line-highlight
                                       'local-map (let ((map (make-sparse-keymap)))
                                                    (define-key map [mode-line mouse-1]
@@ -6248,7 +6268,11 @@ Shows \" ⧉\" when a command prefix is used."
                                    (agent-shell--get-available-modes (agent-shell--state)))))
               (concat " ➤ " (propertize mode-name
                                         'face 'font-lock-type-face
-                                        'help-echo "Click to open session mode menu"
+                                        'help-echo (concat "Click to open session mode menu "
+                                                           (propertize (key-description (where-is-internal
+                                                                                         'agent-shell-set-session-mode
+                                                                                         agent-shell-mode-map t))
+                                                                       'face 'help-key-binding))
                                         'mouse-face 'mode-line-highlight
                                         'local-map (let ((map (make-sparse-keymap)))
                                                      (define-key map [mode-line mouse-1]

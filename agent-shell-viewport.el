@@ -1235,18 +1235,27 @@ Automatically determines qualifier and bindings based on current major mode."
                        `((:key . ,(key-description (where-is-internal
                                                     'agent-shell-viewport-help-menu
                                                     agent-shell-viewport-view-mode-map t)))
-                         (:description . "Help"))))))))
+                         (:description . "Help")))))))
+         (keymap (cond
+                  ((derived-mode-p 'agent-shell-viewport-edit-mode)
+                   agent-shell-viewport-edit-mode-map)
+                  ((derived-mode-p 'agent-shell-viewport-view-mode)
+                   agent-shell-viewport-view-mode-map)))
+         (model-binding (when keymap
+                          (key-description (where-is-internal
+                                            'agent-shell-viewport-set-session-model
+                                            keymap t))))
+         (mode-binding (when keymap
+                         (key-description (where-is-internal
+                                           'agent-shell-viewport-set-session-mode
+                                           keymap t)))))
     (when-let* ((shell-buffer (agent-shell-viewport--shell-buffer))
                 (header (with-current-buffer shell-buffer
-                          (cond
-                           ((eq agent-shell-header-style 'graphical)
-                            (agent-shell--make-header (agent-shell--state)
-                                                      :qualifier qualifier
-                                                      :bindings bindings))
-                           ((memq agent-shell-header-style '(text none nil))
-                            (agent-shell--make-header (agent-shell--state)
-                                                      :qualifier qualifier
-                                                      :bindings bindings))))))
+                          (agent-shell--make-header (agent-shell--state)
+                                                    :qualifier qualifier
+                                                    :bindings bindings
+                                                    :model-binding model-binding
+                                                    :mode-binding mode-binding))))
       (setq-local header-line-format header))))
 
 (defvar-local agent-shell-viewport--clean-up t)
