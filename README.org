@@ -25,6 +25,10 @@ Watch on [[https://www.youtube.com/watch?v=R2Ucr3amgGg][YouTube]]
 
 [[https://www.youtube.com/watch?v=R2Ucr3amgGg][file:yt.png]]
 
+[[https://www.youtube.com/watch?v=ymMlftdGx4I][https://img.youtube.com/vi/ymMlftdGx4I/0.jpg]]
+
+[[https://www.youtube.com/watch?v=HJQ86HuSIJI][https://img.youtube.com/vi/HJQ86HuSIJI/0.jpg]]
+
 * News
 
 - [[https://xenodium.com/agent-shell-0-47-1-updates][agent-shell 0.47 updates]].
@@ -64,13 +68,15 @@ Thanks to [[https://github.com/lobehub/lobe-icons][Lobe Icons]] for the lovely i
 
 *** Claude Agent SDK
 
-For Anthropic's [[https://platform.claude.com/docs/en/agent-sdk/overview][Claude Agent SDK]] (formerly known as the Claude Code SDK), follow [[https://github.com/agentclientprotocol/claude-agent-acp][claude-agent-acp instructions]], typically something like:
+For Anthropic's [[https://code.claude.com/docs/en/overview][Claude Agent]] (formerly known as the Claude Code), follow [[https://github.com/agentclientprotocol/claude-agent-acp][claude-agent-acp instructions]], typically something like:
 
 #+begin_src bash
 npm install -g @agentclientprotocol/claude-agent-acp
 #+end_src
 
 *Note:* The =-g= flag is required to install the binary globally so it's available in your PATH. After installation, verify it's available by running =which claude-agent-acp= in your terminal.
+
+Optionally: You may also need [[https://code.claude.com/docs/en/overview][Claude Agent]] itself if you want to use a Claude subscription (run the CLI outside of Emacs at least once to log in to your subscription and then use =agent-shell= from Emacs). Follow Claude Agent's [[https://code.claude.com/docs/en/overview#get-started][get started]] for installation.
 
 *** Codex
 
@@ -93,6 +99,16 @@ npm install -g @blowmage/cursor-agent-acp
 #+end_src
 
 See https://github.com/blowmage/cursor-agent-acp-npm for details.
+
+*** Kimi Code CLI
+
+For Kimi Code CLI, install with:
+
+#+begin_src bash
+curl -L code.kimi.com/install.sh | bash
+#+end_src
+
+See https://www.kimi.com/code for details.
 
 *** Kiro CLI
 
@@ -853,7 +869,7 @@ Sometimes including a traffic screenshot in an issue is enough. Other times incl
 
 If you're able to determine the agent is missing a feature (or a bug is present) in their [[https://agentclientprotocol.com][Agent Client Protocol]] implementation, please file an issue directly with the agent folks. For example:
 
-- [[https://github.com/zed-industries/claude-code-acp][claude-code-acp]]: For Claude Agent.
+- [[https://github.com/agentclientprotocol/claude-agent-acp][claude-agent-acp]]: For Claude Agent.
 - [[https://github.com/zed-industries/codex-acp][codex-acp]]: For Codex.
 - [[https://github.com/google-gemini/gemini-cli][Gemini CLI]].
 - [[https://block.github.io/goose/docs/getting-started/installation][Goose]].
