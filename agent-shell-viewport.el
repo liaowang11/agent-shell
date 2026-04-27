@@ -487,11 +487,14 @@ Optionally set its PROMPT and RESPONSE."
                   agent-shell-viewport-edit-mode))
   (interactive)
   (agent-shell-viewport--ensure-buffer)
-  (when-let ((shell-buffer (agent-shell-viewport--shell-buffer)))
-    (with-current-buffer shell-buffer
-      (goto-char comint-last-input-start)))
-  (agent-shell-viewport-view-mode)
-  (agent-shell-viewport-refresh))
+  (agent-shell-goto-last-interaction)
+  (when-let ((current (agent-shell-interaction-at-point)))
+    (agent-shell-viewport-view-mode)
+    (agent-shell-viewport--initialize
+     :prompt (map-elt current :prompt)
+     :response (map-elt current :response))
+    (goto-char (point-min))
+    current))
 
 (defun agent-shell-viewport-refresh ()
   "Refresh viewport buffer content with current item from shell."
@@ -499,14 +502,11 @@ Optionally set its PROMPT and RESPONSE."
                   agent-shell-viewport-edit-mode))
   (interactive)
   (agent-shell-viewport--ensure-buffer)
-  (when-let ((shell-buffer (agent-shell-viewport--shell-buffer))
-             (viewport-buffer (current-buffer))
-             (current (with-current-buffer shell-buffer
-                        (or (shell-maker--command-and-response-at-point)
-                            (shell-maker-next-command-and-response t)))))
+  (when-let ((viewport-buffer (current-buffer))
+             (current (agent-shell-interaction-at-point)))
     (agent-shell-viewport--initialize
-     :prompt (car current)
-     :response (cdr current))
+     :prompt (map-elt current :prompt)
+     :response (map-elt current :response))
     (goto-char (point-min))
     current))
 

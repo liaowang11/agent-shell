@@ -1224,6 +1224,25 @@ code block content
         (agent-shell--start-idle-timer :event 'permission-request)
         (should (timerp (map-elt agent-shell--state :idle-timer)))))))
 
+(ert-deftest agent-shell-idle-event-per-event-timeout-test ()
+  "Test that idle timer uses per-event timeout from alist."
+  (with-temp-buffer
+    (let ((agent-shell--state (list (cons :buffer (current-buffer))
+                                    (cons :event-subscriptions nil)
+                                    (cons :idle-timer nil)))
+          (agent-shell-idle-timeout '((permission-request . 0.01)
+                                      (turn-complete . 999)))
+          (fired nil))
+      (cl-letf (((symbol-function 'agent-shell--state)
+                 (lambda () agent-shell--state)))
+        (agent-shell-subscribe-to
+         :shell-buffer (current-buffer)
+         :event 'idle
+         :on-event (lambda (_event) (setq fired t)))
+        (agent-shell--start-idle-timer :event 'permission-request)
+        (sit-for 0.05)
+        (should fired)))))
+
 (ert-deftest agent-shell-idle-event-includes-trigger-and-buffer-test ()
   "Test that idle event data includes the trigger event and buffer."
   (with-temp-buffer
@@ -2458,6 +2477,34 @@ that fallback buffer, potentially starting the new shell in the wrong project."
         (kill-buffer other-buffer))
       (when-let ((buf (get-buffer "*test-restart-new-shell*")))
         (kill-buffer buf)))))
+
+(ert-deftest agent-shell-sort-sessions-by-recency-test ()
+  "Test `agent-shell--sort-sessions-by-recency' ordering."
+  ;; Newest `updatedAt' first.
+  (should (equal (agent-shell--sort-sessions-by-recency
+                  '(((sessionId . "a") (updatedAt . "2024-01-01T00:00:00Z"))
+                    ((sessionId . "b") (updatedAt . "2024-02-01T00:00:00Z"))
+                    ((sessionId . "c") (updatedAt . "2024-01-15T00:00:00Z"))))
+                 '(((sessionId . "b") (updatedAt . "2024-02-01T00:00:00Z"))
+                   ((sessionId . "c") (updatedAt . "2024-01-15T00:00:00Z"))
+                   ((sessionId . "a") (updatedAt . "2024-01-01T00:00:00Z")))))
+
+  ;; Falls back to `createdAt' when `updatedAt' is missing.
+  (should (equal (agent-shell--sort-sessions-by-recency
+                  '(((sessionId . "a") (createdAt . "2024-01-01T00:00:00Z"))
+                    ((sessionId . "b") (updatedAt . "2024-02-01T00:00:00Z"))))
+                 '(((sessionId . "b") (updatedAt . "2024-02-01T00:00:00Z"))
+                   ((sessionId . "a") (createdAt . "2024-01-01T00:00:00Z")))))
+
+  ;; Sessions without either timestamp sort last.
+  (should (equal (agent-shell--sort-sessions-by-recency
+                  '(((sessionId . "a"))
+                    ((sessionId . "b") (updatedAt . "2024-02-01T00:00:00Z"))))
+                 '(((sessionId . "b") (updatedAt . "2024-02-01T00:00:00Z"))
+                   ((sessionId . "a")))))
+
+  ;; Empty input returns empty output.
+  (should (equal (agent-shell--sort-sessions-by-recency '()) '())))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

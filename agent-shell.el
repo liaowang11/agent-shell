@@ -579,7 +579,23 @@ or `turn-complete'), an `idle' event is emitted after this many
 seconds of inactivity.  Activity events (`permission-response',
 `tool-call-update', `input-submitted', `clean-up') cancel the timer.
 
-When nil, defaults to 30 seconds.")
+Can be a number (same timeout for all events) or an alist mapping
+event symbols to timeouts:
+
+  (setq agent-shell-idle-timeout
+        \\='((permission-request . 10)
+          (turn-complete . 60)))
+
+Defaults to 30 seconds when nil or when an event has no entry.")
+
+(cl-defun agent-shell-idle-timeout (&key event)
+  "Resolve idle timeout in seconds.
+When EVENT is non-nil, look it up in `agent-shell-idle-timeout'
+if it is an alist.  Falls back to 30 seconds."
+  (or (if (listp agent-shell-idle-timeout)
+          (map-elt agent-shell-idle-timeout event)
+        agent-shell-idle-timeout)
+      30))
 
 (defcustom agent-shell-outgoing-request-decorator nil
   "Function to decorate outgoing ACP requests before they are sent.
@@ -3756,7 +3772,7 @@ the original EVENT as :idle-event."
   (agent-shell--cancel-idle-timer)
   (when-let ((buffer (map-elt (agent-shell--state) :buffer)))
     (map-put! (agent-shell--state) :idle-timer
-              (run-at-time (or agent-shell-idle-timeout 30) nil
+              (run-at-time (agent-shell-idle-timeout :event event) nil
                            (lambda ()
                              (when (buffer-live-p buffer)
                                (with-current-buffer buffer
@@ -4078,6 +4094,25 @@ Must provide ON-SESSION-INIT (lambda ())."
         (agent-shell--initiate-new-session
          :shell-buffer shell-buffer
          :on-session-init on-session-init))))))
+
+(defun agent-shell--sort-sessions-by-recency (acp-sessions)
+  "Return ACP-SESSIONS sorted by recency, newest first.
+
+Sorts by `updatedAt' when present, falling back to `createdAt'.
+ISO-8601 timestamps sort lexically the same as chronologically,
+so `string>' yields descending time order.
+
+  (agent-shell--sort-sessions-by-recency
+   \\='(((sessionId . \"a\") (updatedAt . \"2024-01-01T00:00:00Z\"))
+     ((sessionId . \"b\") (updatedAt . \"2024-02-01T00:00:00Z\"))))
+  ;; => (((sessionId . \"b\") (updatedAt . \"2024-02-01T00:00:00Z\"))
+  ;;     ((sessionId . \"a\") (updatedAt . \"2024-01-01T00:00:00Z\")))"
+  (seq-sort (lambda (a b)
+              (string> (or (map-elt a 'updatedAt)
+                           (map-elt a 'createdAt) "")
+                       (or (map-elt b 'updatedAt)
+                           (map-elt b 'createdAt) "")))
+            acp-sessions))
 
 (defun agent-shell--format-session-date (iso-timestamp)
   "Format ISO-TIMESTAMP as a human-friendly date string.
@@ -4452,7 +4487,8 @@ SESSION-TITLE is an optional display title for the resumed session."
              :cwd (agent-shell--resolve-path (agent-shell-cwd)))
    :buffer (current-buffer)
    :on-success (lambda (acp-response)
-                 (let ((acp-sessions (append (or (map-elt acp-response 'sessions) '()) nil)))
+                 (let ((acp-sessions (agent-shell--sort-sessions-by-recency
+                                      (append (or (map-elt acp-response 'sessions) '()) nil))))
                    (condition-case nil
                        (let* ((acp-session
                                (pcase agent-shell-session-strategy
@@ -4922,6 +4958,22 @@ Returns a buffer object or nil."
                               :new-session t
                               :session-strategy agent-shell-session-strategy))))))
 
+(defun agent-shell-goto-last-interaction ()
+  "Move point to the last interaction in the shell buffer."
+  (when-let ((shell-buffer (agent-shell--shell-buffer)))
+    (with-current-buffer shell-buffer
+      (goto-char comint-last-input-start))))
+
+(defun agent-shell-interaction-at-point ()
+  "Return the interaction at point in the shell buffer.
+Result is of the form ((:prompt . PROMPT) (:response . RESPONSE))."
+  (when-let ((shell-buffer (agent-shell--shell-buffer))
+             (result (with-current-buffer shell-buffer
+                       (or (shell-maker--command-and-response-at-point)
+                           (shell-maker-next-command-and-response t)))))
+    `((:prompt . ,(car result))
+      (:response . ,(cdr result)))))
+
 (defun agent-shell--current-shell ()
   "Current shell for viewport or shell buffer."
   (cond ((derived-mode-p 'agent-shell-mode)
@@ -4934,6 +4986,22 @@ Returns a buffer object or nil."
                                           :existing-only t)
                                          (current-buffer)))
                                 (agent-shell-buffers))))))
+
+;;;###autoload
+(cl-defun agent-shell-shell-buffer (&key viewport-buffer no-error no-create)
+  "Return an agent-shell buffer for the current context.
+
+A stable public API wrapping the internal resolver, intended for
+packages that integrate with agent-shell programmatically.
+
+Resolution order: viewport → current buffer → project buffers → prompt user.
+
+Example:
+  (agent-shell-shell-buffer)
+  (agent-shell-shell-buffer :no-error t)"
+  (agent-shell--shell-buffer :viewport-buffer viewport-buffer
+                             :no-error no-error
+                             :no-create no-create))
 
 (defun agent-shell--input ()
   "Return shell input (not yet submitted)."

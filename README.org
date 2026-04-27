@@ -21,11 +21,15 @@ A native Emacs shell to interact with LLM agents powered by ACP ([[https://agent
 
 With agent-shell, you can chat with the likes of Gemini CLI, Claude Agent, Auggie, Mistral Vibe, or any other ACP-driven agent.
 
-Watch on [[https://www.youtube.com/watch?v=R2Ucr3amgGg][YouTube]]
+[[https://www.youtube.com/watch?v=R2Ucr3amgGg][agent-shell - YouTube]]
 
 [[https://www.youtube.com/watch?v=R2Ucr3amgGg][file:yt.png]]
 
+[[https://www.youtube.com/watch?v=ymMlftdGx4I][agent-shell + Claude Skills - YouTube]]
+
 [[https://www.youtube.com/watch?v=ymMlftdGx4I][https://img.youtube.com/vi/ymMlftdGx4I/0.jpg]]
+
+[[https://www.youtube.com/watch?v=HJQ86HuSIJI][agent-shell + Claude Skills + Charts - YouTube]]
 
 [[https://www.youtube.com/watch?v=HJQ86HuSIJI][https://img.youtube.com/vi/HJQ86HuSIJI/0.jpg]]
 
@@ -57,6 +61,8 @@ We now have a handful of additional packages to extend the =agent-shell= experie
 - [[https://github.com/zackattackz/agent-shell-notifications][agent-shell-notifications]]: Desktop notifications for =agent-shell= events.
 - [[https://github.com/ElleNajt/meta-agent-shell][meta-agent-shell]]: Multi-agent coordination system for =agent-shell= with inter-agent communication, task tracking, and project-level dispatching.
 - [[https://github.com/cxa/agent-shell-macext][agent-shell-macext]]: macOS-specific enhancements for =agent-shell=.
+- [[https://github.com/lllShamanlll/agent-shell-org-transcript][agent-shell-org-transcript]]: Org-mode transcripts for =agent-shell= sessions, with org-roam integration.
+- [[https://github.com/eddof13/ob-agent-shell][ob-agent-shell]]: Org Babel backend for executing =agent-shell= source blocks.
 
 * Icons
 
