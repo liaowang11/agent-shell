@@ -2405,10 +2405,10 @@ For example:
 (defun agent-shell--dot-subdir (subdir)
   "Return path to SUBDIR for `agent-shell' data, creating it if needed.
 Calls `agent-shell-dot-subdir-function' to resolve the path.
-When the directory is first created inside a git repo and
-.agent-shell/ is not yet ignored, automatically add it to .gitignore.
-This gitignore update is a one-time operation: if the entry is later
-removed from .gitignore it will not be re-added."
+When the directory is first created under the project .agent-shell/ directory
+inside a git repo and .agent-shell/ is not yet ignored, automatically add it
+to .gitignore.  This gitignore update is a one-time operation: if the entry is
+later removed from .gitignore it will not be re-added."
   (unless (functionp agent-shell-dot-subdir-function)
     (error "agent-shell-dot-subdir-function must be set to a function"))
   (let ((dir (funcall agent-shell-dot-subdir-function subdir)))
@@ -2416,8 +2416,23 @@ removed from .gitignore it will not be re-added."
       (error "Failed to resolve agent-shell data directory (subdir: %s).  Resulting directory is not a non-empty string (dir: %s)" subdir dir))
     (unless (file-directory-p dir)
       (make-directory dir t)
-      (agent-shell--ensure-gitignore (agent-shell-cwd)))
+      (when (agent-shell--dot-subdir-in-repo-p dir)
+        (agent-shell--ensure-gitignore (agent-shell-cwd))))
     dir))
+
+(defun agent-shell--dot-subdir-in-repo-p (dir)
+  "Return non-nil when DIR is under the project .agent-shell directory.
+
+For example:
+
+  (agent-shell--dot-subdir-in-repo-p \"/path/to/project/.agent-shell/screenshots\")
+  => t
+
+  (agent-shell--dot-subdir-in-repo-p \"/home/user/.emacs.d/agent-shell/project/screenshots\")
+  => nil"
+  (file-in-directory-p dir
+                       (file-name-as-directory
+                        (expand-file-name ".agent-shell" (agent-shell-cwd)))))
 
 (defun agent-shell--ensure-gitignore (project-root)
   "If .agent-shell/ is not ignored under PROJECT-ROOT, add it to .gitignore."
