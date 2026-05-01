@@ -63,6 +63,7 @@ We now have a handful of additional packages to extend the =agent-shell= experie
 - [[https://github.com/cxa/agent-shell-macext][agent-shell-macext]]: macOS-specific enhancements for =agent-shell=.
 - [[https://github.com/lllShamanlll/agent-shell-org-transcript][agent-shell-org-transcript]]: Org-mode transcripts for =agent-shell= sessions, with org-roam integration.
 - [[https://github.com/eddof13/ob-agent-shell][ob-agent-shell]]: Org Babel backend for executing =agent-shell= source blocks.
+- [[https://github.com/Marx-A00/agent-recall][agent-recall]]: Search, browse, and resume =agent-shell= conversation transcripts.
 
 * Icons
 
