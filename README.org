@@ -158,13 +158,13 @@ See https://github.com/mistralai/mistral-vibe for details.
 
 *** Factory Droid
 
-For Factory Droid, install the =droid-acp= client:
+For Factory Droid, install Droid:
 
 #+begin_src bash
-npm install -g droid-acp
+curl -fsSL https://app.factory.ai/cli | sh
 #+end_src
 
-See https://github.com/yaonyan/droid-acp for details.
+See https://factory.ai for details.
 
 *** Pi
 
