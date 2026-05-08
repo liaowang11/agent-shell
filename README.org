@@ -825,6 +825,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                 | agent-shell-viewport-previous-page                      | Show previous interaction (request / response).                               |
 |                 | agent-shell-viewport-refresh                            | Refresh viewport buffer content with current item from shell.                 |
 |                 | agent-shell-viewport-reply                              | Reply as a follow-up and compose another prompt/query.                        |
+|                 | agent-shell-viewport-quote-reply                        | Reply with the entire response block-quoted.                                  |
 |                 | agent-shell-viewport-set-session-mode                   | Set session mode.                                                             |
 |                 | agent-shell-viewport-set-session-model                  | Set session model.                                                            |
 |                 | agent-shell-viewport-view-last                          | Display the last request/response interaction.                                |

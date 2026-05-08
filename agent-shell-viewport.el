@@ -168,10 +168,7 @@ Returns an alist with insertion details or nil otherwise:
         ;; Transitioned to edit mode. Wipe content.
         (agent-shell-viewport--initialize)
         ;; Restore snapshot if needed.
-        (when-let ((snapshot agent-shell-viewport--compose-snapshot))
-          (insert (map-elt snapshot :content))
-          (goto-char (map-elt snapshot :location))
-          (setq agent-shell-viewport--compose-snapshot nil))
+        (agent-shell-viewport--restore-compose-snapshot)
         (save-excursion
           (goto-char (point-max))
           (setq insert-start (point))
@@ -206,7 +203,7 @@ Returns an alist with insertion details or nil otherwise:
     (user-error "Not in a shell viewport buffer"))
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
         (viewport-buffer (current-buffer))
-        (prompt (buffer-string)))
+        (prompt (agent-shell-viewport--compose-prompt)))
     (with-current-buffer shell-buffer
       (agent-shell--insert-to-shell-buffer
        :text prompt
@@ -223,7 +220,7 @@ Returns an alist with insertion details or nil otherwise:
       (user-error "Not in a shell viewport buffer"))
     (let ((shell-buffer (agent-shell-viewport--shell-buffer))
           (viewport-buffer (current-buffer))
-          (prompt (string-trim (buffer-string))))
+          (prompt (agent-shell-viewport--compose-prompt)))
       (when (agent-shell-viewport--busy-p)
         (unless (agent-shell-interrupt-confirmed-p)
           (throw 'exit nil))
@@ -312,6 +309,66 @@ Optionally set its PROMPT and RESPONSE."
   (unless (or (derived-mode-p 'agent-shell-viewport-view-mode)
               (derived-mode-p 'agent-shell-viewport-edit-mode))
     (user-error "Not in a shell viewport buffer")))
+
+(defun agent-shell-viewport--save-compose-snapshot ()
+  "Save the current compose buffer state."
+  (let ((bounds (agent-shell-viewport--compose-prompt-bounds)))
+    (setq agent-shell-viewport--compose-snapshot
+          `((:content . ,(buffer-substring-no-properties
+                          (car bounds) (cdr bounds)))
+            (:location . ,(- (point) (car bounds)))
+            (:reply-context . ,(agent-shell-viewport--reply-context))))))
+
+(cl-defun agent-shell-viewport--restore-compose-snapshot (&key reply-context)
+  "Restore compose buffer state from snapshot and clear it.
+
+When REPLY-CONTEXT is non-nil, use it instead of the snapshot's context."
+  (let* ((snapshot agent-shell-viewport--compose-snapshot)
+         (context (or reply-context (map-elt snapshot :reply-context))))
+    (when (and context (not (string-empty-p context)))
+      (agent-shell-viewport--insert-reply-context context))
+    (when snapshot
+      (let ((content-start (point)))
+        (insert (map-elt snapshot :content))
+        (goto-char (+ content-start (map-elt snapshot :location))))
+      (setq agent-shell-viewport--compose-snapshot nil))))
+
+(defun agent-shell-viewport--compose-prompt-bounds ()
+  "Return (BEG . END) of the user-editable content in the compose buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (let* ((match (text-property-search-forward
+                   'agent-shell-viewport-reply-context))
+           (beg (if match (point) (point-min))))
+      (cons beg (point-max)))))
+
+(defun agent-shell-viewport--compose-prompt ()
+  "Return the user-editable content of the compose buffer."
+  (let ((bounds (agent-shell-viewport--compose-prompt-bounds)))
+    (string-trim (buffer-substring-no-properties (car bounds) (cdr bounds)))))
+
+(defun agent-shell-viewport--reply-context ()
+  "Return the reply context text from the buffer.
+
+If there is no reply context, return nil."
+  (save-excursion
+    (goto-char (point-min))
+    (when-let ((match (text-property-search-forward
+                       'agent-shell-viewport-reply-context t t)))
+      (string-trim
+       (buffer-substring-no-properties
+        (prop-match-beginning match)
+        (prop-match-end match))))))
+
+(defun agent-shell-viewport--insert-reply-context (text)
+  "Insert TEXT as read-only reply context at point."
+  (let ((inhibit-read-only t))
+    (insert (propertize (concat text "\n\n")
+                        'agent-shell-viewport-reply-context t
+                        'read-only t
+                        'face 'shadow
+                        'rear-nonsticky '(agent-shell-viewport-reply-context
+                                          read-only face)))))
 
 (defun agent-shell-viewport--prompt ()
   "Return the buffer prompt."
@@ -408,9 +465,7 @@ Optionally set its PROMPT and RESPONSE."
     ;; Save in-progress compose text before first history navigation.
     (when (and (not agent-shell-viewport--ring-index)
                (not agent-shell-viewport--compose-snapshot))
-      (setq agent-shell-viewport--compose-snapshot
-            `((:content . ,(buffer-string))
-              (:location . ,(point)))))
+      (agent-shell-viewport--save-compose-snapshot))
     (cond
      ;; Empty ring.
      ((not next-index)
@@ -440,13 +495,10 @@ Optionally set its PROMPT and RESPONSE."
          (next-index (1- agent-shell-viewport--ring-index)))
     (if (< next-index 0)
         ;; Past newest entry, restore in-progress compose text.
-        (let ((snapshot agent-shell-viewport--compose-snapshot))
+        (progn
           (setq agent-shell-viewport--ring-index nil)
           (agent-shell-viewport--initialize)
-          (when snapshot
-            (insert (map-elt snapshot :content))
-            (goto-char (map-elt snapshot :location))
-            (setq agent-shell-viewport--compose-snapshot nil)))
+          (agent-shell-viewport--restore-compose-snapshot))
       ;; Show older entry.
       (setq agent-shell-viewport--ring-index next-index)
       (agent-shell-viewport--initialize
@@ -476,9 +528,7 @@ Optionally set its PROMPT and RESPONSE."
   (unless (with-current-buffer (agent-shell-viewport--shell-buffer)
             (shell-maker-history-position))
     (user-error "No items in history"))
-  (setq agent-shell-viewport--compose-snapshot
-        `((:content . ,(buffer-string))
-          (:location . ,(point))))
+  (agent-shell-viewport--save-compose-snapshot)
   (agent-shell-viewport-view-last))
 
 (defun agent-shell-viewport-view-last ()
@@ -620,6 +670,34 @@ With EXISTING-ONLY, only return existing buffers without creating."
               (agent-shell-viewport-edit-mode)
               (current-buffer))))))))
 
+(defun agent-shell-viewport--block-quote (text)
+  "Prefix each line of TEXT with \"> \"."
+  (concat "> " (replace-regexp-in-string "\n" "\n> " text)))
+
+(cl-defun agent-shell-viewport--setup-reply (&key reply-context quoted-text)
+  "Set up the buffer to compose a reply.
+
+REPLY-CONTEXT is shown as read-only context at the top.  QUOTED-TEXT is
+inserted as a block quote as part of the reply."
+  (with-current-buffer (agent-shell-viewport--shell-buffer)
+    (goto-char (point-max)))
+  (let ((had-snapshot agent-shell-viewport--compose-snapshot))
+    (agent-shell-viewport-edit-mode)
+    (agent-shell-viewport--initialize)
+    (agent-shell-viewport--restore-compose-snapshot :reply-context reply-context)
+    (when quoted-text
+      (goto-char (point-max))
+      (insert (if had-snapshot "\n\n" "")
+              (agent-shell-viewport--block-quote quoted-text) "\n\n"))
+    ;; Skip past any cursor-intangible layout text (e.g. the
+    ;; newline inserted by `agent-shell-viewport--initialize')
+    ;; so callers like `agent-shell-viewport-reply-1' can insert.
+    (goto-char (if (or had-snapshot quoted-text
+                       (and reply-context (not (string-empty-p reply-context))))
+                   (point-max)
+                 (or (next-single-property-change (point-min) 'cursor-intangible)
+                     (point-max))))))
+
 (defun agent-shell-viewport-reply ()
   "Reply as a follow-up and compose another prompt/query."
   (declare (modes agent-shell-viewport-view-mode))
@@ -629,35 +707,22 @@ With EXISTING-ONLY, only return existing buffers without creating."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (let* ((region (map-elt (agent-shell--get-region :deactivate t) :content))
-         (block-quoted-text (when region
-                              (concat
-                               (mapconcat (lambda (line)
-                                            (concat "> " line))
-                                          (split-string region "\n")
-                                          "\n")
-                               "\n\n"))))
-    (with-current-buffer (agent-shell-viewport--shell-buffer)
-      (goto-char (point-max)))
-    (let ((snapshot agent-shell-viewport--compose-snapshot))
-      (agent-shell-viewport-edit-mode)
-      (agent-shell-viewport--initialize)
-      (when snapshot
-        (insert (map-elt snapshot :content))
-        (setq agent-shell-viewport--compose-snapshot nil))
-      (when block-quoted-text
-        (goto-char (point-max))
-        (insert (if snapshot
-                    "\n\n"
-                  "") block-quoted-text))
-      ;; Skip past any cursor-intangible layout text (e.g. the
-      ;; newline inserted by `agent-shell-viewport--initialize')
-      ;; so callers like `agent-shell-viewport-reply-1' can insert.
-      (goto-char (if (or snapshot block-quoted-text)
-                     (point-max)
-                   (or (next-single-property-change (point-min) 'cursor-intangible)
-                       (point-max)))))
-    ;; Setting point isn't enough at times. Force scrolling.
-    (set-window-start (selected-window) (point-min))))
+         (last-response (string-trim (or (agent-shell-viewport--response) ""))))
+    (agent-shell-viewport--setup-reply
+     :reply-context (unless region last-response)
+     :quoted-text region)))
+
+(defun agent-shell-viewport-quote-reply ()
+  "Reply with the entire response block-quoted."
+  (declare (modes agent-shell-viewport-view-mode))
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-viewport-view-mode)
+    (user-error "Not in a shell viewport buffer"))
+  (when (agent-shell-viewport--busy-p)
+    (user-error "Busy, please wait"))
+  (let ((response (or (agent-shell-viewport--response) "")))
+    (agent-shell-viewport--setup-reply
+     :quoted-text (string-trim (substring-no-properties response)))))
 
 (defun agent-shell-viewport-reply-yes ()
   "Reply with \"yes\" and send immediately."
@@ -790,9 +855,7 @@ buffer from the snapshot and switch to edit mode."
         (progn
           (agent-shell-viewport-edit-mode)
           (agent-shell-viewport--initialize)
-          (insert (map-elt snapshot :content))
-          (goto-char (map-elt snapshot :location))
-          (setq agent-shell-viewport--compose-snapshot nil)
+          (agent-shell-viewport--restore-compose-snapshot)
           (cl-return-from agent-shell-viewport-next-page))
       (when-let ((next (with-current-buffer shell-buffer
                          (if backwards
@@ -998,6 +1061,7 @@ VIEWPORT-BUFFER is the viewport buffer to check."
     (define-key map (kbd "f") #'agent-shell-viewport-next-page)
     (define-key map (kbd "b") #'agent-shell-viewport-previous-page)
     (define-key map (kbd "r") #'agent-shell-viewport-reply)
+    (define-key map (kbd "R") #'agent-shell-viewport-quote-reply)
     (define-key map (kbd "y") #'agent-shell-viewport-reply-yes)
     (define-key map (kbd "1") #'agent-shell-viewport-reply-1)
     (define-key map (kbd "2") #'agent-shell-viewport-reply-2)
@@ -1053,6 +1117,9 @@ VIEWPORT-BUFFER is the viewport buffer to check."
                       agent-shell-viewport-view-mode-map
                       '(((:function . agent-shell-viewport-reply)
                          (:description . "Reply…")
+                         (:if-not . agent-shell-viewport--busy-p))
+                        ((:function . agent-shell-viewport-quote-reply)
+                         (:description . "Quote reply…")
                          (:if-not . agent-shell-viewport--busy-p))
                         ((:function . agent-shell-viewport-reply-yes)
                          (:description . "Reply \"yes\"")
