@@ -547,6 +547,7 @@ You can send a screenshot from your clipboard to your shell with =agent-shell-se
 - =wl-paste= for Wayland desktops,
 - =xclip= for Xorg,
 - =pngpaste= for MacOS.
+- =powershell= for Windows.
 
 *** Inhibiting minor modes during file writes
 
