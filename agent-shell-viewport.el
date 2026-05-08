@@ -709,7 +709,7 @@ inserted as a block quote as part of the reply."
   (let* ((region (map-elt (agent-shell--get-region :deactivate t) :content))
          (last-response (string-trim (or (agent-shell-viewport--response) ""))))
     (agent-shell-viewport--setup-reply
-     :reply-context (unless region last-response)
+     :reply-context last-response
      :quoted-text region)))
 
 (defun agent-shell-viewport-quote-reply ()
