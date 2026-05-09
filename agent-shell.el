@@ -1198,6 +1198,35 @@ Includes shells accessed via viewport buffers, preserving visited order."
         (message "Copied session ID: %s" session-id))
     (user-error "No active session")))
 
+(cl-defun agent-shell--permission-pending-p (&key shell-buffer tool-call-id)
+  "Return non-nil if a permission request is pending.
+When SHELL-BUFFER is non-nil, check that buffer instead of the current one.
+When TOOL-CALL-ID is non-nil, check only that specific tool call.
+When nil, check if any permission request is pending."
+  (with-current-buffer (or shell-buffer (current-buffer))
+    (if tool-call-id
+        (map-nested-elt (map-elt (agent-shell--state) :tool-calls)
+                        (list tool-call-id :permission-request-id))
+      (seq-some (lambda (entry)
+                  (map-elt (cdr entry) :permission-request-id))
+                (map-elt (agent-shell--state) :tool-calls)))))
+
+(cl-defun agent-shell-status (&key shell-buffer)
+  "Return the status of the agent shell as a symbol.
+When SHELL-BUFFER is non-nil, check that buffer instead of the current one.
+
+Returns one of:
+  `busy'    - Agent is actively processing.
+  `blocked' - Agent is waiting for a permission response.
+  `ready'   - Agent is idle and ready for input."
+  (with-current-buffer (or shell-buffer (current-buffer))
+    (cond
+     ((and (shell-maker-busy)
+           (agent-shell--permission-pending-p)) 'blocked)
+     ((shell-maker-busy)
+      'busy)
+     (t 'ready))))
+
 (defun agent-shell-interrupt (&optional force)
   "Interrupt in-progress request and reject all pending permissions.
 When FORCE is non-nil, skip confirmation prompt.
