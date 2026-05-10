@@ -1223,9 +1223,10 @@ Returns one of:
     (cond
      ((and (shell-maker-busy)
            (agent-shell--permission-pending-p)) 'blocked)
-     ((shell-maker-busy)
-      'busy)
-     (t 'ready))))
+     (t
+      (if (shell-maker-busy)
+          'busy
+        'ready)))))
 
 (defun agent-shell-interrupt (&optional force)
   "Interrupt in-progress request and reject all pending permissions.
