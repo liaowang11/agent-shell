@@ -2766,6 +2766,8 @@ variable (see makunbound)"))
     (with-current-buffer shell-buffer
       ;; Apply dir-local variables in agent-shell buffer
       (hack-dir-local-variables-non-file-buffer)
+      ;; Set minimal buffer-local state initialization so `agent-shell-get-config' is available.
+      (setq-local agent-shell--state (agent-shell--make-state :agent-config config))
       (unless (and (map-elt config :client-maker)
                    (funcall (map-elt config :client-maker) (current-buffer)))
         (kill-buffer shell-buffer)
@@ -2776,7 +2778,7 @@ variable (see makunbound)"))
           (error "%s" (agent-shell--make-missing-executable-error
                        :executable command
                        :install-instructions (map-elt config :install-instructions)))))
-      ;; Initialize buffer-local state
+      ;; Initialize full buffer-local state (replaces the minimal one above).
       (setq-local agent-shell--state (agent-shell--make-state
                                       :buffer shell-buffer
                                       :heartbeat (agent-shell-heartbeat-make
