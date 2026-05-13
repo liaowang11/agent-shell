@@ -443,15 +443,18 @@
   (let ((sent-request nil)
         (agent-shell--state (list
                              (cons :client 'test-client)
-                             (cons :session (list (cons :id "test-session")))
+                             (cons :session (list (cons :id "test-session") (cons :title nil)))
                              (cons :prompt-capabilities '((:embedded-context . t)))
                              (cons :buffer (current-buffer))
                              (cons :last-entry-type nil)
-                             (cons :active-requests nil))))
+                             (cons :active-requests nil)
+                             (cons :idle-timer nil))))
 
     ;; Mock acp-send-request to capture what gets sent;
     ;; stub viewport--buffer to avoid interactive shell-buffer prompt in batch.
-    (cl-letf (((symbol-function 'acp-send-request)
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'acp-send-request)
                (lambda (&rest args)
                  (setq sent-request args)))
               ((symbol-function 'agent-shell-viewport--buffer)
@@ -477,15 +480,18 @@
   (let ((sent-request nil)
         (agent-shell--state (list
                              (cons :client 'test-client)
-                             (cons :session (list (cons :id "test-session")))
+                             (cons :session (list (cons :id "test-session") (cons :title nil)))
                              (cons :prompt-capabilities '((:embedded-context . t)))
                              (cons :buffer (current-buffer))
                              (cons :last-entry-type nil)
-                             (cons :active-requests nil))))
+                             (cons :active-requests nil)
+                             (cons :idle-timer nil))))
 
     ;; Mock build-content-blocks to throw an error;
     ;; stub viewport--buffer to avoid interactive shell-buffer prompt in batch.
-    (cl-letf (((symbol-function 'agent-shell--build-content-blocks)
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--build-content-blocks)
                (lambda (_prompt)
                  (error "Simulated error in build-content-blocks")))
               ((symbol-function 'acp-send-request)
@@ -522,10 +528,11 @@
         (agent-shell--state (list (cons :buffer (current-buffer))
                                   (cons :event-subscriptions nil)
                                   (cons :client 'test-client)
-                                  (cons :session (list (cons :id "test-session")))
+                                  (cons :session (list (cons :id "test-session") (cons :title nil)))
                                   (cons :last-entry-type nil)
                                   (cons :tool-calls nil)
-                                  (cons :usage (list (cons :total-tokens 0)))))
+                                  (cons :usage (list (cons :total-tokens 0)))
+                                  (cons :idle-timer nil)))
         (agent-shell-show-busy-indicator nil)
         (agent-shell-show-usage-at-turn-end nil))
     (cl-letf (((symbol-function 'agent-shell--state)
@@ -1310,7 +1317,8 @@ code block content
         (agent-shell--state (list (cons :buffer (current-buffer))
                                   (cons :event-subscriptions nil)
                                   (cons :tool-calls nil)
-                                  (cons :last-entry-type nil))))
+                                  (cons :last-entry-type nil)
+                                  (cons :idle-timer nil))))
     (cl-letf (((symbol-function 'agent-shell--state)
                (lambda () agent-shell--state))
               ((symbol-function 'agent-shell--update-fragment)
@@ -2020,7 +2028,8 @@ code block content
                     (:client . test-client)
                     (:tool-calls . nil)
                     (:last-entry-type . nil)
-                    (:event-subscriptions . nil))))
+                    (:event-subscriptions . nil)
+                    (:idle-timer . nil))))
       (cl-letf (((symbol-function 'agent-shell--state)
                  (lambda () state))
                 ((symbol-function 'agent-shell--update-fragment)
@@ -2064,7 +2073,8 @@ code block content
                     (:client . test-client)
                     (:tool-calls . nil)
                     (:last-entry-type . nil)
-                    (:event-subscriptions . nil))))
+                    (:event-subscriptions . nil)
+                    (:idle-timer . nil))))
       (cl-letf (((symbol-function 'agent-shell--state)
                  (lambda () state))
                 ((symbol-function 'agent-shell--update-fragment)
@@ -2465,7 +2475,11 @@ that fallback buffer, potentially starting the new shell in the wrong project."
                        (lambda (&rest _args)
                          (setq captured-dir default-directory)
                          (get-buffer-create "*test-restart-new-shell*")))
+                      ((symbol-function 'shell-maker-set-buffer-name)
+                       #'ignore)
                       ((symbol-function 'agent-shell--display-buffer)
+                       #'ignore)
+                      ((symbol-function 'agent-shell-viewport--show-buffer)
                        #'ignore))
               (agent-shell-restart)))
           (should (equal captured-dir project-a)))
@@ -2527,6 +2541,22 @@ and it must handle that cleanly."
         (with-current-buffer shell-buf
           (remove-hook 'kill-buffer-hook #'agent-shell--clean-up t))
         (kill-buffer shell-buf)))))
+
+(ert-deftest agent-shell-filter-buffer-substring-strips-hidden-markup ()
+  "Copying text should exclude markdown syntax hidden by overlays."
+  (with-temp-buffer
+    (insert "```emacs-lisp\n(defun foo (x)\n  x)\n```\n")
+    (markdown-overlays-put)
+    (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
+      (should (equal result "(defun foo (x)\n  x)\n\n")))))
+
+(ert-deftest agent-shell-filter-buffer-substring-strips-inline-code-backticks ()
+  "Copying inline code should exclude the surrounding backticks."
+  (with-temp-buffer
+    (insert "Use `foo-bar` for that.")
+    (markdown-overlays-put)
+    (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
+      (should (equal result "Use foo-bar for that.")))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

@@ -170,6 +170,7 @@
                     ((symbol-function 'acp-make-session-request-permission-response) #'ignore)
                     ((symbol-function 'agent-shell--delete-fragment) #'ignore)
                     ((symbol-function 'agent-shell--emit-event) #'ignore)
+                    ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
                     ((symbol-function 'agent-shell-jump-to-latest-permission-button-row) #'ignore)
                     ((symbol-function 'agent-shell-viewport--buffer) (lambda (&rest _) nil)))
             (with-current-buffer shell-buf
@@ -196,7 +197,8 @@
                           (cons :diff-buffer diff-buf)))
          (state (list (cons :buffer shell-buf)
                       (cons :tool-calls
-                            (list (cons "tc-1" tool-data))))))
+                            (list (cons "tc-1" tool-data)))
+                      (cons :idle-timer nil))))
     (unwind-protect
         (progn
           (should (buffer-live-p diff-buf))

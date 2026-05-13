@@ -4,10 +4,10 @@
 
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
-;; Version: 0.50.1
-;; Package-Requires: ((emacs "29.1") (shell-maker "0.90.1") (acp "0.11.1"))
+;; Version: 0.51.1
+;; Package-Requires: ((emacs "29.1") (shell-maker "0.91.2") (acp "0.11.1"))
 
-(defconst agent-shell--version "0.50.1")
+(defconst agent-shell--version "0.51.1")
 
 ;; This package is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -47,7 +47,7 @@
 (require 'json)
 (require 'map)
 (unless (require 'markdown-overlays nil 'noerror)
-  (error "Please update 'shell-maker' to v0.90.1 or newer"))
+  (error "Please update 'shell-maker' to v0.91.2 or newer"))
 (require 'agent-shell-anthropic)
 (require 'agent-shell-auggie)
 (require 'agent-shell-cline)
@@ -984,13 +984,14 @@ Works from both shell and viewport buffers."
                        'new-deferred
                      'new))
          (config (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                          :agent-config)))
+                          :agent-config))
+         (shell-dir (buffer-local-value 'default-directory shell-buffer)))
     (with-current-buffer shell-buffer
       (when (and (agent-shell--active-requests-p (agent-shell--state))
                  (not (y-or-n-p "Agent is busy.  Restart anyway?")))
         (user-error "Cancelled")))
     (kill-buffer shell-buffer)
-    (let* ((default-directory (buffer-local-value 'default-directory shell-buffer))
+    (let* ((default-directory shell-dir)
            (new-shell-buffer (agent-shell--start
                               :config config
                               :session-strategy strategy
@@ -1272,14 +1273,22 @@ See also `agent-shell-confirm-interrupt'."
       :shell-buffer (map-elt shell :buffer)))))
 
 (defun agent-shell--filter-buffer-substring (start end &optional delete)
-  "Return the buffer substring between START and END, after filtering.
-Strip the text properties `line-prefix' and `wrap-prefix' from the
-copied substring.  If DELETE is non-nil, delete the text between START
-and END from the buffer."
-  (let ((text (if delete
-                  (prog1 (buffer-substring start end)
-                    (delete-region start end))
-                (buffer-substring start end))))
+  "Return visible text between START and END, stripping hidden markup.
+If DELETE is non-nil, delete the text between START and END."
+  (let ((text "")
+        (pos start))
+    (while (< pos end)
+      (let ((next (next-overlay-change pos))
+            (exclude (seq-find (lambda (ov)
+                                 (memq (overlay-get ov 'markdown-overlays-markup-type)
+                                       '(fence language inline-code
+                                         bold italic strikethrough header)))
+                               (overlays-at pos))))
+        (unless exclude
+          (setq text (concat text (buffer-substring pos (min next end)))))
+        (setq pos (max next (1+ pos)))))
+    (when delete
+      (delete-region start end))
     (remove-text-properties 0 (length text)
                             '(line-prefix nil wrap-prefix nil)
                             text)
@@ -2731,8 +2740,8 @@ SESSION-STRATEGY overrides `agent-shell-session-strategy' buffer-locally.
 SESSION-ID resumes an existing session by its id string.
 FORK-SESSION-ID forks an existing session by its id string.
 OUTGOING-REQUEST-DECORATOR is passed through to `acp-make-client'."
-  (unless (version<= "0.90.1" shell-maker-version)
-    (error "Please update shell-maker to version 0.90.1 or newer"))
+  (unless (version<= "0.91.2" shell-maker-version)
+    (error "Please update shell-maker to version 0.91.2 or newer"))
   (unless (version<= "0.11.1" acp-package-version)
     (error "Please update acp.el to version 0.11.1 or newer"))
   (when (boundp 'agent-shell--transcript-file-path-function)
