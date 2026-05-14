@@ -6321,6 +6321,34 @@ With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an
     (agent-shell-insert :text (agent-shell--context :shell-buffer shell-buffer)
                         :shell-buffer shell-buffer)))
 
+(cl-defun agent-shell-queue-request-dwim (&optional arg)
+  "Queue a request with DWIM context for an existing shell.
+
+When called with prefix ARG, prompt to choose an existing shell.
+
+Prefills the minibuffer with `agent-shell--context' when available, but does
+not send until the minibuffer input is confirmed."
+  (interactive "P")
+  (let* ((shell-buffer
+          (if arg
+              (get-buffer
+               (completing-read "Queue request to shell: "
+                                (mapcar #'buffer-name (or (agent-shell-buffers)
+                                                          (user-error "No shells available")))
+                                nil t))
+            (agent-shell--shell-buffer :no-create t)))
+         (context (when-let ((text (agent-shell--context :shell-buffer shell-buffer)))
+                    (concat text "\n\n")))
+         (prompt (with-current-buffer shell-buffer
+                   (or (map-nested-elt (agent-shell--state) '(:agent-config :shell-prompt))
+                       "Enqueue request: ")))
+         (request (minibuffer-with-setup-hook
+                     (lambda ()
+                       (agent-shell-completion--setup-minibuffer shell-buffer))
+                   (read-string prompt context))))
+    (with-current-buffer shell-buffer
+      (agent-shell-queue-request request))))
+
 (cl-defun agent-shell--get-region-context (&key deactivate no-error agent-cwd)
   "Get region as insertable text, ready for sending to agent.
 
