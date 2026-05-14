@@ -46,7 +46,9 @@ the word, nil otherwise."
   (save-excursion
     (when-let* ((end (progn (skip-chars-forward char-class) (point)))
                 (start (progn (skip-chars-backward char-class) (point)))
-                ((eq (char-before start) trigger-char)))
+                ((eq (char-before start) trigger-char))
+                ((or (= start (1+ (line-beginning-position)))
+                     (memq (char-before (1- start)) '(?\s ?\t ?\n)))))
       `((:start . ,start) (:end . ,end)))))
 
 (defun agent-shell--capf-exit-with-space (_string _status)
