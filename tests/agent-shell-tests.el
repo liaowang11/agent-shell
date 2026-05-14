@@ -2480,6 +2480,189 @@ so the command must not append a second time."
                 (agent-shell-send-dwim))
               (should (equal appends '("context from source"))))
           (kill-buffer shell-buffer))))))
+
+(ert-deftest agent-shell-queue-request-dwim-prefills-context-test ()
+  "Test `agent-shell-queue-request-dwim' prefills context before queueing."
+  (with-temp-buffer
+    (let ((source-buffer (current-buffer))
+          (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+          read-args
+          queued-prompt
+          queued-buffer)
+      (unwind-protect
+          (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell--state)
+                     (lambda ()
+                       (if (eq (current-buffer) shell-buffer)
+                           '((:agent-config . ((:shell-prompt . "Enqueue request: "))))
+                         (error "Processed outside shell: %s" major-mode))))
+                    ((symbol-function 'agent-shell--context)
+                     (lambda (&key shell-buffer)
+                       (ignore shell-buffer)
+                       (when (eq (current-buffer) source-buffer)
+                         "context from source")))
+                    ((symbol-function 'read-string)
+                     (lambda (prompt &optional initial-input _history _default-value _inherit-input-method)
+                       (setq read-args (list prompt initial-input))
+                       (concat initial-input "\nextra prompt")))
+                    ((symbol-function 'agent-shell-queue-request)
+                     (lambda (prompt)
+                       (setq queued-prompt prompt
+                             queued-buffer (current-buffer)))))
+            (agent-shell-queue-request-dwim)
+            (should (equal read-args '("Enqueue request: " "context from source\n\n")))
+            (should (equal queued-prompt "context from source\n\n\nextra prompt"))
+            (should (eq queued-buffer shell-buffer)))
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell-queue-request-dwim-sends-immediately-when-idle-test ()
+  "Test `agent-shell-queue-request-dwim' sends immediately when shell is idle."
+  (with-temp-buffer
+    (let ((source-buffer (current-buffer))
+          (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+          inserted-args)
+      (unwind-protect
+          (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell--state)
+                     (lambda ()
+                       (if (eq (current-buffer) shell-buffer)
+                           '((:agent-config . ((:shell-prompt . "Enqueue request: "))))
+                         (error "Processed outside shell: %s" major-mode))))
+                    ((symbol-function 'agent-shell--context)
+                     (lambda (&key shell-buffer)
+                       (ignore shell-buffer)
+                       (when (eq (current-buffer) source-buffer)
+                         "context from source")))
+                    ((symbol-function 'read-string)
+                     (lambda (&rest _)
+                       "final prompt"))
+                    ((symbol-function 'shell-maker-busy)
+                     (lambda ()
+                       nil))
+                    ((symbol-function 'agent-shell--insert-to-shell-buffer)
+                     (lambda (&rest args)
+                       (setq inserted-args (cons (current-buffer) args)))))
+            (agent-shell-queue-request-dwim)
+            (should (eq (car inserted-args) shell-buffer))
+            (should (equal (plist-get (cdr inserted-args) :text) "final prompt"))
+            (should (plist-get (cdr inserted-args) :submit))
+            (should (plist-get (cdr inserted-args) :no-focus)))
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell-queue-request-dwim-enqueues-when-busy-test ()
+  "Test `agent-shell-queue-request-dwim' enqueues when shell is busy."
+  (with-temp-buffer
+    (let ((source-buffer (current-buffer))
+          (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+          enqueued-args)
+      (unwind-protect
+          (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell--state)
+                     (lambda ()
+                       (if (eq (current-buffer) shell-buffer)
+                           '((:agent-config . ((:shell-prompt . "Enqueue request: "))))
+                         (error "Processed outside shell: %s" major-mode))))
+                    ((symbol-function 'agent-shell--context)
+                     (lambda (&key shell-buffer)
+                       (ignore shell-buffer)
+                       (when (eq (current-buffer) source-buffer)
+                         "context from source")))
+                    ((symbol-function 'read-string)
+                     (lambda (&rest _)
+                       "final prompt"))
+                    ((symbol-function 'shell-maker-busy)
+                     (lambda ()
+                       t))
+                    ((symbol-function 'agent-shell--enqueue-request)
+                     (lambda (&rest args)
+                       (setq enqueued-args (cons (current-buffer) args)))))
+            (agent-shell-queue-request-dwim)
+            (should (eq (car enqueued-args) shell-buffer))
+            (should (equal (plist-get (cdr enqueued-args) :prompt) "final prompt")))
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell-queue-request-dwim-prompts-for-existing-shell-test ()
+  "Test `agent-shell-queue-request-dwim' prompts for an existing shell with prefix."
+  (with-temp-buffer
+    (let ((source-buffer (current-buffer))
+          (shell-buffer-a (generate-new-buffer " *agent-shell a*"))
+          (shell-buffer-b (generate-new-buffer " *agent-shell b*"))
+          completion-choices
+          queued-buffer)
+      (unwind-protect
+          (cl-letf (((symbol-function 'agent-shell-buffers)
+                     (lambda ()
+                       (list shell-buffer-a shell-buffer-b)))
+                    ((symbol-function 'agent-shell--state)
+                     (lambda ()
+                       (if (memq (current-buffer) (list shell-buffer-a shell-buffer-b))
+                           '((:agent-config . ((:shell-prompt . "Enqueue request: "))))
+                         (error "Processed outside shell: %s" major-mode))))
+                    ((symbol-function 'agent-shell--context)
+                     (lambda (&key shell-buffer)
+                       (when (eq (current-buffer) source-buffer)
+                         (format "context for %s" (buffer-name shell-buffer)))))
+                    ((symbol-function 'completing-read)
+                     (lambda (_prompt choices &rest _)
+                       (setq completion-choices choices)
+                       (buffer-name shell-buffer-b)))
+                    ((symbol-function 'read-string)
+                     (lambda (&rest _)
+                       "final prompt"))
+                    ((symbol-function 'agent-shell-queue-request)
+                     (lambda (&rest _)
+                       (setq queued-buffer (current-buffer)))))
+            (agent-shell-queue-request-dwim '(4))
+            (should (equal completion-choices
+                           (list (buffer-name shell-buffer-a)
+                                 (buffer-name shell-buffer-b))))
+            (should (eq queued-buffer shell-buffer-b)))
+        (kill-buffer shell-buffer-a)
+        (kill-buffer shell-buffer-b)))))
+
+(ert-deftest agent-shell-queue-request-dwim-errors-when-no-shell-exists-test ()
+  "Test `agent-shell-queue-request-dwim' errors instead of creating a shell."
+  (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+             (lambda (&rest _)
+               (user-error "No agent shell buffers available for current project"))))
+    (should-error (agent-shell-queue-request-dwim)
+                  :type 'user-error)))
+
+(ert-deftest agent-shell-queue-request-dwim-uses-viewport-compose-when-preferred-test ()
+  "Test `agent-shell-queue-request-dwim' opens viewport compose when preferred."
+  (with-temp-buffer
+    (let ((source-buffer (current-buffer))
+          (shell-buffer (generate-new-buffer " *test-shell*"))
+          (agent-shell-prefer-viewport-interaction t)
+          displayed-buffer
+          viewport-content)
+      (unwind-protect
+          (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell--context)
+                     (lambda (&key shell-buffer)
+                       (ignore shell-buffer)
+                       (when (eq (current-buffer) source-buffer)
+                         "context from source")))
+                    ((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil))
+                    ((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest _) (erase-buffer)))
+                    ((symbol-function 'agent-shell--display-buffer)
+                     (lambda (buf) (setq displayed-buffer buf))))
+            (agent-shell-queue-request-dwim)
+            (should displayed-buffer)
+            (with-current-buffer displayed-buffer
+              (setq viewport-content (buffer-string)))
+            (should (equal (string-trim viewport-content) "context from source")))
+        (kill-buffer shell-buffer)
+        (when-let ((vp (get-buffer " *test-shell* [viewport]")))
+          (kill-buffer vp))))))
+
+
 (ert-deftest agent-shell--on-request-emits-permission-request-event-test ()
   "Test `agent-shell--on-request' emits permission-request event."
   (let ((received-events nil)
@@ -4404,6 +4587,107 @@ with \"Method not found\"."
                    (setq sent-method (map-elt (plist-get args :request) :method)))))
         (agent-shell--refresh-session-title)
         (should (equal sent-method "session/list"))))))
+
+(ert-deftest agent-shell--replace-pending-request-replaces-in-place-test ()
+  "Test `agent-shell--replace-pending-request' replaces the request at INDEX."
+  (with-temp-buffer
+    (setq-local agent-shell--state (list (cons :pending-requests (list "a" "b" "c"))))
+    (agent-shell--replace-pending-request :index 1 :prompt "b-edited")
+    (should (equal (map-elt agent-shell--state :pending-requests)
+                   '("a" "b-edited" "c")))))
+
+(ert-deftest agent-shell--replace-pending-request-empty-keeps-request-test ()
+  "Test empty/whitespace/nil PROMPT leaves the request unchanged without error."
+  (with-temp-buffer
+    (setq-local agent-shell--state (list (cons :pending-requests (list "a" "b" "c"))))
+    (agent-shell--replace-pending-request :index 1 :prompt "")
+    (agent-shell--replace-pending-request :index 1 :prompt "   ")
+    (agent-shell--replace-pending-request :index 1 :prompt nil)
+    (should (equal (map-elt agent-shell--state :pending-requests)
+                   '("a" "b" "c")))))
+
+(ert-deftest agent-shell--replace-pending-request-out-of-range-noops-test ()
+  "Test out-of-range INDEX leaves the queue unchanged without error."
+  (with-temp-buffer
+    (setq-local agent-shell--state (list (cons :pending-requests (list "a"))))
+    (agent-shell--replace-pending-request :index 5 :prompt "x")
+    (should (equal (map-elt agent-shell--state :pending-requests) '("a")))))
+
+(ert-deftest agent-shell-edit-pending-request-no-pending-errors-test ()
+  "Test `agent-shell-edit-pending-request' errors when the queue is empty."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state (list (cons :pending-requests nil)))
+    (should-error (call-interactively #'agent-shell-edit-pending-request)
+                  :type 'user-error)))
+
+(ert-deftest agent-shell-edit-pending-request-minibuffer-replaces-test ()
+  "Test minibuffer edit prefills current text and replaces in place."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state (list (cons :pending-requests (list "a" "b" "c"))))
+    (let ((agent-shell-prefer-viewport-interaction nil)
+          read-initial)
+      (cl-letf (((symbol-function 'agent-shell--read-queue-prompt)
+                 (lambda (&rest args)
+                   (setq read-initial (plist-get args :initial))
+                   "b-edited")))
+        (agent-shell-edit-pending-request 1)
+        (should (equal read-initial "b"))
+        (should (equal (map-elt agent-shell--state :pending-requests)
+                       '("a" "b-edited" "c")))))))
+
+(ert-deftest agent-shell-edit-pending-request-viewport-prefills-test ()
+  "Test viewport edit prefills current text and records the edit index."
+  (let ((shell-buffer (generate-new-buffer " *test-shell*"))
+        (agent-shell-prefer-viewport-interaction t)
+        displayed-buffer)
+    (unwind-protect
+        (with-current-buffer shell-buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq-local agent-shell--state
+                      (list (cons :pending-requests (list "a" "b" "c"))))
+          (cl-letf (((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest _) (erase-buffer)))
+                    ((symbol-function 'agent-shell-viewport--update-header)
+                     #'ignore)
+                    ((symbol-function 'agent-shell--display-buffer)
+                     (lambda (buf) (setq displayed-buffer buf))))
+            (agent-shell-edit-pending-request 1)
+            (should displayed-buffer)
+            (with-current-buffer displayed-buffer
+              (should (equal (string-trim (buffer-string)) "b"))
+              (should (= agent-shell-viewport--edit-pending-index 1)))))
+      (kill-buffer shell-buffer)
+      (when-let ((vp (get-buffer " *test-shell* [viewport]")))
+        (kill-buffer vp)))))
+
+(ert-deftest agent-shell-viewport-compose-send-edit-replaces-test ()
+  "Test compose-send replaces the pending request when editing, not enqueue."
+  (let ((shell-buffer (generate-new-buffer " *test-shell*"))
+        replaced queued)
+    (unwind-protect
+        (with-temp-buffer
+          (insert "b-edited")
+          (setq agent-shell-viewport--edit-pending-index 1)
+          (cl-letf (((symbol-function 'derived-mode-p)
+                     (lambda (&rest _) t))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell--replace-pending-request)
+                     (lambda (&rest args) (setq replaced args)))
+                    ((symbol-function 'agent-shell-queue-request)
+                     (lambda (&rest _) (setq queued t)))
+                    ((symbol-function 'agent-shell-viewport--busy-p)
+                     (lambda (&rest _) t))
+                    ((symbol-function 'kill-buffer) #'ignore)
+                    ((symbol-function 'pop-to-buffer) #'ignore))
+            (agent-shell-viewport-compose-send-and-kill)
+            (should (equal (plist-get replaced :index) 1))
+            (should (equal (plist-get replaced :prompt) "b-edited"))
+            (should-not queued)
+            (should-not agent-shell-viewport--edit-pending-index)))
+      (kill-buffer shell-buffer))))
 
 ;;; Tests for agent-shell--activity-group-id
 

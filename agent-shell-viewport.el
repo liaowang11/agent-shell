@@ -47,6 +47,7 @@
 (declare-function agent-shell--display-buffer "agent-shell")
 (declare-function agent-shell--get-region "agent-shell")
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
+(declare-function agent-shell--replace-pending-request "agent-shell")
 (declare-function agent-shell--make-header "agent-shell")
 (declare-function agent-shell--context "agent-shell")
 (declare-function agent-shell--shell-buffer "agent-shell")
@@ -62,6 +63,7 @@
 (declare-function agent-shell-open-transcript "agent-shell")
 (declare-function agent-shell-queue-request "agent-shell")
 (declare-function agent-shell-remove-pending-request "agent-shell")
+(declare-function agent-shell-edit-pending-request "agent-shell")
 (declare-function agent-shell-resume-pending-requests "agent-shell")
 (declare-function agent-shell-view-acp-logs "agent-shell")
 (declare-function agent-shell-view-traffic "agent-shell")
@@ -105,6 +107,13 @@ restored while the peeked interaction is the same one.")
   "Current index into `comint-input-ring' for history navigation.")
 ;; Survives mode switches (edit <-> view) which clear buffer-local vars.
 (put 'agent-shell-viewport--ring-index 'permanent-local t)
+
+(defvar-local agent-shell-viewport--edit-pending-index nil
+  "Index of the pending request this compose buffer is editing, or nil.
+When non-nil, submitting the compose buffer replaces the pending request at
+this index instead of enqueueing a new one.")
+;; Survives mode switches (edit <-> view) which clear buffer-local vars.
+(put 'agent-shell-viewport--edit-pending-index 'permanent-local t)
 
 (cl-defun agent-shell-viewport--show-buffer (&key append override submit no-focus shell-buffer)
   "Show a viewport compose buffer for the agent shell.
@@ -226,13 +235,19 @@ queued right away, regardless of `agent-shell-viewport-dismiss-on-send'."
     (user-error "Not in a shell viewport buffer"))
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
         (viewport-buffer (current-buffer))
+        (edit-index agent-shell-viewport--edit-pending-index)
         (prompt (string-trim (buffer-string))))
+    (setq agent-shell-viewport--edit-pending-index nil)
     (with-current-buffer shell-buffer
-      (if (agent-shell-viewport--busy-p)
-          (agent-shell-queue-request prompt)
+      (cond
+       (edit-index
+        (agent-shell--replace-pending-request :index edit-index :prompt prompt))
+       ((agent-shell-viewport--busy-p)
+        (agent-shell-queue-request prompt))
+       (t
         (agent-shell--insert-to-shell-buffer
          :text prompt
-         :submit t)))
+         :submit t))))
     (kill-buffer viewport-buffer)
     (pop-to-buffer shell-buffer)))
 
@@ -281,10 +296,20 @@ resolving to its shell on the next invocation."
       (user-error "Not in a shell viewport buffer"))
     (let ((shell-buffer (agent-shell-viewport--shell-buffer))
           (viewport-buffer (current-buffer))
+          (edit-index agent-shell-viewport--edit-pending-index)
           (prompt (string-trim (buffer-string))))
-      (when (string-empty-p (string-trim prompt))
+      (setq agent-shell-viewport--edit-pending-index nil)
+      ;; Editing keeps the request unchanged on empty input rather than
+      ;; erroring (`agent-shell--replace-pending-request' no-ops on empty).
+      (when (and (not edit-index) (string-empty-p prompt))
         (agent-shell-viewport--initialize)
         (user-error "Nothing to send"))
+      (when edit-index
+        (with-current-buffer shell-buffer
+          (agent-shell--replace-pending-request :index edit-index :prompt prompt))
+        (with-current-buffer viewport-buffer
+          (agent-shell-viewport-view-last))
+        (throw 'exit nil))
       (when (agent-shell-viewport--busy-p)
         (with-current-buffer shell-buffer
           (agent-shell-queue-request prompt))
@@ -336,6 +361,11 @@ Optionally set its PROMPT and RESPONSE."
   (let ((inhibit-read-only t)
         (viewport-buffer (current-buffer)))
     (erase-buffer)
+    ;; A freshly-initialized compose buffer is not editing a pending
+    ;; request unless a caller marks it one afterwards.  Clearing here
+    ;; prevents a stale index from a previously-abandoned edit hijacking
+    ;; the next compose.
+    (setq agent-shell-viewport--edit-pending-index nil)
     (when-let* ((shell-buffer (agent-shell-viewport--shell-buffer)))
       (with-current-buffer shell-buffer
         (unless (eq agent-shell-header-style 'graphical)
@@ -366,6 +396,25 @@ Optionally set its PROMPT and RESPONSE."
     (agent-shell-viewport--update-header)
     ;; TODO: Render prompt markdown?
     ))
+
+(cl-defun agent-shell-viewport--prefill-edit (&key shell-buffer index text)
+  "Prepare SHELL-BUFFER's viewport edit buffer to edit pending request INDEX.
+
+Open the viewport edit buffer, prefill it with TEXT and mark it as editing
+the pending request at INDEX.  Submitting it (see
+`agent-shell-viewport-compose-send-and-wait-for-response') replaces that
+request in place rather than enqueueing a new one.  Return the viewport
+buffer."
+  (let ((viewport-buffer (agent-shell-viewport--buffer :shell-buffer shell-buffer)))
+    (with-current-buffer viewport-buffer
+      (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
+        (agent-shell-viewport-edit-mode))
+      (agent-shell-viewport--initialize)
+      (goto-char (point-max))
+      (when text
+        (insert text))
+      (setq agent-shell-viewport--edit-pending-index index))
+    viewport-buffer))
 
 (defun agent-shell-viewport--ensure-buffer ()
   "Ensure current buffer is a viewport and err otherwise."
@@ -1066,6 +1115,17 @@ buffer from the snapshot and switch to edit mode."
                           (user-error "Not in an agent-shell buffer"))))
     (with-current-buffer shell-buffer
       (call-interactively #'agent-shell-remove-pending-request))))
+
+(defun agent-shell-viewport-edit-pending-request ()
+  "Edit a pending request in the queue."
+  (declare (modes agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
+  (interactive)
+  (agent-shell-viewport--ensure-buffer)
+  (let ((shell-buffer (or (agent-shell--current-shell)
+                          (user-error "Not in an agent-shell buffer"))))
+    (with-current-buffer shell-buffer
+      (call-interactively #'agent-shell-edit-pending-request))))
 
 (defun agent-shell-viewport-copy-session-id ()
   "Copy the current session ID to the kill ring."
