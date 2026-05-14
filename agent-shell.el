@@ -7094,6 +7094,54 @@ With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an
     (agent-shell-insert :text (agent-shell--context :shell-buffer shell-buffer)
                         :shell-buffer shell-buffer)))
 
+(cl-defun agent-shell-queue-request-dwim (&optional arg)
+  "Queue a request with DWIM context for an existing shell.
+
+When called with prefix ARG, prompt to choose an existing shell.
+
+Prefills the minibuffer with `agent-shell--context' when available, but does
+not send until the minibuffer input is confirmed.
+
+When `agent-shell-prefer-viewport-interaction' is non-nil, opens the viewport
+compose buffer with context prefilled instead of using the minibuffer."
+  (interactive "P")
+  (let ((shell-buffer
+         (if arg
+             (get-buffer
+              (completing-read "Queue request to shell: "
+                               (mapcar #'buffer-name (or (agent-shell-buffers)
+                                                         (user-error "No shells available")))
+                               nil t))
+           (agent-shell--shell-buffer :no-create t))))
+    (if agent-shell-prefer-viewport-interaction
+        (let* ((text (or (agent-shell--context :shell-buffer shell-buffer) ""))
+               (viewport-buffer (agent-shell-viewport--buffer :shell-buffer shell-buffer)))
+          (with-current-buffer viewport-buffer
+            (if (derived-mode-p 'agent-shell-viewport-edit-mode)
+                (progn
+                  (unless (string-empty-p text)
+                    (save-excursion
+                      (goto-char (point-max))
+                      (insert "\n\n" text))))
+              (agent-shell-viewport-edit-mode)
+              (agent-shell-viewport--initialize)
+              (save-excursion
+                (goto-char (point-max))
+                (unless (string-empty-p text)
+                  (insert "\n\n" text)))))
+          (agent-shell--display-buffer viewport-buffer))
+      (let* ((context (when-let ((text (agent-shell--context :shell-buffer shell-buffer)))
+                        (concat text "\n\n")))
+             (prompt (with-current-buffer shell-buffer
+                       (or (map-nested-elt (agent-shell--state) '(:agent-config :shell-prompt))
+                           "Enqueue request: ")))
+             (request (minibuffer-with-setup-hook
+                          (lambda ()
+                            (agent-shell-completion--setup-minibuffer shell-buffer))
+                        (read-string prompt context))))
+        (with-current-buffer shell-buffer
+          (agent-shell-queue-request request))))))
+
 (cl-defun agent-shell--get-region-context (&key deactivate no-error agent-cwd)
   "Get region as insertable text, ready for sending to agent.
 
