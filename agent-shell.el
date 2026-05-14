@@ -6234,6 +6234,16 @@ Each marked span is replaced by its `agent-shell-region-text' value."
                                   :shell-buffer shell-buffer
                                   :existing-only t)))
       (with-current-buffer viewport-buffer
+        ;; When a command is sent (e.g. a queued request executing)
+        ;; while the user is composing in the viewport edit buffer,
+        ;; preserve the draft so it can be restored on the next return
+        ;; to edit mode instead of being wiped by the view-mode switch.
+        (when (and (derived-mode-p 'agent-shell-viewport-edit-mode)
+                   (not (string-empty-p (string-trim (buffer-string))))
+                   (not agent-shell-viewport--compose-snapshot))
+          (setq agent-shell-viewport--compose-snapshot
+                `((:content . ,(buffer-string))
+                  (:location . ,(point)))))
         (agent-shell-viewport-view-mode)
         (agent-shell-viewport--initialize
          :prompt  prompt)))
@@ -7404,6 +7414,54 @@ With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an
            (agent-shell--read-queue-prompt :initial (concat text "\n\n"))))
       (agent-shell-insert :text text :shell-buffer shell-buffer))))
 
+(cl-defun agent-shell-queue-request-dwim (&optional arg)
+  "Queue a request with DWIM context for an existing shell.
+
+When called with prefix ARG, prompt to choose an existing shell.
+
+Prefills the minibuffer with `agent-shell--context' when available, but does
+not send until the minibuffer input is confirmed.
+
+When `agent-shell-prefer-viewport-interaction' is non-nil, opens the viewport
+compose buffer with context prefilled instead of using the minibuffer."
+  (interactive "P")
+  (let ((shell-buffer
+         (if arg
+             (get-buffer
+              (completing-read "Queue request to shell: "
+                               (mapcar #'buffer-name (or (agent-shell-buffers)
+                                                         (user-error "No shells available")))
+                               nil t))
+           (agent-shell--shell-buffer :no-create t))))
+    (if agent-shell-prefer-viewport-interaction
+        (let* ((text (or (agent-shell--context :shell-buffer shell-buffer) ""))
+               (viewport-buffer (agent-shell-viewport--buffer :shell-buffer shell-buffer)))
+          (with-current-buffer viewport-buffer
+            (if (derived-mode-p 'agent-shell-viewport-edit-mode)
+                (progn
+                  (unless (string-empty-p text)
+                    (save-excursion
+                      (goto-char (point-max))
+                      (insert "\n\n" text))))
+              (agent-shell-viewport-edit-mode)
+              (agent-shell-viewport--initialize)
+              (save-excursion
+                (goto-char (point-max))
+                (unless (string-empty-p text)
+                  (insert "\n\n" text)))))
+          (agent-shell--display-buffer viewport-buffer))
+      (let* ((context (when-let ((text (agent-shell--context :shell-buffer shell-buffer)))
+                        (concat text "\n\n")))
+             (prompt (with-current-buffer shell-buffer
+                       (or (map-nested-elt (agent-shell--state) '(:agent-config :shell-prompt))
+                           "Enqueue request: ")))
+             (request (minibuffer-with-setup-hook
+                          (lambda ()
+                            (agent-shell-completion--setup-minibuffer shell-buffer))
+                        (read-string prompt context))))
+        (with-current-buffer shell-buffer
+          (agent-shell-queue-request request))))))
+
 (cl-defun agent-shell--get-region-context (&key deactivate no-error agent-cwd)
   "Get region as insertable text, ready for sending to agent.
 
@@ -8554,6 +8612,7 @@ Includes STATUS, TITLE, KIND, DESCRIPTION, COMMAND, PARAMETERS, and OUTPUT."
 
 %s
 
+Edit:   M-x agent-shell-edit-pending-request
 Resume: M-x agent-shell-resume-pending-requests
 Remove: M-x agent-shell-remove-pending-request
 "
@@ -8740,6 +8799,73 @@ and queue it via `agent-shell-queue-request'."
       (message "Shell is busy, requests will auto-resume when ready")
     (agent-shell--process-pending-request)))
 
+(defun agent-shell--pending-request-choices ()
+  "Return an alist of (LABEL . INDEX) for the pending requests.
+
+LABEL is the request's 1-based position and a truncated copy of its text;
+INDEX is the 0-based position in `:pending-requests'.  Returns nil when the
+queue is empty.
+
+For example, with pending requests \"first\" and \"second\":
+
+  ((\"1: first\" . 0) (\"2: second\" . 1))"
+  (seq-map-indexed
+   (lambda (req idx)
+     (cons (format "%d: %s" (1+ idx)
+                   (truncate-string-to-width req 60 nil nil "..."))
+           idx))
+   (map-elt agent-shell--state :pending-requests)))
+
+(cl-defun agent-shell--replace-pending-request (&key index prompt)
+  "Replace the pending request at INDEX with PROMPT, preserving its position.
+
+When PROMPT is nil or only whitespace, the request is left unchanged (no
+error).  When INDEX is out of range (e.g. the queue drained while editing),
+nothing is changed.  Otherwise PROMPT is spliced in at INDEX."
+  (let ((pending (map-elt agent-shell--state :pending-requests)))
+    (cond
+     ((or (null prompt) (string-empty-p (string-trim prompt)))
+      (message "Pending request unchanged"))
+     ((or (null index) (< index 0) (>= index (length pending)))
+      (message "Request no longer pending"))
+     (t
+      (let ((new-pending (append (seq-take pending index)
+                                 (list prompt)
+                                 (seq-drop pending (1+ index)))))
+        (map-put! agent-shell--state :pending-requests new-pending)
+        (message "Request updated (%d pending)" (length new-pending)))))))
+
+(defun agent-shell-edit-pending-request (index)
+  "Edit the pending request at INDEX, replacing it in place.
+
+When called interactively, prompt to choose a pending request (or use the
+only one when there is just one).  The current request text is prefilled for
+editing: in a viewport-edit buffer when
+`agent-shell-prefer-viewport-interaction' is non-nil, otherwise in the
+minibuffer.  Submitting empty text leaves the request unchanged.
+
+While editing, @ completes project files and / completes available agent
+commands when the agent has reported them."
+  (declare (modes agent-shell-mode))
+  (interactive
+   (progn
+     (unless (derived-mode-p 'agent-shell-mode)
+       (error "Not in a shell"))
+     (let ((choices (agent-shell--pending-request-choices)))
+       (when (seq-empty-p choices)
+         (user-error "No pending requests"))
+       (list (if (cdr choices)
+                 (cdr (assoc (completing-read "Edit: " choices nil t) choices))
+               (cdar choices))))))
+  (let ((current (nth index (map-elt agent-shell--state :pending-requests))))
+    (if agent-shell-prefer-viewport-interaction
+        (agent-shell--display-buffer
+         (agent-shell-viewport--prefill-edit
+          :shell-buffer (current-buffer) :index index :text current))
+      (agent-shell--replace-pending-request
+       :index index
+       :prompt (agent-shell--read-queue-prompt :initial current)))))
+
 (defun agent-shell-remove-pending-request (&optional remove-index)
   "Remove all pending requests or a specific request by REMOVE-INDEX.
 
@@ -8752,14 +8878,8 @@ or select a specific request to remove."
        (error "Not in a shell"))
      (when (seq-empty-p pending)
        (user-error "No pending requests"))
-     (let* ((choices (append
-                      '(("Remove all" . remove-all))
-                      (seq-map-indexed
-                       (lambda (req idx)
-                         (cons (format "%d: %s" (1+ idx)
-                                       (truncate-string-to-width req 60 nil nil "..."))
-                               idx))
-                       pending)))
+     (let* ((choices (append '(("Remove all" . remove-all))
+                             (agent-shell--pending-request-choices)))
             (selection (cdr (assoc (completing-read "Remove: " choices nil t) choices))))
        (list (unless (eq selection 'remove-all) selection)))))
   (if remove-index
