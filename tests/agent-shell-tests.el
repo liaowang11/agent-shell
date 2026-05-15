@@ -996,6 +996,39 @@ code block content
         (should (equal (map-elt bounds :start) 10))
         (should (equal (map-elt bounds :end) 19))))))
 
+(ert-deftest agent-shell-completion-sources-shell-buffer-in-minibuffer-test ()
+  "Test minibuffer completion sources data from the shell buffer."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        project-files-buffer)
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local agent-shell--state
+                        '((:available-commands
+                           . (((name . "review")
+                               (description . "Review code"))))))
+            (agent-shell-completion-mode +1))
+          (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell--project-files)
+                     (lambda ()
+                       (setq project-files-buffer (current-buffer))
+                       '("README.org" "tests/"))))
+            (with-temp-buffer
+              (agent-shell-completion--setup-minibuffer shell-buffer)
+              (insert "/rev")
+              (let ((command-capf (agent-shell--command-completion-at-point)))
+                (should command-capf)
+                (should (equal (nth 2 command-capf) '("review"))))
+              (erase-buffer)
+              (insert "@REA")
+              (let ((file-capf (agent-shell--file-completion-at-point)))
+                (should file-capf)
+                (should (equal (nth 2 file-capf) '("README.org" "tests/"))))
+              (should (eq project-files-buffer shell-buffer))
+              (agent-shell-completion--cleanup-minibuffer))))
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell--capf-exit-with-space-test ()
   "Test `agent-shell--capf-exit-with-space' function."
   (with-temp-buffer
@@ -2486,6 +2519,50 @@ code block content
             (should (= viewport-calls 0))
             (should (= shell-calls 1))))
       (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--update-fragment-preserves-window-position-test ()
+  "Test `agent-shell--update-fragment' preserves point and window start."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (original-derived-mode-p (symbol-function 'derived-mode-p)))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer shell-buffer)
+          (with-current-buffer shell-buffer
+            (setq-local comint-last-output-start (make-marker))
+            (setq-local comint-use-prompt-regexp t)
+            (dotimes (index 200)
+              (insert (format "line %03d\n" index)))
+            (goto-char (point-min))
+            (forward-line 120)
+            (set-window-start (selected-window) (point))
+            (forward-line 10)
+            (let ((expected-point (point))
+                  (expected-window-start (window-start)))
+              (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'derived-mode-p)
+                         (lambda (&rest modes)
+                           (if (eq (current-buffer) shell-buffer)
+                               (memq 'agent-shell-mode modes)
+                             (apply original-derived-mode-p modes))))
+                        ((symbol-function 'agent-shell-ui-update-fragment)
+                         (lambda (&rest _)
+                           (goto-char (point-min))
+                           (insert "new output\n")
+                           '((:padding . ((:start . 1) (:end . 1)))
+                             (:block . ((:start . 1) (:end . 11)))
+                             (:body . ((:start . 1) (:end . 11))))))
+                        ((symbol-function 'markdown-overlays-put)
+                         (lambda () nil)))
+                (agent-shell--update-fragment
+                 :state `((:buffer . ,shell-buffer)
+                          (:request-count . 7))
+                 :block-id "tool-call"
+                 :body "Running tool"
+                 :append t)
+                (should (= (point) expected-point))
+                (should (= (window-start) expected-window-start))))))
       (kill-buffer shell-buffer))))
 
 (ert-deftest agent-shell--delete-fragment-skips-history-viewport-test ()
