@@ -62,6 +62,7 @@
 (require 'agent-shell-goose)
 (require 'agent-shell-heartbeat)
 (require 'agent-shell-active-message)
+(require 'agent-shell-hermes)
 (require 'agent-shell-kimi)
 (require 'agent-shell-kiro)
 (require 'agent-shell-mistral)
@@ -518,7 +519,8 @@ Goose, Cursor, Auggie, and others."
         (agent-shell-mistral-make-config)
         (agent-shell-opencode-make-agent-config)
         (agent-shell-pi-make-agent-config)
-        (agent-shell-qwen-make-agent-config)))
+        (agent-shell-qwen-make-agent-config)
+        (agent-shell-hermes-make-agent-config)))
 
 (defcustom agent-shell-agent-configs
   (agent-shell--make-default-agent-configs)
@@ -546,6 +548,7 @@ configuration alist for backwards compatibility."
                  (const :tag "Droid" droid)
                  (const :tag "Gemini CLI" gemini-cli)
                  (const :tag "Goose" goose)
+                 (const :tag "Hermes" hermes)
                  (const :tag "Kimi" kimi)
                  (const :tag "Kiro" kiro)
                  (const :tag "Mistral" le-chat)
