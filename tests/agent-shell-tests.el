@@ -1964,6 +1964,38 @@ code block content
             (should (equal (agent-shell--dot-subdir "screenshots") expected-dir))))
       (delete-directory temp-dir t))))
 
+(ert-deftest agent-shell--dot-subdir-ensures-gitignore-for-in-repo-directory-test ()
+  "Test that `agent-shell--dot-subdir' ensures gitignore for in-repo data."
+  (let* ((temp-dir (make-temp-file "agent-shell-test" t))
+         (ensure-gitignore-called-with nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () temp-dir))
+                  ((symbol-function 'agent-shell--ensure-gitignore)
+                   (lambda (project-root)
+                     (setq ensure-gitignore-called-with project-root))))
+          (let ((agent-shell-dot-subdir-function #'agent-shell--dot-subdir-in-repo))
+            (agent-shell--dot-subdir "screenshots")
+            (should (equal ensure-gitignore-called-with temp-dir))))
+      (delete-directory temp-dir t))))
+
+(ert-deftest agent-shell--dot-subdir-skips-gitignore-for-external-directory-test ()
+  "Test that `agent-shell--dot-subdir' skips gitignore for external data."
+  (let ((project-dir (make-temp-file "agent-shell-project" t))
+        (data-dir (make-temp-file "agent-shell-data" t))
+        (ensure-gitignore-called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-cwd) (lambda () project-dir))
+                  ((symbol-function 'agent-shell--ensure-gitignore)
+                   (lambda (_project-root)
+                     (setq ensure-gitignore-called t))))
+          (let ((agent-shell-dot-subdir-function
+                 (lambda (subdir)
+                   (expand-file-name subdir data-dir))))
+            (agent-shell--dot-subdir "screenshots")
+            (should-not ensure-gitignore-called)))
+      (delete-directory project-dir t)
+      (delete-directory data-dir t))))
+
 (ert-deftest agent-shell--dot-subdir-noop-if-directory-exists-test ()
   "Test that `agent-shell--dot-subdir' does not error if the directory already exists."
   (let* ((temp-dir (make-temp-file "agent-shell-test" t))
