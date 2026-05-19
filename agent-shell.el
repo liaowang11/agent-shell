@@ -2859,8 +2859,9 @@ variable (see makunbound)"))
         (map-put! agent-shell--state :resume-session-id session-id))
       (when fork-session-id
         (map-put! agent-shell--state :fork-session-id fork-session-id))
-      (when session-strategy
-        (setq-local agent-shell-session-strategy session-strategy))
+      ;; Snapshot the strategy also in case it was dynamically re-bound
+      (setq-local agent-shell-session-strategy
+                  (or session-strategy agent-shell-session-strategy))
       ;; Show deferred welcome text,
       ;; but first wipe buffer content.
       (let ((inhibit-read-only t))
