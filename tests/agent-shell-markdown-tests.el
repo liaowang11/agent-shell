@@ -872,14 +872,20 @@ A " nil)
 
 (ert-deftest agent-shell-markdown-blockquote-inside-fence-stays-raw ()
   ;; A `>'-prefixed line inside a fenced code block must not be
-  ;; styled — the source-block range is in avoid-ranges.
-  (let ((s (agent-shell-markdown-convert "```
+  ;; styled as a blockquote — the source-block range is in
+  ;; avoid-ranges.  The `>' should keep its source-block face and not
+  ;; get the blockquote face.
+  (let* ((s (agent-shell-markdown-convert "```
 > not a quote
 ```
-")))
-    (should (string-match-p "^> not a quote" (substring-no-properties s)))
-    (let ((quote-pos (string-match "> not a quote" (substring-no-properties s))))
-      (should-not (get-text-property quote-pos 'display s)))))
+"))
+         (quote-pos (string-match "> not a quote"
+                                  (substring-no-properties s))))
+    (should quote-pos)
+    (should (eq (get-text-property quote-pos 'face s)
+                'agent-shell-markdown-source-block))
+    (should-not (eq (get-text-property quote-pos 'face s)
+                    'agent-shell-markdown-blockquote))))
 
 (ert-deftest agent-shell-markdown-header-waits-for-newline-across-chunks ()
   ;; A header split across two chunks (chunk 1 = `# He', chunk 2 =
