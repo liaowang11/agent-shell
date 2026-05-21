@@ -786,6 +786,95 @@ A " nil)
              (" 2 " nil)
              ("│" (agent-shell-markdown-table-border))))))
 
+(ert-deftest agent-shell-markdown-watermark-skips-prefix-on-streamed-append ()
+  ;; After a render, the prefix carries the watermark text property and
+  ;; the next render — narrowed to (watermark, point-max) — must not
+  ;; revisit the rendered prefix.  Verify by injecting a sentinel
+  ;; `font-lock-face' at point-min after the first render; the mirror
+  ;; pass on the second render would overwrite it if the prefix were
+  ;; re-scanned, but with the watermark in place it stays put.
+  (with-temp-buffer
+    (insert "**hello**\n")
+    (agent-shell-markdown-replace-markup)
+    (put-text-property (point-min) (1+ (point-min))
+                       'font-lock-face 'agent-shell-markdown-test-sentinel)
+    (goto-char (point-max))
+    (insert "**world**\n")
+    (agent-shell-markdown-replace-markup)
+    (should (eq (get-text-property (point-min) 'font-lock-face)
+                'agent-shell-markdown-test-sentinel))
+    ;; And the newly-streamed bold still rendered normally.
+    (should (string-match-p "^hello\nworld\n$"
+                            (substring-no-properties (buffer-string))))))
+
+(ert-deftest agent-shell-markdown-watermark-keeps-pending-table-in-scope ()
+  ;; When table rows stream in one at a time, the table needs at least
+  ;; two consecutive pipe-rows in scope before `--find-tables' will
+  ;; render anything.  If the watermark advances past each row as it
+  ;; arrives, the renderer never sees enough rows at once and the
+  ;; whole table stays raw forever.  `--extending-table-start' has to
+  ;; back off through a streak of raw pipe-rows just like it does
+  ;; through a rendered table, so the next chunk's narrow includes the
+  ;; whole accumulating table.
+  (with-temp-buffer
+    (insert "intro paragraph\n\n")
+    (agent-shell-markdown-replace-markup)
+    (dolist (row '("| A | B |\n"
+                   "|---|---|\n"
+                   "| 1 | 2 |\n"
+                   "| 3 | 4 |\n"))
+      (goto-char (point-max))
+      (insert row)
+      (agent-shell-markdown-replace-markup))
+    (should (string-match-p "│"
+                            (substring-no-properties (buffer-string))))
+    (should-not (string-match-p "^| A | B |"
+                                (substring-no-properties (buffer-string))))))
+
+(ert-deftest agent-shell-markdown-inline-code-completes-across-chunk-boundary ()
+  ;; LLM streams may split an inline-code span across chunks (e.g.
+  ;; `\\`co' lands first, then `de\\`').  The first render sees an
+  ;; unclosed backtick on the last line — `--inline-code-ranges' marks
+  ;; the rest of the line as a still-streaming range so `--style-
+  ;; inline-code's two-backtick regex doesn't match yet, and the
+  ;; watermark stays at the start of that line.  When the closing
+  ;; backtick arrives on the same line in the next chunk, the second
+  ;; render matches the full span and strips both backticks.
+  ;;
+  ;; This regression-guards the watermark too: if a future change
+  ;; advanced the watermark past the open backtick, the second render
+  ;; would narrow past the opener and leave it raw.
+  (with-temp-buffer
+    (insert "text `co")
+    (agent-shell-markdown-replace-markup)
+    (should (string-match-p "`co"
+                            (substring-no-properties (buffer-string))))
+    (goto-char (point-max))
+    (insert "de`")
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "text code"))
+    (should (eq (get-text-property (- (point-max) 1) 'face)
+                'agent-shell-markdown-inline-code))))
+
+(ert-deftest agent-shell-markdown-replace-markup-force-clears-watermark ()
+  ;; The `:force' key drops the stored watermark before the call, so
+  ;; the whole buffer is re-scanned.  We simulate a maximally
+  ;; advanced watermark by stamping one at `point-max' — a non-force
+  ;; call narrows to (point-max, point-max) and is a no-op; a `:force
+  ;; t' call clears the watermark first and renders normally.
+  (with-temp-buffer
+    (insert "**bold**\n")
+    (with-silent-modifications
+      (put-text-property (point-min) (1+ (point-min))
+                         'agent-shell-markdown-watermark (point-max)))
+    (agent-shell-markdown-replace-markup)
+    (should (string-match-p "\\*\\*bold\\*\\*"
+                            (substring-no-properties (buffer-string))))
+    (agent-shell-markdown-replace-markup :force t)
+    (should-not (string-match-p "\\*\\*"
+                                (substring-no-properties (buffer-string))))))
+
 (provide 'agent-shell-markdown-tests)
 
 ;;; agent-shell-markdown-tests.el ends here
