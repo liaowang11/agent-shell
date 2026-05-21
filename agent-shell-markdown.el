@@ -282,7 +282,15 @@ non-nil to drop the watermark and re-render the whole buffer
           ;; / shell-maker / agent-shell buffers fontify on every output
           ;; chunk and would otherwise clear our `face' properties.
           (agent-shell-markdown--mirror-face-to-font-lock-face
-           (point-min) (point-max)))))
+           (point-min) (point-max))
+          ;; Tag rendered chars so a yank into another buffer drops the
+          ;; styling, display overrides, internal markers, and keymaps
+          ;; we layered on — paste should give plain chars, not our
+          ;; implementation cruft.
+          (put-text-property (point-min) (point-max)
+                             'yank-handler
+                             (list (lambda (s)
+                                     (insert (substring-no-properties s))))))))
     (agent-shell-markdown--set-watermark)))
 
 (cl-defun agent-shell-markdown--replace-bolds (&key avoid-ranges)

@@ -812,6 +812,22 @@ A " nil)
     (should (string-match-p "^hello\nworld\n$"
                             (substring-no-properties (buffer-string))))))
 
+(ert-deftest agent-shell-markdown-yank-strips-properties ()
+  ;; Rendered chars carry a `yank-handler' that strips every text
+  ;; property on paste — display overrides, internal markers, faces,
+  ;; keymaps — so a copy/paste into another buffer gives plain chars,
+  ;; not our implementation cruft.
+  (with-temp-buffer
+    (insert "**bold** and `code`\n")
+    (agent-shell-markdown-replace-markup)
+    (kill-new (buffer-substring (point-min) (point-max))))
+  (with-temp-buffer
+    (yank)
+    (let ((pos (point-min)))
+      (while (< pos (point-max))
+        (should-not (text-properties-at pos))
+        (setq pos (1+ pos))))))
+
 (ert-deftest agent-shell-markdown-convert-blockquote-single-level ()
   ;; `> text\n' keeps the `>' in the buffer (source round-trips) but
   ;; shows `▌' as a display override.  The line content carries the
