@@ -396,14 +396,20 @@ title text is left with face `agent-shell-markdown-header-N' where N is
 the number of `#' characters clamped to 1..6.  Headers inside any
 of AVOID-RANGES are left untouched.
 
-For example, the buffer \"## My title\" becomes \"My title\" with
-face `agent-shell-markdown-header-2'."
+Requires an explicit trailing newline — a header at end-of-buffer
+without `\\n' is treated as still streaming and left raw, so a
+chunk that lands `# He' followed later by `llo World\\n' renders
+the full `Hello World' on the second call rather than eagerly
+facing `He' and leaving `llo World' plain.
+
+For example, the buffer \"## My title\\n\" becomes \"My title\\n\"
+with face `agent-shell-markdown-header-2' on \"My title\"."
   (let ((case-fold-search nil))
     (goto-char (point-min))
     (while (re-search-forward
             (rx bol (zero-or-more blank) (group (one-or-more "#"))
                 (one-or-more blank)
-                (group (one-or-more (not (any "\n")))) eol)
+                (group (one-or-more (not (any "\n")))) "\n")
             nil t)
       (let* ((markup-start (match-beginning 0))
              (markup-end (match-end 0))
@@ -415,7 +421,7 @@ face `agent-shell-markdown-header-2'."
                 (text (buffer-substring (match-beginning 2) (match-end 2))))
             (delete-region markup-start markup-end)
             (goto-char markup-start)
-            (insert text)
+            (insert text "\n")
             (add-face-text-property markup-start
                                     (+ markup-start (length text))
                                     (intern (format "agent-shell-markdown-header-%d"

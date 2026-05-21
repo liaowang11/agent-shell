@@ -111,20 +111,25 @@
                  '(("bold-strike" (agent-shell-markdown-bold agent-shell-markdown-strikethrough))))))
 
 (ert-deftest agent-shell-markdown-convert-header-level-1 ()
+  ;; Header rendering requires a trailing newline to complete; an
+  ;; eob-only header is treated as still streaming and left raw.
   (should (equal (agent-shell-markdown--deconstruct
-                  (agent-shell-markdown-convert "# Title"))
-                 '(("Title" (agent-shell-markdown-header-1))))))
+                  (agent-shell-markdown-convert "# Title\n"))
+                 '(("Title" (agent-shell-markdown-header-1))
+                   ("\n" nil)))))
 
 (ert-deftest agent-shell-markdown-convert-header-level-3 ()
   (should (equal (agent-shell-markdown--deconstruct
-                  (agent-shell-markdown-convert "### Title"))
-                 '(("Title" (agent-shell-markdown-header-3))))))
+                  (agent-shell-markdown-convert "### Title\n"))
+                 '(("Title" (agent-shell-markdown-header-3))
+                   ("\n" nil)))))
 
 (ert-deftest agent-shell-markdown-convert-header-with-bold ()
   (should (equal (agent-shell-markdown--deconstruct
-                  (agent-shell-markdown-convert "## **Big** title"))
+                  (agent-shell-markdown-convert "## **Big** title\n"))
                  '(("Big" (agent-shell-markdown-header-2 agent-shell-markdown-bold))
-                   (" title" (agent-shell-markdown-header-2))))))
+                   (" title" (agent-shell-markdown-header-2))
+                   ("\n" nil)))))
 
 (ert-deftest agent-shell-markdown-convert-fenced-block-protects-markup ()
   (should (equal (agent-shell-markdown--deconstruct
@@ -806,6 +811,24 @@ A " nil)
     ;; And the newly-streamed bold still rendered normally.
     (should (string-match-p "^hello\nworld\n$"
                             (substring-no-properties (buffer-string))))))
+
+(ert-deftest agent-shell-markdown-header-waits-for-newline-across-chunks ()
+  ;; A header split across two chunks (chunk 1 = `# He', chunk 2 =
+  ;; `llo World\\n') must not render eagerly on chunk 1 — the
+  ;; trailing-newline gate keeps `# He' raw, and chunk 2's render
+  ;; faces the entire `Hello World' once the line completes.
+  (with-temp-buffer
+    (insert "# He")
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string)) "# He"))
+    (goto-char (point-max))
+    (insert "llo World\n")
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "Hello World\n"))
+    (dotimes (i (length "Hello World"))
+      (should (eq (get-text-property (+ (point-min) i) 'face)
+                  'agent-shell-markdown-header-1)))))
 
 (ert-deftest agent-shell-markdown-watermark-keeps-pending-table-in-scope ()
   ;; When table rows stream in one at a time, the table needs at least
