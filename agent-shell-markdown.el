@@ -216,14 +216,17 @@ changes, so adjacent delimiters peel one layer per round
 links, images, bare image-path lines, dividers, source-block
 styling, and table styling run once after the loop."
   (save-excursion
-    (let* ((source-ranges (agent-shell-markdown--make-markers
-                           (agent-shell-markdown--source-block-ranges)))
+    (let* ((source-ranges (agent-shell-markdown--sort-ranges
+                           (agent-shell-markdown--make-markers
+                            (agent-shell-markdown--source-block-ranges))))
            (rendered-ranges (agent-shell-markdown--make-markers
                              (agent-shell-markdown--frozen-ranges)))
            (inline-ranges (agent-shell-markdown--make-markers
                            (agent-shell-markdown--inline-code-ranges
-                            :avoid-ranges (append source-ranges rendered-ranges))))
-           (avoid-ranges (append source-ranges rendered-ranges inline-ranges)))
+                            :avoid-ranges (agent-shell-markdown--sort-ranges
+                                           source-ranges rendered-ranges))))
+           (avoid-ranges (agent-shell-markdown--sort-ranges
+                          source-ranges rendered-ranges inline-ranges)))
       (while (let ((italic-changed (agent-shell-markdown--replace-italics
                                     :avoid-ranges avoid-ranges))
                    (bold-changed (agent-shell-markdown--replace-bolds
@@ -274,18 +277,22 @@ world.\" with face `agent-shell-markdown-bold' on \"world\"."
                      (seq "__" (group (one-or-more (not (any "\n_")))) "__")))
                 (or (syntax punctuation) (syntax whitespace) line-end))
             nil t)
-      (let ((markup-start (match-beginning 1))
-            (markup-end (match-end 1))
-            (text (buffer-substring (or (match-beginning 2) (match-beginning 3))
-                                    (or (match-end 2) (match-end 3)))))
-        (unless (agent-shell-markdown--in-avoid-range-p markup-start markup-end avoid-ranges)
-          (delete-region markup-start markup-end)
-          (goto-char markup-start)
-          (insert text)
-          (add-face-text-property markup-start
-                                  (+ markup-start (length text))
-                                  'agent-shell-markdown-bold)
-          (setq changed t))))
+      (let* ((markup-start (match-beginning 1))
+             (markup-end (match-end 1))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     markup-start markup-end avoid-ranges)))
+        (if avoid
+            (goto-char (cdr avoid))
+          (let ((text (buffer-substring
+                       (or (match-beginning 2) (match-beginning 3))
+                       (or (match-end 2) (match-end 3)))))
+            (delete-region markup-start markup-end)
+            (goto-char markup-start)
+            (insert text)
+            (add-face-text-property markup-start
+                                    (+ markup-start (length text))
+                                    'agent-shell-markdown-bold)
+            (setq changed t)))))
     changed))
 
 (cl-defun agent-shell-markdown--replace-italics (&key avoid-ranges)
@@ -309,18 +316,22 @@ world.\" with face `agent-shell-markdown-italic' on \"world\"."
                            (group "_")
                            (group (one-or-more (not (any "\n_")))) "_")))
             nil t)
-      (let ((markup-start (or (match-beginning 2) (match-beginning 5)))
-            (markup-end (match-end 0))
-            (text (buffer-substring (or (match-beginning 3) (match-beginning 6))
-                                    (or (match-end 3) (match-end 6)))))
-        (unless (agent-shell-markdown--in-avoid-range-p markup-start markup-end avoid-ranges)
-          (delete-region markup-start markup-end)
-          (goto-char markup-start)
-          (insert text)
-          (add-face-text-property markup-start
-                                  (+ markup-start (length text))
-                                  'agent-shell-markdown-italic)
-          (setq changed t))))
+      (let* ((markup-start (or (match-beginning 2) (match-beginning 5)))
+             (markup-end (match-end 0))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     markup-start markup-end avoid-ranges)))
+        (if avoid
+            (goto-char (cdr avoid))
+          (let ((text (buffer-substring
+                       (or (match-beginning 3) (match-beginning 6))
+                       (or (match-end 3) (match-end 6)))))
+            (delete-region markup-start markup-end)
+            (goto-char markup-start)
+            (insert text)
+            (add-face-text-property markup-start
+                                    (+ markup-start (length text))
+                                    'agent-shell-markdown-italic)
+            (setq changed t)))))
     changed))
 
 (cl-defun agent-shell-markdown--replace-strikethroughs (&key avoid-ranges)
@@ -339,17 +350,20 @@ For example, the buffer \"a ~~b~~ c\" becomes \"a b c\" with face
     (while (re-search-forward
             (rx "~~" (group (one-or-more (not (any "\n~")))) "~~")
             nil t)
-      (let ((markup-start (match-beginning 0))
-            (markup-end (match-end 0))
-            (text (buffer-substring (match-beginning 1) (match-end 1))))
-        (unless (agent-shell-markdown--in-avoid-range-p markup-start markup-end avoid-ranges)
-          (delete-region markup-start markup-end)
-          (goto-char markup-start)
-          (insert text)
-          (add-face-text-property markup-start
-                                  (+ markup-start (length text))
-                                  'agent-shell-markdown-strikethrough)
-          (setq changed t))))
+      (let* ((markup-start (match-beginning 0))
+             (markup-end (match-end 0))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     markup-start markup-end avoid-ranges)))
+        (if avoid
+            (goto-char (cdr avoid))
+          (let ((text (buffer-substring (match-beginning 1) (match-end 1))))
+            (delete-region markup-start markup-end)
+            (goto-char markup-start)
+            (insert text)
+            (add-face-text-property markup-start
+                                    (+ markup-start (length text))
+                                    'agent-shell-markdown-strikethrough)
+            (setq changed t)))))
     changed))
 
 (cl-defun agent-shell-markdown--replace-headers (&key avoid-ranges)
@@ -369,18 +383,21 @@ face `agent-shell-markdown-header-2'."
                 (one-or-more blank)
                 (group (one-or-more (not (any "\n")))) eol)
             nil t)
-      (let ((markup-start (match-beginning 0))
-            (markup-end (match-end 0))
-            (level (- (match-end 1) (match-beginning 1)))
-            (text (buffer-substring (match-beginning 2) (match-end 2))))
-        (unless (agent-shell-markdown--in-avoid-range-p markup-start markup-end avoid-ranges)
-          (delete-region markup-start markup-end)
-          (goto-char markup-start)
-          (insert text)
-          (add-face-text-property markup-start
-                                  (+ markup-start (length text))
-                                  (intern (format "agent-shell-markdown-header-%d"
-                                                  (min (max level 1) 6)))))))))
+      (let* ((markup-start (match-beginning 0))
+             (markup-end (match-end 0))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     markup-start markup-end avoid-ranges)))
+        (if avoid
+            (goto-char (cdr avoid))
+          (let ((level (- (match-end 1) (match-beginning 1)))
+                (text (buffer-substring (match-beginning 2) (match-end 2))))
+            (delete-region markup-start markup-end)
+            (goto-char markup-start)
+            (insert text)
+            (add-face-text-property markup-start
+                                    (+ markup-start (length text))
+                                    (intern (format "agent-shell-markdown-header-%d"
+                                                    (min (max level 1) 6))))))))))
 
 (cl-defun agent-shell-markdown--style-inline-code (&key avoid-ranges)
   "Strip backticks from complete inline `X` spans and face the body.
@@ -398,18 +415,21 @@ face `agent-shell-markdown-inline-code' on \"code\"."
   (let ((case-fold-search nil))
     (goto-char (point-min))
     (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
-      (let ((markup-start (match-beginning 0))
-            (markup-end (match-end 0))
-            (text (buffer-substring (match-beginning 1) (match-end 1))))
-        (unless (agent-shell-markdown--in-avoid-range-p markup-start markup-end avoid-ranges)
-          (delete-region markup-start markup-end)
-          (goto-char markup-start)
-          (insert text)
-          (let ((end (+ markup-start (length text))))
-            (add-face-text-property markup-start end 'agent-shell-markdown-inline-code)
-            (add-text-properties markup-start end
-                                 '(agent-shell-markdown-frozen t
-                                   rear-nonsticky (agent-shell-markdown-frozen)))))))))
+      (let* ((markup-start (match-beginning 0))
+             (markup-end (match-end 0))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     markup-start markup-end avoid-ranges)))
+        (if avoid
+            (goto-char (cdr avoid))
+          (let ((text (buffer-substring (match-beginning 1) (match-end 1))))
+            (delete-region markup-start markup-end)
+            (goto-char markup-start)
+            (insert text)
+            (let ((end (+ markup-start (length text))))
+              (add-face-text-property markup-start end 'agent-shell-markdown-inline-code)
+              (add-text-properties markup-start end
+                                   '(agent-shell-markdown-frozen t
+                                     rear-nonsticky (agent-shell-markdown-frozen))))))))))
 
 (cl-defun agent-shell-markdown--replace-links (&key avoid-ranges)
   "Replace `[title](url)' markup with title faced as link.
@@ -433,22 +453,29 @@ and a keymap that opens the URL."
                 (group (one-or-more (not (any ")"))))
                 ")")
             nil t)
-      (let ((markup-start (match-beginning 0))
-            (markup-end (match-end 0))
-            (title (buffer-substring (match-beginning 1) (match-end 1)))
-            (url (buffer-substring-no-properties (match-beginning 2) (match-end 2))))
-        (unless (or (eq (char-before markup-start) ?!)
-                    (agent-shell-markdown--in-avoid-range-p markup-start markup-end avoid-ranges))
-          (delete-region markup-start markup-end)
-          (goto-char markup-start)
-          (insert title)
-          (let ((end (+ markup-start (length title))))
-            (add-face-text-property markup-start end 'agent-shell-markdown-link)
-            (put-text-property markup-start end 'keymap
-                               (agent-shell-markdown--make-ret-binding-map
-                                (lambda () (interactive)
-                                  (agent-shell-markdown--open-link url))))
-            (put-text-property markup-start end 'mouse-face 'highlight)))))))
+      (let* ((markup-start (match-beginning 0))
+             (markup-end (match-end 0))
+             (is-image (eq (char-before markup-start) ?!))
+             (avoid (unless is-image
+                      (agent-shell-markdown--in-avoid-range-p
+                       markup-start markup-end avoid-ranges))))
+        (cond
+         (avoid (goto-char (cdr avoid)))
+         (is-image nil)
+         (t
+          (let ((title (buffer-substring (match-beginning 1) (match-end 1)))
+                (url (buffer-substring-no-properties
+                      (match-beginning 2) (match-end 2))))
+            (delete-region markup-start markup-end)
+            (goto-char markup-start)
+            (insert title)
+            (let ((end (+ markup-start (length title))))
+              (add-face-text-property markup-start end 'agent-shell-markdown-link)
+              (put-text-property markup-start end 'keymap
+                                 (agent-shell-markdown--make-ret-binding-map
+                                  (lambda () (interactive)
+                                    (agent-shell-markdown--open-link url))))
+              (put-text-property markup-start end 'mouse-face 'highlight)))))))))
 
 (cl-defun agent-shell-markdown--replace-images (&key avoid-ranges)
   "Replace `![alt](url)' image markup with displayed images.
@@ -475,28 +502,34 @@ For example, the buffer \"see ![logo](logo.png)\" becomes
             nil t)
       (let* ((markup-start (match-beginning 0))
              (markup-end (match-end 0))
-             (alt (buffer-substring-no-properties (match-beginning 1) (match-end 1)))
-             (url (buffer-substring-no-properties (match-beginning 2) (match-end 2)))
-             (path (agent-shell-markdown--resolve-image-url url)))
-        (when (and path
-                   (image-supported-file-p path)
-                   (display-graphic-p)
-                   (not (agent-shell-markdown--in-avoid-range-p
-                         markup-start markup-end avoid-ranges)))
-          (let ((image (create-image path nil nil
-                                     :max-width (agent-shell-markdown--image-max-width)))
-                (placeholder (if (string-empty-p alt) " " alt)))
-            (image-flush image)
-            (delete-region markup-start markup-end)
-            (goto-char markup-start)
-            (insert placeholder)
-            (let ((end (+ markup-start (length placeholder))))
-              (put-text-property markup-start end 'display image)
-              (put-text-property markup-start end 'keymap
-                                 (agent-shell-markdown--make-ret-binding-map
-                                  (lambda () (interactive)
-                                    (find-file path))))
-              (put-text-property markup-start end 'mouse-face 'highlight))))))))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     markup-start markup-end avoid-ranges)))
+        (cond
+         (avoid (goto-char (cdr avoid)))
+         (t
+          (let* ((alt (buffer-substring-no-properties
+                       (match-beginning 1) (match-end 1)))
+                 (url (buffer-substring-no-properties
+                       (match-beginning 2) (match-end 2)))
+                 (path (agent-shell-markdown--resolve-image-url url)))
+            (when (and path
+                       (image-supported-file-p path)
+                       (display-graphic-p))
+              (let ((image (create-image
+                            path nil nil
+                            :max-width (agent-shell-markdown--image-max-width)))
+                    (placeholder (if (string-empty-p alt) " " alt)))
+                (image-flush image)
+                (delete-region markup-start markup-end)
+                (goto-char markup-start)
+                (insert placeholder)
+                (let ((end (+ markup-start (length placeholder))))
+                  (put-text-property markup-start end 'display image)
+                  (put-text-property markup-start end 'keymap
+                                     (agent-shell-markdown--make-ret-binding-map
+                                      (lambda () (interactive)
+                                        (find-file path))))
+                  (put-text-property markup-start end 'mouse-face 'highlight)))))))))))
 
 (cl-defun agent-shell-markdown--replace-image-file-paths (&key avoid-ranges)
   "Render bare image-path lines as displayed images.
@@ -520,27 +553,31 @@ renders the image in place of that text."
     (while (re-search-forward regex nil t)
       (let* ((line-start (match-beginning 0))
              (line-end (match-end 0))
-             (path-start (match-beginning 1))
-             (path-end (match-end 1))
-             (raw (buffer-substring-no-properties path-start path-end))
-             (resolved (agent-shell-markdown--resolve-image-url raw)))
-        (when (and resolved
-                   (image-supported-file-p resolved)
-                   (display-graphic-p)
-                   (not (agent-shell-markdown--in-avoid-range-p
-                         line-start line-end avoid-ranges)))
-          (let ((image (create-image resolved nil nil
-                                     :max-width (agent-shell-markdown--image-max-width))))
-            (image-flush image)
-            (put-text-property path-start path-end 'display image)
-            (put-text-property path-start path-end 'keymap
-                               (agent-shell-markdown--make-ret-binding-map
-                                (lambda () (interactive)
-                                  (find-file resolved))))
-            (put-text-property path-start path-end 'mouse-face 'highlight)
-            (add-text-properties path-start path-end
-                                 '(agent-shell-markdown-frozen t
-                                   rear-nonsticky (agent-shell-markdown-frozen)))))))))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     line-start line-end avoid-ranges)))
+        (cond
+         (avoid (goto-char (cdr avoid)))
+         (t
+          (let* ((path-start (match-beginning 1))
+                 (path-end (match-end 1))
+                 (raw (buffer-substring-no-properties path-start path-end))
+                 (resolved (agent-shell-markdown--resolve-image-url raw)))
+            (when (and resolved
+                       (image-supported-file-p resolved)
+                       (display-graphic-p))
+              (let ((image (create-image
+                            resolved nil nil
+                            :max-width (agent-shell-markdown--image-max-width))))
+                (image-flush image)
+                (put-text-property path-start path-end 'display image)
+                (put-text-property path-start path-end 'keymap
+                                   (agent-shell-markdown--make-ret-binding-map
+                                    (lambda () (interactive)
+                                      (find-file resolved))))
+                (put-text-property path-start path-end 'mouse-face 'highlight)
+                (add-text-properties path-start path-end
+                                     '(agent-shell-markdown-frozen t
+                                       rear-nonsticky (agent-shell-markdown-frozen))))))))))))
 
 (cl-defun agent-shell-markdown--style-dividers (&key avoid-ranges)
   "Render `---' / `***' / `___' horizontal-rule lines as styled rules.
@@ -562,9 +599,12 @@ property, so the source markdown round-trips through copy/save."
                     (seq "___" (zero-or-more "_")))
                 (zero-or-more blank) eol)
             nil t)
-      (let ((rule-start (match-beginning 0))
-            (rule-end (match-end 0)))
-        (unless (agent-shell-markdown--in-avoid-range-p rule-start rule-end avoid-ranges)
+      (let* ((rule-start (match-beginning 0))
+             (rule-end (match-end 0))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     rule-start rule-end avoid-ranges)))
+        (if avoid
+            (goto-char (cdr avoid))
           (add-text-properties
            rule-start rule-end
            (list 'display
@@ -749,6 +789,15 @@ unchanged source is a no-op."
       (while (< pos (point-max))
         (goto-char pos)
         (cond
+         ;; Skip past any avoid-range containing POS in one hop —
+         ;; otherwise multi-line ranges (open fences, big rendered
+         ;; spans) make us walk every line just to fall through.
+         ;; Query with `[pos, pos+1)' so a range whose half-open
+         ;; exclusive END equals POS doesn't match (would otherwise
+         ;; setq POS back to itself → infinite loop).
+         ((let ((avoid (agent-shell-markdown--in-avoid-range-p
+                        pos (1+ pos) avoid-ranges)))
+            (when avoid (setq pos (cdr avoid)) t)))
          ((get-text-property pos 'agent-shell-markdown-table-source)
           (let* ((stashed (get-text-property pos 'agent-shell-markdown-table-source))
                  (rendered-end (or (next-single-property-change
@@ -794,8 +843,7 @@ unchanged source is a no-op."
               ;; be a no-op, so skip past the rendered region.
               (setq pos rendered-end))))
          ((and (looking-at agent-shell-markdown--table-line-regexp)
-               (not (get-text-property pos 'agent-shell-markdown-frozen))
-               (not (agent-shell-markdown--in-avoid-range-p pos pos avoid-ranges)))
+               (not (get-text-property pos 'agent-shell-markdown-frozen)))
           (let ((table-start pos)
                 (table-end nil)
                 (row-count 0))
@@ -824,8 +872,18 @@ unchanged source is a no-op."
                       (:end . ,table-end)
                       (:source . ,(buffer-substring table-start table-end)))
                     tables))
-            (setq pos (or table-end (1+ pos)))))
-         (t (setq pos (1+ pos))))))
+            ;; If we matched table rows, `table-end' is past them.
+            ;; Otherwise advance to the next line — the table regex
+            ;; needs `bol' to match, so scanning the rest of this line
+            ;; char-by-char can never produce a hit.
+            (setq pos (or table-end
+                          (progn (forward-line 1) (point))))))
+         (t
+          ;; No table-source here and no table starts at this position.
+          ;; The table regex requires `bol', so jump straight to the
+          ;; next line start rather than crawling each char.
+          (forward-line 1)
+          (setq pos (point))))))
     (nreverse tables)))
 
 (defun agent-shell-markdown--parse-table-row (start end)
@@ -1651,15 +1709,39 @@ Resolves `agent-shell-markdown-image-max-width' which may be an integer
                   (copy-marker (cdr range))))
           ranges))
 
-(defun agent-shell-markdown--in-avoid-range-p (start end avoid-ranges)
-  "Return non-nil if positions START..END are fully inside any AVOID-RANGES.
+(defun agent-shell-markdown--sort-ranges (&rest range-collections)
+  "Merge RANGE-COLLECTIONS into a vector sorted by start position.
+Each collection is a sequence of (BEG . END) cons cells — list or
+vector — so already-sorted vectors can be re-merged without first
+being flattened.  Endpoints may be integers or markers.  The
+returned vector enables O(log n) lookup via
+`agent-shell-markdown--in-avoid-range-p'."
+  (sort (apply #'vconcat range-collections)
+        (lambda (a b) (< (car a) (car b)))))
 
-AVOID-RANGES is a list of (start . end) cons cells; values may be
-integers or markers (comparison works for both)."
-  (seq-find (lambda (range)
-              (and (>= start (car range))
-                   (<= end (cdr range))))
-            avoid-ranges))
+(defun agent-shell-markdown--in-avoid-range-p (start end avoid-ranges)
+  "Return the avoid-range fully containing START..END, or nil.
+
+AVOID-RANGES is a vector of (BEG . END) cons cells sorted by BEG
+— produce one with `agent-shell-markdown--sort-ranges'.
+Endpoints may be integers or markers.  Ranges are assumed
+non-overlapping (callers compose disjoint sources), so the first
+candidate found suffices to decide containment.  The returned
+range lets callers advance point past it instead of re-checking
+the same range on every match inside it."
+  (when avoid-ranges
+    (let ((lo 0)
+          (hi (length avoid-ranges))
+          (candidate nil))
+      (while (< lo hi)
+        (let* ((mid (/ (+ lo hi) 2))
+               (range (aref avoid-ranges mid)))
+          (if (<= (car range) start)
+              (setq candidate range
+                    lo (1+ mid))
+            (setq hi mid))))
+      (when (and candidate (<= end (cdr candidate)))
+        candidate))))
 
 (defun agent-shell-markdown--source-block-ranges ()
   "Return list of (start . end) ranges covering fenced code blocks.
