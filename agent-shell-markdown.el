@@ -93,6 +93,11 @@
   "Face for link titles rendered by `agent-shell-markdown-convert'."
   :group 'agent-shell-markdown)
 
+(defface agent-shell-markdown-blockquote
+  '((t :inherit font-lock-comment-face))
+  "Face for blockquoted text rendered by `agent-shell-markdown-convert'."
+  :group 'agent-shell-markdown)
+
 (defface agent-shell-markdown-header-1
   '((t :inherit org-level-1))
   "Face for level-1 headers rendered by `agent-shell-markdown-convert'."
@@ -256,6 +261,7 @@ non-nil to drop the watermark and re-render the whole buffer
           (agent-shell-markdown--replace-images :avoid-ranges avoid-ranges)
           (agent-shell-markdown--replace-image-file-paths :avoid-ranges avoid-ranges)
           (agent-shell-markdown--style-dividers :avoid-ranges avoid-ranges)
+          (agent-shell-markdown--style-blockquotes :avoid-ranges avoid-ranges)
           (agent-shell-markdown--style-source-blocks)
           ;; Tables run last so cell content has already been processed by
           ;; every other pass (bold, italic, links, inline code, etc.).
@@ -636,11 +642,59 @@ property, so the source markdown round-trips through copy/save."
           (add-text-properties
            rule-start rule-end
            (list 'display
-                 (concat (propertize (make-string (agent-shell-markdown--display-width) ?\s)
+                 (concat (propertize (make-string 12 ?\s)
                                      'face '(:underline t))
                          "\n")
                  'agent-shell-markdown-frozen t
                  'rear-nonsticky '(display agent-shell-markdown-frozen))))))))
+
+(cl-defun agent-shell-markdown--style-blockquotes (&key avoid-ranges)
+  "Render `>'-prefixed lines as blockquotes with vertical bars.
+
+Each leading `>' character on the line is shown as `▌' via a
+`display' text property; the underlying `>' chars stay in the
+buffer so the source markdown round-trips through copy/save and
+re-rendering remains idempotent.  Remaining content on the line
+gets face `agent-shell-markdown-blockquote' (composes with any
+face already applied by an earlier pass — bold/italic/inline-code
+inside a blockquote still render).
+
+Multiple nesting levels are supported: each leading `>' renders
+as its own bar, so `>> text' shows two bars and `>>> text' three.
+Whitespace between `>'s is preserved literally.
+
+Requires an explicit trailing newline — a blockquote line at
+end-of-buffer without `\\n' is treated as still streaming and
+left raw, matching the header behaviour.
+
+Lines inside any of AVOID-RANGES (e.g. fenced code blocks) are
+left untouched."
+  (let ((case-fold-search nil)
+        (bar (propertize "▌" 'face 'agent-shell-markdown-blockquote)))
+    (goto-char (point-min))
+    (while (re-search-forward
+            (rx bol (zero-or-more blank)
+                ">" (zero-or-more (any " \t>"))
+                (zero-or-more (not (any "\n"))) "\n")
+            nil t)
+      (let* ((line-start (match-beginning 0))
+             (line-end (match-end 0))
+             (avoid (agent-shell-markdown--in-avoid-range-p
+                     line-start line-end avoid-ranges)))
+        (if avoid
+            (goto-char (cdr avoid))
+          (save-excursion
+            (goto-char line-start)
+            (skip-chars-forward " \t" line-end)
+            (while (eq (char-after) ?>)
+              (put-text-property (point) (1+ (point)) 'display bar)
+              (forward-char 1)
+              (skip-chars-forward " \t" line-end)))
+          (add-face-text-property line-start (1- line-end)
+                                  'agent-shell-markdown-blockquote)
+          (add-text-properties line-start line-end
+                               '(agent-shell-markdown-frozen t
+                                 rear-nonsticky (agent-shell-markdown-frozen))))))))
 
 (defun agent-shell-markdown--display-width ()
   "Return a usable display width for divider rendering.

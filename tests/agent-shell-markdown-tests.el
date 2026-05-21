@@ -812,6 +812,75 @@ A " nil)
     (should (string-match-p "^hello\nworld\n$"
                             (substring-no-properties (buffer-string))))))
 
+(ert-deftest agent-shell-markdown-convert-blockquote-single-level ()
+  ;; `> text\n' keeps the `>' in the buffer (source round-trips) but
+  ;; shows `▌' as a display override.  The line content carries the
+  ;; blockquote face.
+  (let ((s (agent-shell-markdown-convert "> hello\n")))
+    (should (equal (substring-no-properties s) "> hello\n"))
+    (should (equal (get-text-property 0 'display s)
+                   (propertize "▌"
+                              'face 'agent-shell-markdown-blockquote)))
+    (should (eq (get-text-property 2 'face s)
+                'agent-shell-markdown-blockquote))
+    (should (eq (get-text-property 0 'agent-shell-markdown-frozen s) t))))
+
+(ert-deftest agent-shell-markdown-convert-blockquote-multi-level ()
+  ;; Each leading `>' gets its own bar — `>> ' shows two, `>>> '
+  ;; shows three.  Whitespace between `>'s is preserved.
+  (let ((s (agent-shell-markdown-convert ">> level 2\n")))
+    (should (equal (get-text-property 0 'display s)
+                   (propertize "▌"
+                              'face 'agent-shell-markdown-blockquote)))
+    (should (equal (get-text-property 1 'display s)
+                   (propertize "▌"
+                              'face 'agent-shell-markdown-blockquote))))
+  (let ((s (agent-shell-markdown-convert ">>> level 3\n")))
+    (dolist (i '(0 1 2))
+      (should (equal (get-text-property i 'display s)
+                     (propertize "▌"
+                                'face 'agent-shell-markdown-blockquote))))))
+
+(ert-deftest agent-shell-markdown-convert-blockquote-with-bold ()
+  ;; Inline markup inside a blockquote still renders — bold runs
+  ;; before blockquote, and the blockquote face composes on top so
+  ;; the bold text ends up with both faces.
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "> hello **world**\n"))
+                 '(("> hello " (agent-shell-markdown-blockquote))
+                   ("world" (agent-shell-markdown-blockquote
+                             agent-shell-markdown-bold))
+                   ("\n" nil)))))
+
+(ert-deftest agent-shell-markdown-blockquote-waits-for-newline-across-chunks ()
+  ;; A blockquote line streamed across two chunks (`> hel' then `lo\n')
+  ;; must not render until the line completes — otherwise `> hel'
+  ;; would face only `hel' and leave the rest plain on the next call.
+  (with-temp-buffer
+    (insert "> hel")
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string)) "> hel"))
+    (should-not (get-text-property (point-min) 'display))
+    (goto-char (point-max))
+    (insert "lo\n")
+    (agent-shell-markdown-replace-markup)
+    (should (equal (get-text-property (point-min) 'display)
+                   (propertize "▌"
+                              'face 'agent-shell-markdown-blockquote)))
+    (should (eq (get-text-property (+ (point-min) 2) 'face)
+                'agent-shell-markdown-blockquote))))
+
+(ert-deftest agent-shell-markdown-blockquote-inside-fence-stays-raw ()
+  ;; A `>'-prefixed line inside a fenced code block must not be
+  ;; styled — the source-block range is in avoid-ranges.
+  (let ((s (agent-shell-markdown-convert "```
+> not a quote
+```
+")))
+    (should (string-match-p "^> not a quote" (substring-no-properties s)))
+    (let ((quote-pos (string-match "> not a quote" (substring-no-properties s))))
+      (should-not (get-text-property quote-pos 'display s)))))
+
 (ert-deftest agent-shell-markdown-header-waits-for-newline-across-chunks ()
   ;; A header split across two chunks (chunk 1 = `# He', chunk 2 =
   ;; `llo World\\n') must not render eagerly on chunk 1 — the
