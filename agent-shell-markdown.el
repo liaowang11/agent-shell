@@ -151,6 +151,11 @@ the window, so the block reads as a contiguous panel rather than
 a per-char highlight."
   :group 'agent-shell-markdown)
 
+(defface agent-shell-markdown-source-block-language
+  '((t :inherit (italic font-lock-type-face agent-shell-markdown-source-block)))
+  "Face for the language label shown above a fenced source block."
+  :group 'agent-shell-markdown)
+
 (defvar agent-shell-markdown-image-max-width 0.4
   "Maximum width for inline images rendered from `![alt](url)'.
 An integer is taken as pixels.  A float between 0 and 1 is a
@@ -805,10 +810,10 @@ with `emacs-lisp-mode' face properties on the body and a
                                  line-prefix ,prefix
                                  wrap-prefix ,prefix)))
         ;; Vertical padding via `display' property.  The first body
-        ;; char renders as "<blank-line><original-char>" and the
+        ;; char renders as "<top-padding><original-char>" and the
         ;; trailing \n renders as "<original-\n><blank-line>",
-        ;; visually inserting a blank bg-tinted line above and below
-        ;; the block without modifying buffer text — copying the body
+        ;; visually inserting bg-tinted lines above and below the
+        ;; block without modifying buffer text — copying the body
         ;; still yanks the raw source.  vpad is a single bg-faced \n:
         ;; the `line-prefix' applied to body chars also paints these
         ;; padding visual lines (cols 0-1 plain, cols 2-3 bg), and
@@ -816,13 +821,26 @@ with `emacs-lisp-mode' face properties on the body and a
         ;; edge.  Adding a literal "  " in vpad would put a plain
         ;; stripe on top of the prefix, which then flashes the region
         ;; face when the underlying char is selected.
-        (let ((vpad (propertize "\n" 'face
-                                'agent-shell-markdown-source-block))
-              (first-pos (marker-position body-start))
-              (last-pos (marker-position body-end)))
+        ;;
+        ;; When the fence carries a language, the top padding grows
+        ;; to three lines with the language label on the middle one;
+        ;; languageless fences keep the single-line padding so we
+        ;; don't waste vertical space when there's no label to show.
+        (let* ((vpad (propertize "\n" 'face
+                                 'agent-shell-markdown-source-block))
+               (top-pad (if (string-empty-p lang)
+                            vpad
+                          (concat vpad
+                                  (propertize
+                                   lang 'face
+                                   'agent-shell-markdown-source-block-language)
+                                  vpad
+                                  vpad)))
+               (first-pos (marker-position body-start))
+               (last-pos (marker-position body-end)))
           (put-text-property first-pos (1+ first-pos)
                              'display
-                             (concat vpad
+                             (concat top-pad
                                      (buffer-substring first-pos
                                                        (1+ first-pos))))
           (put-text-property last-pos (1+ last-pos)
