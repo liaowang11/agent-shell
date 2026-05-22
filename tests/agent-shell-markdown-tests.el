@@ -239,10 +239,11 @@ body
 " (agent-shell-markdown-source-block))))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-language-padding ()
-  ;; A language-tagged fence renders with 3 lines of top padding
-  ;; where the middle (line 2) shows the language label.  No-
-  ;; language fences keep the single-line top padding so the empty
-  ;; lines aren't wasted on something that has nothing to label.
+  ;; Every fence renders with 3 lines of top padding and a label on
+  ;; the middle line — "LANG ⧉" when the fence declared a language,
+  ;; the fallback "snippet ⧉" otherwise.  The whole label is
+  ;; actionable (RET / mouse-1 kills the body to the kill ring), not
+  ;; just the copy glyph.
   (let* ((with-lang (agent-shell-markdown-convert "```python
 print(\"hi\")
 ```
@@ -253,19 +254,18 @@ body
 "))
          (with-lang-display (get-text-property 0 'display with-lang))
          (no-lang-display (get-text-property 0 'display no-lang)))
-    ;; With-language: display is "\nLANG ⧉\n\n" + first-char.  The
-    ;; copy character carries `mouse-face' + a keymap that kills the
-    ;; body to the kill ring on RET / mouse-1.
     (should (equal (substring-no-properties with-lang-display)
                    "\npython ⧉\n\np"))
-    (should (eq (get-text-property 1 'face with-lang-display)
-                'agent-shell-markdown-source-block-language))
-    (should (eq (get-text-property 8 'mouse-face with-lang-display)
-                'highlight))
-    (should (keymapp (get-text-property 8 'keymap with-lang-display)))
-    ;; No-language: keep the original single-newline padding.
     (should (equal (substring-no-properties no-lang-display)
-                   "\nb"))))
+                   "\nsnippet ⧉\n\nb"))
+    ;; Label face + actionable props cover the whole label (both the
+    ;; first char of the name and the ⧉ glyph).
+    (dolist (i '(1 8))
+      (should (eq (get-text-property i 'face with-lang-display)
+                  'agent-shell-markdown-source-block-language))
+      (should (eq (get-text-property i 'mouse-face with-lang-display)
+                  'highlight))
+      (should (keymapp (get-text-property i 'keymap with-lang-display))))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-nested-fences ()
   ;; A 4-backtick outer fence wraps inner 3-backtick fences as
