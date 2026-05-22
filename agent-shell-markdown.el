@@ -822,20 +822,29 @@ with `emacs-lisp-mode' face properties on the body and a
         ;; stripe on top of the prefix, which then flashes the region
         ;; face when the underlying char is selected.
         ;;
-        ;; When the fence carries a language, the top padding grows
-        ;; to three lines with the language label on the middle one;
-        ;; languageless fences keep the single-line padding so we
-        ;; don't waste vertical space when there's no label to show.
+        ;; Top padding is three lines with the label on the middle
+        ;; one — "LANG ⧉" if a language was given, otherwise the
+        ;; fallback "snippet ⧉".  The whole label is actionable: RET
+        ;; or mouse-1 anywhere on it kills the body to the kill ring.
         (let* ((vpad (propertize "\n" 'face
                                  'agent-shell-markdown-source-block))
-               (top-pad (if (string-empty-p lang)
-                            vpad
-                          (concat vpad
-                                  (propertize
-                                   lang 'face
-                                   'agent-shell-markdown-source-block-language)
-                                  vpad
-                                  vpad)))
+               (label-text (concat (if (string-empty-p lang) "snippet" lang)
+                                   " ⧉"))
+               (label
+                (propertize
+                 label-text
+                 'face 'agent-shell-markdown-source-block-language
+                 'mouse-face 'highlight
+                 'pointer 'hand
+                 'keymap (agent-shell-markdown--make-ret-binding-map
+                          (lambda ()
+                            (interactive)
+                            (kill-new
+                             (buffer-substring-no-properties
+                              (marker-position body-start)
+                              (marker-position body-end)))
+                            (message "Copied")))))
+               (top-pad (concat vpad label vpad vpad))
                (first-pos (marker-position body-start))
                (last-pos (marker-position body-end)))
           (put-text-property first-pos (1+ first-pos)

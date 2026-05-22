@@ -253,12 +253,16 @@ body
 "))
          (with-lang-display (get-text-property 0 'display with-lang))
          (no-lang-display (get-text-property 0 'display no-lang)))
-    ;; With-language: display string is "\nLANG\n\n" + first-char.
+    ;; With-language: display is "\nLANG ⧉\n\n" + first-char.  The
+    ;; copy character carries `mouse-face' + a keymap that kills the
+    ;; body to the kill ring on RET / mouse-1.
     (should (equal (substring-no-properties with-lang-display)
-                   "\npython\n\np"))
-    ;; The "python" segment carries the language face.
+                   "\npython ⧉\n\np"))
     (should (eq (get-text-property 1 'face with-lang-display)
                 'agent-shell-markdown-source-block-language))
+    (should (eq (get-text-property 8 'mouse-face with-lang-display)
+                'highlight))
+    (should (keymapp (get-text-property 8 'keymap with-lang-display)))
     ;; No-language: keep the original single-newline padding.
     (should (equal (substring-no-properties no-lang-display)
                    "\nb"))))
