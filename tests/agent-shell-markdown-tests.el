@@ -238,6 +238,31 @@ body
                  '(("body
 " (agent-shell-markdown-source-block))))))
 
+(ert-deftest agent-shell-markdown-convert-source-block-language-padding ()
+  ;; A language-tagged fence renders with 3 lines of top padding
+  ;; where the middle (line 2) shows the language label.  No-
+  ;; language fences keep the single-line top padding so the empty
+  ;; lines aren't wasted on something that has nothing to label.
+  (let* ((with-lang (agent-shell-markdown-convert "```python
+print(\"hi\")
+```
+"))
+         (no-lang (agent-shell-markdown-convert "```
+body
+```
+"))
+         (with-lang-display (get-text-property 0 'display with-lang))
+         (no-lang-display (get-text-property 0 'display no-lang)))
+    ;; With-language: display string is "\nLANG\n\n" + first-char.
+    (should (equal (substring-no-properties with-lang-display)
+                   "\npython\n\np"))
+    ;; The "python" segment carries the language face.
+    (should (eq (get-text-property 1 'face with-lang-display)
+                'agent-shell-markdown-source-block-language))
+    ;; No-language: keep the original single-newline padding.
+    (should (equal (substring-no-properties no-lang-display)
+                   "\nb"))))
+
 (ert-deftest agent-shell-markdown-convert-source-block-nested-fences ()
   ;; A 4-backtick outer fence wraps inner 3-backtick fences as
   ;; literal body — the inner ```python ... ``` is *not* re-rendered
