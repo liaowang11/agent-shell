@@ -238,6 +238,22 @@ body
                  '(("body
 " (agent-shell-markdown-source-block))))))
 
+(ert-deftest agent-shell-markdown-convert-source-block-nested-fences ()
+  ;; A 4-backtick outer fence wraps inner 3-backtick fences as
+  ;; literal body — the inner ```python ... ``` is *not* re-rendered
+  ;; as a code block.  Mirrors CommonMark's variable-width fence
+  ;; rule: a closer must match the opener's backtick count, and a
+  ;; shorter run inside is part of the body.
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert
+                   "````markdown
+```python
+print(\"hi\")
+```
+````"))
+                 '(("```python\nprint(\"hi\")\n```\n"
+                    (agent-shell-markdown-source-block))))))
+
 (ert-deftest agent-shell-markdown-convert-source-block-with-language ()
   ;; `emacs-lisp' source block: fences deleted, body chars get
   ;; `emacs-lisp-mode' font-lock faces *plus* the

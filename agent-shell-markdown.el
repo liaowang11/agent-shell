@@ -739,23 +739,32 @@ with `emacs-lisp-mode' face properties on the body and a
 `agent-shell-markdown-frozen' tag covering those same chars."
   (let ((case-fold-search nil))
     (goto-char (point-min))
+    ;; Group 2 captures the opening backtick run; `backref' on the
+    ;; closer matches the same literal run, so a 4-backtick outer
+    ;; fence requires a 4-backtick close — a 3-backtick line inside
+    ;; is just body.  Note this is slightly tighter than CommonMark
+    ;; (which permits close > open), but every-LLM-I've-seen emits
+    ;; matched counts, so the simplification is worth it.
     (while (re-search-forward
-            (rx (group bol (zero-or-more blank) "```" (zero-or-more blank)
+            (rx (group bol (zero-or-more blank)
+                       (group (>= 3 "`"))
+                       (zero-or-more blank)
                        (group (zero-or-more (or alphanumeric "-" "+" "#")))
                        (zero-or-more blank) "\n")
                 (group (*? anychar))
                 "\n"
-                (group bol (zero-or-more blank) "```" (zero-or-more blank)
-                       (or "\n" eol)))
+                (group bol (zero-or-more blank)
+                       (backref 2)
+                       (zero-or-more blank) (or "\n" eol)))
             nil t)
       (let* ((open-start (match-beginning 1))
              (open-end (match-end 1))
-             (lang (buffer-substring-no-properties (match-beginning 2)
-                                                   (match-end 2)))
-             (body-start (copy-marker (match-beginning 3)))
-             (body-end (copy-marker (match-end 3)))
-             (close-start (match-beginning 4))
-             (close-end (match-end 4))
+             (lang (buffer-substring-no-properties (match-beginning 3)
+                                                   (match-end 3)))
+             (body-start (copy-marker (match-beginning 4)))
+             (body-end (copy-marker (match-end 4)))
+             (close-start (match-beginning 5))
+             (close-end (match-end 5))
              (highlighted (agent-shell-markdown--highlight-code
                            (buffer-substring-no-properties body-start body-end)
                            lang)))
@@ -1939,10 +1948,15 @@ the same range on every match inside it."
 (defun agent-shell-markdown--source-block-ranges ()
   "Return list of (start . end) ranges covering fenced code blocks.
 
-Each range spans from the opening ``` line to the start of the
-line after the closing ``` line.  A fence that is open but not
+Each range spans from the opening fence line to the start of the
+line after the closing fence line.  A fence that is open but not
 yet closed (mid-stream) extends to `point-max', so its contents
 are protected as the buffer grows.
+
+Fence widths pair like CommonMark: an opening fence of N
+backticks (N>=3) is closed only by a fence line with M>=N
+backticks, so a 4-backtick outer fence wraps any 3-backtick inner
+fence as body rather than terminating on it.
 
 For example, given the buffer:
 
@@ -1952,20 +1966,26 @@ For example, given the buffer:
 
 returns a list with one range covering the whole block."
   (let ((ranges '())
-        (open nil)
+        (open-start nil)
+        (open-count nil)
         (case-fold-search nil))
     (save-excursion
       (goto-char (point-min))
       (while (re-search-forward
-              (rx bol (zero-or-more whitespace) "```" (zero-or-more not-newline))
+              (rx bol (zero-or-more whitespace)
+                  (group (>= 3 "`"))
+                  (zero-or-more not-newline))
               nil t)
-        (if open
-            (progn
-              (push (cons open (line-beginning-position 2)) ranges)
-              (setq open nil))
-          (setq open (match-beginning 0))))
-      (when open
-        (push (cons open (point-max)) ranges)))
+        (let ((count (- (match-end 1) (match-beginning 1))))
+          (cond
+           ((and open-count (>= count open-count))
+            (push (cons open-start (line-beginning-position 2)) ranges)
+            (setq open-start nil open-count nil))
+           ((not open-count)
+            (setq open-start (match-beginning 0)
+                  open-count count)))))
+      (when open-count
+        (push (cons open-start (point-max)) ranges)))
     (nreverse ranges)))
 
 (defun agent-shell-markdown--frozen-ranges ()
