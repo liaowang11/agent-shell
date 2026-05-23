@@ -868,6 +868,14 @@ with `emacs-lisp-mode' face properties on the body and a
       line-end)
   "Regexp matching a single line of a markdown table.")
 
+(defconst agent-shell-markdown--table-pending-line-regexp
+  (rx line-start (zero-or-more (any " \t")) "|")
+  "Lenient regexp matching a line that might still be streaming into
+a table row — anything starting with `|' (after optional leading
+whitespace).  Used by `--extending-table-start' so the watermark
+can back off past a partial separator like `|---|---|----' that
+hasn't grown its closing `|' yet.")
+
 (defconst agent-shell-markdown--table-separator-regexp
   (rx line-start
       (zero-or-more (any " \t"))
@@ -1870,12 +1878,19 @@ Stops on the first non-pipe-row non-table line — past that
 point, a table from there can no longer accumulate."
   (when (> (point-max) (point-min))
     (save-excursion
+      ;; Walk from the last content line.  `forward-line 0' moves to
+      ;; the start of the line containing point; if that landed us on
+      ;; an empty trailing line (buffer ends with `\\n'), step one
+      ;; line further back so the loop's first iteration examines
+      ;; actual content rather than the empty tail.
       (goto-char (point-max))
+      (forward-line 0)
+      (when (and (eobp) (not (bobp)))
+        (forward-line -1))
       (let (rendered-table-start
             pending-table-start
             (continue t))
         (while continue
-          (forward-line -1)
           (cond
            ;; Hit a char already inside a rendered table — find its start.
            ((get-text-property (point) 'agent-shell-markdown-table-source)
@@ -1885,10 +1900,17 @@ point, a table from there can no longer accumulate."
                        'agent-shell-markdown-table-source)
                       (point-min)))
             (setq continue nil))
-           ((bobp) (setq continue nil))
-           ;; Raw pipe-row — remember the earliest streak entry.
-           ((looking-at agent-shell-markdown--table-line-regexp)
-            (setq pending-table-start (point)))
+           ;; Pipe-row (or still-streaming partial of one) — remember
+           ;; the earliest streak entry and step back another line.
+           ;; The lenient regex also matches partial separators that
+           ;; haven't grown their closing `|' yet, so the watermark
+           ;; doesn't slip past the header while the separator is
+           ;; mid-stream.
+           ((looking-at agent-shell-markdown--table-pending-line-regexp)
+            (setq pending-table-start (point))
+            (if (bobp)
+                (setq continue nil)
+              (forward-line -1)))
            ;; Anything else — extension impossible from here.
            (t (setq continue nil))))
         (or rendered-table-start pending-table-start)))))

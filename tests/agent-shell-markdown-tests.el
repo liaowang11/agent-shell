@@ -990,6 +990,33 @@ A " nil)
     (should-not (string-match-p "^| A | B |"
                                 (substring-no-properties (buffer-string))))))
 
+(ert-deftest agent-shell-markdown-watermark-keeps-pending-table-with-partial-separator ()
+  ;; Real-world regression: an LLM streams a 5-column table cell-by-
+  ;; cell and the separator row arrives as a sequence of `|-------'
+  ;; chunks that aren't a complete pipe-row until the trailing `|'
+  ;; lands.  While the separator is mid-stream, the strict pipe-row
+  ;; regex doesn't match (it needs the closing `|'); the lenient
+  ;; pending-line regex must still recognise it so the watermark
+  ;; stays at the header line.  Otherwise the watermark slips past
+  ;; the header and `--find-tables' eventually renders only
+  ;; separator + data rows, leaving the header raw outside the table.
+  (with-temp-buffer
+    (dolist (chunk '("| Col 1 | Col 2 |\n"
+                     "|-------"
+                     "|-------"
+                     "|"
+                     "\n"
+                     "| Row 1 | A |\n"
+                     "| Row 2 | B |\n"))
+      (goto-char (point-max))
+      (insert chunk)
+      (agent-shell-markdown-replace-markup))
+    (let ((rendered (substring-no-properties (buffer-string))))
+      ;; Header is part of the rendered Unicode table — no raw `|' on
+      ;; its line.
+      (should (string-match-p "│ Col 1 *│ Col 2 *│" rendered))
+      (should-not (string-match-p "^| Col 1" rendered)))))
+
 (ert-deftest agent-shell-markdown-inline-code-completes-across-chunk-boundary ()
   ;; LLM streams may split an inline-code span across chunks (e.g.
   ;; `\\`co' lands first, then `de\\`').  The first render sees an
