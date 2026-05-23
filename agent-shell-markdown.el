@@ -143,16 +143,8 @@
   "Face for alternating (zebra) data rows in tables."
   :group 'agent-shell-markdown)
 
-(defface agent-shell-markdown-source-block
-  '((t :inherit lazy-highlight :extend t))
-  "Background face applied to rendered fenced source-block bodies.
-`:extend t' makes the background color reach the right edge of
-the window, so the block reads as a contiguous panel rather than
-a per-char highlight."
-  :group 'agent-shell-markdown)
-
 (defface agent-shell-markdown-source-block-language
-  '((t :inherit (italic font-lock-type-face agent-shell-markdown-source-block)))
+  '((t :inherit (italic font-lock-type-face)))
   "Face for the language label shown above a fenced source block."
   :group 'agent-shell-markdown)
 
@@ -777,58 +769,20 @@ with `emacs-lisp-mode' face properties on the body and a
         ;; valid; body markers adjust automatically.
         (delete-region close-start close-end)
         (delete-region open-start open-end)
-        ;; Seed the background face on every body char first, then
-        ;; layer the language's font-lock faces on top — the
-        ;; foreground colors take priority for each glyph while the
-        ;; `:extend t' background fills the gaps and reaches the
-        ;; right edge of the window.  Include the trailing `\n' (the
-        ;; one between body and close fence, preserved by our two
-        ;; `delete-region's above): `:extend t' only extends the
-        ;; background when the face is in effect at end-of-line, so
-        ;; without the `\n' carrying the face the last body line's
-        ;; bg would stop at the last content char instead of running
-        ;; to the window edge.
-        (put-text-property body-start (1+ (marker-position body-end))
-                           'face 'agent-shell-markdown-source-block)
+        ;; Apply the language's font-lock faces over the body.  No
+        ;; bg-panel face: the block reads inline with surrounding
+        ;; prose rather than as a tinted panel.
         (agent-shell-markdown--apply-faces-from highlighted
                                                 (marker-position body-start))
-        ;; `line-prefix' / `wrap-prefix' indent each rendered code-block
-        ;; line visually without inserting literal spaces.  Copying chars
-        ;; out of the block yanks the raw source with no leading
-        ;; indentation.  `wrap-prefix' handles long lines that wrap.
-        ;; The last 2 chars of the prefix carry the block's background
-        ;; face so the bg panel reaches 2 chars into the indent —
-        ;; visually the code block sits inside a slightly inset tinted
-        ;; panel rather than starting hard at column 4.
-        (let ((prefix (concat "  "
-                              (propertize
-                               "  " 'face
-                               'agent-shell-markdown-source-block))))
-          (add-text-properties body-start body-end
-                               `(agent-shell-markdown-frozen t
-                                 rear-nonsticky (agent-shell-markdown-frozen)
-                                 line-prefix ,prefix
-                                 wrap-prefix ,prefix)))
-        ;; Vertical padding via `display' property.  The first body
-        ;; char renders as "<top-padding><original-char>" and the
-        ;; trailing \n renders as "<original-\n><blank-line>",
-        ;; visually inserting bg-tinted lines above and below the
-        ;; block without modifying buffer text — copying the body
-        ;; still yanks the raw source.  vpad is a single bg-faced \n:
-        ;; the `line-prefix' applied to body chars also paints these
-        ;; padding visual lines (cols 0-1 plain, cols 2-3 bg), and
-        ;; `:extend t' on the face fills cols 4+ to the right window
-        ;; edge.  Adding a literal "  " in vpad would put a plain
-        ;; stripe on top of the prefix, which then flashes the region
-        ;; face when the underlying char is selected.
-        ;;
-        ;; Top padding is three lines with the label on the middle
-        ;; one — "LANG ⧉" if a language was given, otherwise the
-        ;; fallback "snippet ⧉".  The whole label is actionable: RET
-        ;; or mouse-1 anywhere on it kills the body to the kill ring.
-        (let* ((vpad (propertize "\n" 'face
-                                 'agent-shell-markdown-source-block))
-               (label-text (concat (if (string-empty-p lang) "snippet" lang)
+        (add-text-properties body-start body-end
+                             '(agent-shell-markdown-frozen t
+                               rear-nonsticky (agent-shell-markdown-frozen)))
+        ;; Render an actionable "LANG ⧉" / "snippet ⧉" header above
+        ;; the body via a `display' property on the first body char.
+        ;; The label sits directly above the body with no padding.
+        ;; RET or mouse-1 on the label kills the body to the kill
+        ;; ring.
+        (let* ((label-text (concat (if (string-empty-p lang) "snippet" lang)
                                    " ⧉"))
                (label
                 (propertize
@@ -844,19 +798,12 @@ with `emacs-lisp-mode' face properties on the body and a
                               (marker-position body-start)
                               (marker-position body-end)))
                             (message "Copied")))))
-               (top-pad (concat vpad label vpad vpad))
-               (first-pos (marker-position body-start))
-               (last-pos (marker-position body-end)))
+               (first-pos (marker-position body-start)))
           (put-text-property first-pos (1+ first-pos)
                              'display
-                             (concat top-pad
+                             (concat label "\n\n"
                                      (buffer-substring first-pos
-                                                       (1+ first-pos))))
-          (put-text-property last-pos (1+ last-pos)
-                             'display
-                             (concat (buffer-substring last-pos
-                                                       (1+ last-pos))
-                                     vpad)))))))
+                                                       (1+ first-pos)))))))))
 
 (defconst agent-shell-markdown--table-line-regexp
   (rx line-start

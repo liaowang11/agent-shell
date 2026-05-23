@@ -143,11 +143,9 @@ after **b2**"))
                  '(("before " nil)
                    ("b" (agent-shell-markdown-bold))
                    ("
-" nil)
-                   ("**not bold**
+**not bold**
 _not italic_
-" (agent-shell-markdown-source-block))
-                   ("after " nil)
+after " nil)
                    ("b2" (agent-shell-markdown-bold))))))
 
 (ert-deftest agent-shell-markdown-convert-open-fence-protects-rest ()
@@ -204,9 +202,9 @@ streaming **not bold**" nil)))))
                  '(("see ![alt](/no/such/file.png) end" nil)))))
 
 (ert-deftest agent-shell-markdown-convert-link-in-fenced-block-untouched ()
-  ;; The `[b](v)' inside fences stays literal (it isn't re-processed
-  ;; as a link), but rendered source-block bodies now carry the
-  ;; `agent-shell-markdown-source-block' background face.
+  ;; The `[b](v)' inside fences stays literal — it isn't re-processed
+  ;; as a link.  Body chars carry the `agent-shell-markdown-frozen'
+  ;; tag (which `--deconstruct' doesn't surface).
   (should (equal (agent-shell-markdown--deconstruct
                   (agent-shell-markdown-convert
                    "before [a](u)
@@ -217,33 +215,28 @@ after [c](w)"))
                  '(("before " nil)
                    ("a" (agent-shell-markdown-link))
                    ("
-" nil)
-                   ("[b](v)
-" (agent-shell-markdown-source-block))
-                   ("after " nil)
+[b](v)
+after " nil)
                    ("c" (agent-shell-markdown-link))))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-no-language ()
-  ;; Plain fenced block (no language): fences deleted, body remains.
-  ;; Body chars carry the `agent-shell-markdown-source-block' bg face
-  ;; (and the `agent-shell-markdown-frozen' tag, which `--deconstruct'
-  ;; doesn't surface).  The body region includes the trailing `\\n'
-  ;; so `:extend t' on the bg face reaches the right edge of the
-  ;; window on the last line too.
+  ;; Plain fenced block (no language): fences deleted, body remains
+  ;; with no face (only `agent-shell-markdown-frozen' tag, which
+  ;; `--deconstruct' doesn't surface).
   (should (equal (agent-shell-markdown--deconstruct
                   (agent-shell-markdown-convert
                    "```
 body
 ```"))
                  '(("body
-" (agent-shell-markdown-source-block))))))
+" nil)))))
 
-(ert-deftest agent-shell-markdown-convert-source-block-language-padding ()
-  ;; Every fence renders with 3 lines of top padding and a label on
-  ;; the middle line — "LANG ⧉" when the fence declared a language,
-  ;; the fallback "snippet ⧉" otherwise.  The whole label is
-  ;; actionable (RET / mouse-1 kills the body to the kill ring), not
-  ;; just the copy glyph.
+(ert-deftest agent-shell-markdown-convert-source-block-language-label ()
+  ;; Every fence renders with an actionable label directly above the
+  ;; body — "LANG ⧉" when a language is declared, the fallback
+  ;; "snippet ⧉" otherwise.  Label is followed by a single newline;
+  ;; no padding, no bg panel.  RET or mouse-1 anywhere on the label
+  ;; kills the body to the kill ring.
   (let* ((with-lang (agent-shell-markdown-convert "```python
 print(\"hi\")
 ```
@@ -255,12 +248,12 @@ body
          (with-lang-display (get-text-property 0 'display with-lang))
          (no-lang-display (get-text-property 0 'display no-lang)))
     (should (equal (substring-no-properties with-lang-display)
-                   "\npython ⧉\n\np"))
+                   "python ⧉\n\np"))
     (should (equal (substring-no-properties no-lang-display)
-                   "\nsnippet ⧉\n\nb"))
-    ;; Label face + actionable props cover the whole label (both the
-    ;; first char of the name and the ⧉ glyph).
-    (dolist (i '(1 8))
+                   "snippet ⧉\n\nb"))
+    ;; Label face + actionable props on both the first name char and
+    ;; the ⧉ glyph.
+    (dolist (i '(0 7))
       (should (eq (get-text-property i 'face with-lang-display)
                   'agent-shell-markdown-source-block-language))
       (should (eq (get-text-property i 'mouse-face with-lang-display)
@@ -280,27 +273,21 @@ body
 print(\"hi\")
 ```
 ````"))
-                 '(("```python\nprint(\"hi\")\n```\n"
-                    (agent-shell-markdown-source-block))))))
+                 '(("```python\nprint(\"hi\")\n```\n" nil)))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-with-language ()
-  ;; `emacs-lisp' source block: fences deleted, body chars get
-  ;; `emacs-lisp-mode' font-lock faces *plus* the
-  ;; `agent-shell-markdown-source-block' background face (layered
-  ;; with `add-face-text-property' APPEND so it ends up at the tail
-  ;; of the cascade, behind the language's font-lock).  In batch the
-  ;; keyword `if' is faced.  The trailing `\\n' isn't part of the
-  ;; body region and stays unfaced.
+  ;; `emacs-lisp' source block: fences deleted, body chars get the
+  ;; language's `font-lock' faces.  In batch the keyword `if' is
+  ;; faced; the rest of the body stays unfaced (no bg panel).
   (should (equal (agent-shell-markdown--deconstruct
                   (agent-shell-markdown-convert
                    "```emacs-lisp
 (if t nil)
 ```"))
-                 '(("(" (agent-shell-markdown-source-block))
-                   ("if" (font-lock-keyword-face
-                          agent-shell-markdown-source-block))
+                 '(("(" nil)
+                   ("if" (font-lock-keyword-face))
                    (" t nil)
-" (agent-shell-markdown-source-block))))))
+" nil)))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-body-tagged ()
   ;; Body chars carry `agent-shell-markdown-frozen t' so subsequent calls
@@ -339,8 +326,7 @@ print(\"hi\")
     (agent-shell-markdown-replace-markup)
     (should (equal (agent-shell-markdown--deconstruct (buffer-string))
                    '(("**not bold**
-" (agent-shell-markdown-source-block))
-                     ("
+
 " nil)
                      ("real bold" (agent-shell-markdown-bold)))))))
 
@@ -813,10 +799,8 @@ A " nil)
              ("code" (agent-shell-markdown-inline-code))
              (".
 
-" nil)
-             ("**not bold**
-" (agent-shell-markdown-source-block))
-             ("
+**not bold**
+
 ![alt](/missing).
 
 " nil)
@@ -934,8 +918,8 @@ A " nil)
 (ert-deftest agent-shell-markdown-blockquote-inside-fence-stays-raw ()
   ;; A `>'-prefixed line inside a fenced code block must not be
   ;; styled as a blockquote — the source-block range is in
-  ;; avoid-ranges.  The `>' should keep its source-block face and not
-  ;; get the blockquote face.
+  ;; avoid-ranges.  The `>' carries the source-block's
+  ;; `agent-shell-markdown-frozen' tag and no blockquote face.
   (let* ((s (agent-shell-markdown-convert "```
 > not a quote
 ```
@@ -943,8 +927,7 @@ A " nil)
          (quote-pos (string-match "> not a quote"
                                   (substring-no-properties s))))
     (should quote-pos)
-    (should (eq (get-text-property quote-pos 'face s)
-                'agent-shell-markdown-source-block))
+    (should (eq t (get-text-property quote-pos 'agent-shell-markdown-frozen s)))
     (should-not (eq (get-text-property quote-pos 'face s)
                     'agent-shell-markdown-blockquote))))
 
