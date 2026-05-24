@@ -1160,13 +1160,26 @@ code block content
                      (args . ["-y" "@modelcontextprotocol/server-filesystem" "/tmp"])
                      (env . []))])))
 
-  ;; Test server without optional fields
+  ;; Test stdio transport defaults missing ACP collection fields
   (let ((agent-shell-mcp-servers
          '(((name . "simple")
             (command . "simple-server")))))
     (should (equal (agent-shell--mcp-servers)
                    [((name . "simple")
-                     (command . "simple-server"))]))))
+                     (command . "simple-server")
+                     (args . [])
+                     (env . []))])))
+
+  ;; Test HTTP transport defaults missing ACP collection fields
+  (let ((agent-shell-mcp-servers
+         '(((name . "remote")
+            (type . "http")
+            (url . "https://example.com/mcp")))))
+    (should (equal (agent-shell--mcp-servers)
+                   [((name . "remote")
+                     (type . "http")
+                     (url . "https://example.com/mcp")
+                     (headers . []))]))))
 
 (ert-deftest agent-shell--completion-bounds-test ()
   "Test `agent-shell--completion-bounds' function."

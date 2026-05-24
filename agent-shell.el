@@ -4863,19 +4863,34 @@ normalized server configs."
     (apply #'vector
            (mapcar (lambda (server)
                      (setq server (agent-shell--eval-dynamic-values server))
-                     (let ((normalized (copy-alist server)))
-                       (when (map-contains-key normalized 'args)
+                     (let* ((normalized (copy-alist server))
+                            (transport-type (map-elt normalized 'type)))
+                       ;; ACP requires transport-specific collection fields,
+                       ;; but users often omit them in hand-written configs.
+                       ;; Default them to empty vectors before vectorizing any
+                       ;; provided list values so agents like Codex accept the
+                       ;; resulting payload.
+                       (when (and (assoc 'command normalized)
+                                  (not (member transport-type '("http" "sse"))))
+                         (unless (assoc 'args normalized)
+                           (setf (alist-get 'args normalized) []))
+                         (unless (assoc 'env normalized)
+                           (setf (alist-get 'env normalized) [])))
+                       (when (member transport-type '("http" "sse"))
+                         (unless (assoc 'headers normalized)
+                           (setf (alist-get 'headers normalized) [])))
+                       (when (assoc 'args normalized)
                          (let ((args (map-elt normalized 'args)))
                            (when (listp args)
-                             (map-put! normalized 'args (apply #'vector args)))))
-                       (when (map-contains-key normalized 'env)
+                             (setf (alist-get 'args normalized) (apply #'vector args)))))
+                       (when (assoc 'env normalized)
                          (let ((env (map-elt normalized 'env)))
                            (when (listp env)
-                             (map-put! normalized 'env (apply #'vector env)))))
-                       (when (map-contains-key normalized 'headers)
+                             (setf (alist-get 'env normalized) (apply #'vector env)))))
+                       (when (assoc 'headers normalized)
                          (let ((headers (map-elt normalized 'headers)))
                            (when (listp headers)
-                             (map-put! normalized 'headers (apply #'vector headers)))))
+                             (setf (alist-get 'headers normalized) (apply #'vector headers)))))
                        normalized))
                    agent-shell-mcp-servers))))
 
