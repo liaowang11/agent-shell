@@ -235,14 +235,15 @@ trailing-whitespace chars."
 
 (defun agent-shell-ui--body-invisible-p (body-start body-end)
   "Return non-nil if the existing body region [BODY-START, BODY-END) is hidden.
-Inspects the `invisible' property on the first non-whitespace char.
-Trailing whitespace alone is always hidden even on visible bodies,
-so checking the first body char would misclassify whitespace-leading
-bodies."
-  (save-excursion
-    (goto-char body-start)
-    (and (re-search-forward "[^ \t\n]" body-end t)
-         (eq (get-text-property (1- (point)) 'invisible) t))))
+Inspects the `invisible' property on the first body char.  The
+trailing-whitespace handler only sets `invisible' on chars from
+the last non-whitespace position onwards, never the first char,
+so the first char's `invisible' tracks the body's true collapse
+state — including whitespace-only bodies (e.g. a body left as
+two newlines after the markdown renderer stripped an empty
+fenced block)."
+  (and (< body-start body-end)
+       (eq (get-text-property body-start 'invisible) t)))
 
 (defun agent-shell-ui--apply-trailing-whitespace-invisible (body-start body-end)
   "Hide trailing whitespace within [BODY-START, BODY-END) via invisible property.
