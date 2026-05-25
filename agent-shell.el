@@ -3619,9 +3619,16 @@ When provided, included in help-echo tooltips."
                                                                           (dx . "8"))
                                                                         (map-elt binding :description)))))
                                         text-node)))
-                   (let ((result (format " %s" (with-temp-buffer
-                                                 (svg-insert-image svg)
-                                                 (buffer-string)))))
+                   (let ((result (propertize
+                                  (format " %s" (with-temp-buffer
+                                                  (svg-insert-image svg)
+                                                  (buffer-string)))
+                                  'help-echo "Click to open settings menu"
+                                  'mouse-face 'mode-line-highlight
+                                  'local-map (let ((map (make-sparse-keymap)))
+                                               (define-key map [header-line mouse-1]
+                                                           (agent-shell--mode-line-combined-menu))
+                                               map))))
                      (map-put! agent-shell--header-cache cache-key result)
                      result))))
          text-header))
@@ -6743,6 +6750,25 @@ popup."
                                     :thought-level-id ,(map-elt value :value))))
                                :button (:toggle . ,(equal (map-elt value :value) current-id)))))
      (reverse (agent-shell--get-available-thought-levels (agent-shell--state))))
+    menu))
+
+(defun agent-shell--mode-line-combined-menu ()
+  "Build a combined menu keymap exposing all session settings.
+
+The graphical SVG header renders as a single image, so clicks cannot
+target individual segments.  Clicking anywhere on it pops up this menu,
+which groups the per-segment menus (LLM model, thought level, session
+mode) into submenus."
+  (let ((menu (make-sparse-keymap "Agent shell")))
+    (when (agent-shell-get-mode-name (agent-shell--state))
+      (define-key menu [mode]
+                  `(menu-item "Session mode" ,(agent-shell--mode-line-mode-menu))))
+    (when (agent-shell-get-thought-level-name (agent-shell--state))
+      (define-key menu [thought-level]
+                  `(menu-item "Thought level" ,(agent-shell--mode-line-thought-level-menu))))
+    (when (agent-shell-get-model-name (agent-shell--state))
+      (define-key menu [model]
+                  `(menu-item "LLM model" ,(agent-shell--mode-line-model-menu))))
     menu))
 
 (defun agent-shell--mode-line-format ()
