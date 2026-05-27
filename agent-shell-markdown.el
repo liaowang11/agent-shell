@@ -777,33 +777,49 @@ with `emacs-lisp-mode' face properties on the body and a
         (add-text-properties body-start body-end
                              '(agent-shell-markdown-frozen t
                                rear-nonsticky (agent-shell-markdown-frozen)))
-        ;; Render an actionable "LANG ⧉" / "snippet ⧉" header above
-        ;; the body via a `display' property on the first body char.
-        ;; The label sits directly above the body with no padding.
-        ;; RET or mouse-1 on the label kills the body to the kill
-        ;; ring.
+        ;; Insert an actionable "LANG ⧉" / "snippet ⧉" header as real
+        ;; buffer text directly above the body — no `display'
+        ;; properties (avoids embedded-`\\n' rendering quirks that
+        ;; can hide the body's first char) and no overlays.  RET or
+        ;; mouse-1 on the label kills the body to the kill ring.
+        ;; `content-start' uses insertion-type t so it stays AFTER
+        ;; the inserted label, giving the kill-action a stable
+        ;; pointer to the body content even though `body-start'
+        ;; itself collapses to the label's first char.  After
+        ;; insertion we carry the body's caller-set properties
+        ;; (`invisible', agent-shell-ui block/section markers,
+        ;; `read-only', etc.) onto the inserted chars — propertize'd
+        ;; inserts ignore stickiness, and without this the inserted
+        ;; label punches a hole in the caller's contiguous block
+        ;; range and breaks toggle/replace operations.
         (let* ((label-text (concat (if (string-empty-p lang) "snippet" lang)
                                    " ⧉"))
-               (label
-                (propertize
-                 label-text
-                 'face 'agent-shell-markdown-source-block-language
-                 'mouse-face 'highlight
-                 'pointer 'hand
-                 'keymap (agent-shell-markdown--make-ret-binding-map
-                          (lambda ()
-                            (interactive)
-                            (kill-new
-                             (buffer-substring-no-properties
-                              (marker-position body-start)
-                              (marker-position body-end)))
-                            (message "Copied")))))
-               (first-pos (marker-position body-start)))
-          (put-text-property first-pos (1+ first-pos)
-                             'display
-                             (concat label "\n\n"
-                                     (buffer-substring first-pos
-                                                       (1+ first-pos)))))))))
+               (content-start (copy-marker (marker-position body-start) t))
+               (kill-action (lambda ()
+                              (interactive)
+                              (kill-new (buffer-substring-no-properties
+                                         (marker-position content-start)
+                                         (marker-position body-end)))
+                              (message "Copied")))
+               (label (propertize
+                       label-text
+                       'face 'agent-shell-markdown-source-block-language
+                       'mouse-face 'highlight
+                       'pointer 'hand
+                       'keymap (agent-shell-markdown--make-ret-binding-map
+                                kill-action)
+                       'agent-shell-markdown-frozen t
+                       'rear-nonsticky '(agent-shell-markdown-frozen)))
+               (carried (agent-shell-markdown--carry-properties body-start)))
+          (goto-char body-start)
+          (insert label "\n\n")
+          (when carried
+            (add-text-properties (marker-position body-start) (point)
+                                 carried))
+          ;; Move point past the body so the outer `re-search-forward'
+          ;; loop doesn't backtrack into body content (e.g. shorter
+          ;; inner fences inside a wider outer fence).
+          (goto-char (marker-position body-end)))))))
 
 (defconst agent-shell-markdown--table-line-regexp
   (rx line-start

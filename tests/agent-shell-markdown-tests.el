@@ -143,6 +143,10 @@ after **b2**"))
                  '(("before " nil)
                    ("b" (agent-shell-markdown-bold))
                    ("
+" nil)
+                   ("snippet ⧉" (agent-shell-markdown-source-block-language))
+                   ("
+
 **not bold**
 _not italic_
 after " nil)
@@ -215,27 +219,36 @@ after [c](w)"))
                  '(("before " nil)
                    ("a" (agent-shell-markdown-link))
                    ("
+" nil)
+                   ("snippet ⧉" (agent-shell-markdown-source-block-language))
+                   ("
+
 [b](v)
 after " nil)
                    ("c" (agent-shell-markdown-link))))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-no-language ()
-  ;; Plain fenced block (no language): fences deleted, body remains
-  ;; with no face (only `agent-shell-markdown-frozen' tag, which
-  ;; `--deconstruct' doesn't surface).
+  ;; Plain fenced block (no language): fences deleted, a "snippet ⧉"
+  ;; header is inserted directly above the body as real buffer text
+  ;; (no display property), and the body chars carry the
+  ;; `agent-shell-markdown-frozen' tag (not surfaced by
+  ;; `--deconstruct').
   (should (equal (agent-shell-markdown--deconstruct
                   (agent-shell-markdown-convert
                    "```
 body
 ```"))
-                 '(("body
+                 '(("snippet ⧉" (agent-shell-markdown-source-block-language))
+                   ("
+
+body
 " nil)))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-language-label ()
-  ;; Every fence renders with an actionable label directly above the
-  ;; body — "LANG ⧉" when a language is declared, the fallback
-  ;; "snippet ⧉" otherwise.  Label is followed by a single newline;
-  ;; no padding, no bg panel.  RET or mouse-1 anywhere on the label
+  ;; Every fence renders with an actionable label inserted as real
+  ;; buffer text directly above the body — "LANG ⧉" when a language
+  ;; is declared, "snippet ⧉" otherwise.  No display property, no
+  ;; overlays, no bg panel.  RET or mouse-1 anywhere on the label
   ;; kills the body to the kill ring.
   (let* ((with-lang (agent-shell-markdown-convert "```python
 print(\"hi\")
@@ -244,21 +257,19 @@ print(\"hi\")
          (no-lang (agent-shell-markdown-convert "```
 body
 ```
-"))
-         (with-lang-display (get-text-property 0 'display with-lang))
-         (no-lang-display (get-text-property 0 'display no-lang)))
-    (should (equal (substring-no-properties with-lang-display)
-                   "python ⧉\n\np"))
-    (should (equal (substring-no-properties no-lang-display)
-                   "snippet ⧉\n\nb"))
+")))
+    (should (string-prefix-p "python ⧉\n\nprint("
+                             (substring-no-properties with-lang)))
+    (should (string-prefix-p "snippet ⧉\n\nbody"
+                             (substring-no-properties no-lang)))
     ;; Label face + actionable props on both the first name char and
     ;; the ⧉ glyph.
     (dolist (i '(0 7))
-      (should (eq (get-text-property i 'face with-lang-display)
+      (should (eq (get-text-property i 'face with-lang)
                   'agent-shell-markdown-source-block-language))
-      (should (eq (get-text-property i 'mouse-face with-lang-display)
+      (should (eq (get-text-property i 'mouse-face with-lang)
                   'highlight))
-      (should (keymapp (get-text-property i 'keymap with-lang-display))))))
+      (should (keymapp (get-text-property i 'keymap with-lang))))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-nested-fences ()
   ;; A 4-backtick outer fence wraps inner 3-backtick fences as
@@ -273,10 +284,17 @@ body
 print(\"hi\")
 ```
 ````"))
-                 '(("```python\nprint(\"hi\")\n```\n" nil)))))
+                 '(("markdown ⧉" (agent-shell-markdown-source-block-language))
+                   ("
+
+```python
+print(\"hi\")
+```
+" nil)))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-with-language ()
-  ;; `emacs-lisp' source block: fences deleted, body chars get the
+  ;; `emacs-lisp' source block: fences deleted, an "emacs-lisp ⧉"
+  ;; header is inserted as buffer text, then the body chars get the
   ;; language's `font-lock' faces.  In batch the keyword `if' is
   ;; faced; the rest of the body stays unfaced (no bg panel).
   (should (equal (agent-shell-markdown--deconstruct
@@ -284,7 +302,10 @@ print(\"hi\")
                    "```emacs-lisp
 (if t nil)
 ```"))
-                 '(("(" nil)
+                 '(("emacs-lisp ⧉" (agent-shell-markdown-source-block-language))
+                   ("
+
+(" nil)
                    ("if" (font-lock-keyword-face))
                    (" t nil)
 " nil)))))
@@ -310,6 +331,28 @@ print(\"hi\")
     (should (eq t (get-text-property 13 'agent-shell-markdown-frozen s)))
     (should (null (get-text-property 0 'agent-shell-markdown-frozen s)))))
 
+(ert-deftest agent-shell-markdown-source-block-streamed-in-chunks ()
+  ;; Real-world LLM streaming: a fenced code block arrives in small
+  ;; chunks that split the opening fence, the language line, body
+  ;; chars, and the closing fence.  After every chunk the renderer
+  ;; is called.  Once the closing fence lands, the final buffer
+  ;; should show the inserted "python ⧉" label above the body, with
+  ;; no raw fence markers remaining.
+  (with-temp-buffer
+    (dolist (chunk '("``" "`p" "yt" "hon\n"
+                     "pri" "nt(" "\"hi\")\n"
+                     "ra" "ise " "Sys" "temExit\n"
+                     "``" "`\n"))
+      (goto-char (point-max))
+      (insert chunk)
+      (agent-shell-markdown-replace-markup))
+    (should (equal (substring-no-properties (buffer-string))
+                   "python ⧉
+
+print(\"hi\")
+raise SystemExit
+"))))
+
 (ert-deftest agent-shell-markdown-source-block-body-protected-across-calls ()
   ;; Streaming: render a block, then append more markdown and re-render.
   ;; The previously-rendered body (`agent-shell-markdown-frozen t') must stay
@@ -325,7 +368,10 @@ print(\"hi\")
 **real bold**")
     (agent-shell-markdown-replace-markup)
     (should (equal (agent-shell-markdown--deconstruct (buffer-string))
-                   '(("**not bold**
+                   '(("snippet ⧉" (agent-shell-markdown-source-block-language))
+                     ("
+
+**not bold**
 
 " nil)
                      ("real bold" (agent-shell-markdown-bold)))))))
@@ -798,6 +844,10 @@ A " nil)
              (" and " nil)
              ("code" (agent-shell-markdown-inline-code))
              (".
+
+" nil)
+             ("snippet ⧉" (agent-shell-markdown-source-block-language))
+             ("
 
 **not bold**
 
