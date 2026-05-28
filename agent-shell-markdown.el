@@ -808,6 +808,9 @@ with `emacs-lisp-mode' face properties on the body and a
                        'pointer 'hand
                        'keymap (agent-shell-markdown--make-ret-binding-map
                                 kill-action)
+                       'cursor-sensor-functions (list (lambda (_window _old-pos sensor-action)
+                                                        (when (eq sensor-action 'entered)
+                                                          (message "Press RET to copy"))))
                        'agent-shell-markdown-frozen t
                        'rear-nonsticky '(agent-shell-markdown-frozen)))
                (carried (agent-shell-markdown--carry-properties body-start)))
