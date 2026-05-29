@@ -276,21 +276,23 @@ body
   ;; literal body — the inner ```python ... ``` is *not* re-rendered
   ;; as a code block.  Mirrors CommonMark's variable-width fence
   ;; rule: a closer must match the opener's backtick count, and a
-  ;; shorter run inside is part of the body.
-  (should (equal (agent-shell-markdown--deconstruct
-                  (agent-shell-markdown-convert
-                   "````markdown
+  ;; shorter run inside is part of the body.  Face buckets vary by
+  ;; env (markdown-mode's font-lock highlights ``` markup when the
+  ;; mode is loadable; in bare batch it's not), so the contract is
+  ;; asserted on the rendered text, not on the face cascade.
+  (let ((rendered (substring-no-properties
+                   (agent-shell-markdown-convert
+                    "````markdown
 ```python
 print(\"hi\")
 ```
-````"))
-                 '(("markdown ⧉" (agent-shell-markdown-source-block-language))
-                   ("
+````"))))
+    (should (equal rendered "markdown ⧉
 
 ```python
 print(\"hi\")
 ```
-" nil)))))
+"))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-with-language ()
   ;; `emacs-lisp' source block: fences deleted, an "emacs-lisp ⧉"

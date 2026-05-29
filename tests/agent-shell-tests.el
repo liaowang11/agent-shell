@@ -697,6 +697,11 @@
                           (options . [((value . "code")
                                        (name . "Code"))]))]))
     (cl-letf (((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore)
+              ;; `--emit-event' calls `(agent-shell--state)' which errors
+              ;; outside of an `agent-shell-mode' buffer; the test exercises
+              ;; the data layer, not subscription dispatch.
+              ((symbol-function 'agent-shell--emit-event)
                #'ignore))
       (agent-shell--on-notification
        :state state
