@@ -8,7 +8,7 @@
 (ert-deftest agent-shell-ui-body-invisible-p-handles-whitespace-only-body ()
   ;; Regression for PR #597 (pi-acp): the markdown renderer strips
   ;; an empty `\\`\\`\\`console' fence down to a body of only
-  ;; newlines.  On the next `surgical-replace-body',
+  ;; newlines.  On the next `agent-shell-ui--replace-body',
   ;; `--body-invisible-p' must still report the body as hidden when
   ;; its chars carry `invisible t' — otherwise new chars come in
   ;; visible and the fragment "expands" on every subsequent update

@@ -67,9 +67,9 @@ When NO-UNDO is non-nil, disable undo recording for this operation.
 
 For existing blocks, the current expansion state is preserved unless overridden.
 
-Updates to existing blocks are applied surgically per section: a body
-append inserts the new chunk at the end of the body region without
-disturbing already-rendered content, so `agent-shell-markdown' frozen ranges
+Updates to existing blocks are applied per section: a body append
+inserts the new chunk at the end of the body region without disturbing
+already-rendered content, so `agent-shell-markdown' frozen ranges
 stay intact and streaming append is O(new-chunk) rather than
 O(accumulated-body).  Label-only updates leave the body untouched."
   (let* ((window (get-buffer-window (current-buffer)))
@@ -95,7 +95,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                            t))))
             (when (or new-label-left new-label-right new-body)
               (cond
-               ;; Existing block — apply surgical edits per changed section.
+               ;; Existing block — apply edits per changed section.
                ((and match (not create-new))
                 (let* ((state (get-text-property (prop-match-beginning match)
                                                  'agent-shell-ui-state))
@@ -111,20 +111,20 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                     (skip-chars-backward "\n")
                     (setq padding-start (point)))
                   (when new-label-left
-                    (agent-shell-ui--surgical-replace-label
+                    (agent-shell-ui--replace-label
                      qualified-id 'label-left new-label-left))
                   (when new-label-right
-                    (agent-shell-ui--surgical-replace-label
+                    (agent-shell-ui--replace-label
                      qualified-id 'label-right new-label-right))
                   (when new-body
                     (cond
                      ;; Append to existing body — preserves rendered content.
                      ((and append existing-body-range)
-                      (agent-shell-ui--surgical-append-body
+                      (agent-shell-ui--append-body
                        existing-body-range new-body qualified-id collapsed))
                      ;; Replace existing body in place.
                      (existing-body-range
-                      (agent-shell-ui--surgical-replace-body
+                      (agent-shell-ui--replace-body
                        existing-body-range new-body qualified-id collapsed))
                      ;; Body arriving for the first time on a labels-only
                      ;; block — fall back to delete-and-regenerate so the
@@ -132,8 +132,9 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                      ;; and the labels↔body separator is inserted.  Labels
                      ;; are recovered from the buffer (no cache).  The block
                      ;; extent is re-derived from the buffer here because
-                     ;; `surgical-replace-label' may have changed label
-                     ;; length, leaving the original `prop-match-end' stale.
+                     ;; `agent-shell-ui--replace-label' may have changed
+                     ;; label length, leaving the original `prop-match-end'
+                     ;; stale.
                      (t
                       (let* ((current-block-range
                               (agent-shell-ui--block-range :position block-start))
@@ -258,14 +259,20 @@ trailing-whitespace tail."
         (add-text-properties (point) body-end
                              '(invisible t rear-nonsticky (invisible)))))))
 
-(defun agent-shell-ui--surgical-append-body (body-range chunk qualified-id _collapsed)
-  "Insert CHUNK at the end of BODY-RANGE.
-Existing body chars stay in place — `agent-shell-markdown' frozen tags
-and per-char faces are preserved across streaming chunks.
-Visibility for new chars is derived from the current visibility of
-the existing body, not from caller-supplied state, because
-label-less fragments don't follow `state :collapsed' (their bodies
-stay visible regardless of how `:collapsed' was stored)."
+(defun agent-shell-ui--append-body (body-range chunk qualified-id _collapsed)
+  "Append CHUNK to the body region described by BODY-RANGE.
+
+BODY-RANGE is an alist with `:start' and `:end' marking the existing
+body section.  Existing body chars stay in place — `agent-shell-markdown'
+frozen tags and per-char faces survive across streaming chunks, no
+re-rendering needed.  QUALIFIED-ID is the fragment identifier used to
+tag the new chars so the body's section property and help-echo line up
+with the rest of the block.
+
+_COLLAPSED is intentionally unused: visibility for new chars is derived
+from the current visibility of the existing body, not from caller-supplied
+state, because label-less fragments don't follow `state :collapsed'
+(their bodies stay visible regardless of how `:collapsed' was stored)."
   (when (and (stringp chunk) (not (string-empty-p chunk)))
     (let* ((body-start (map-elt body-range :start))
            (body-end (map-elt body-range :end))
@@ -287,8 +294,16 @@ stay visible regardless of how `:collapsed' was stored)."
           (agent-shell-ui--apply-trailing-whitespace-invisible
            body-start insert-end))))))
 
-(defun agent-shell-ui--surgical-replace-body (body-range new-body qualified-id _collapsed)
-  "Replace body chars in BODY-RANGE with NEW-BODY."
+(defun agent-shell-ui--replace-body (body-range new-body qualified-id _collapsed)
+  "Replace the body region described by BODY-RANGE with NEW-BODY.
+
+BODY-RANGE is an alist with `:start' and `:end'.  Only the body chars
+are touched — the surrounding label, indicator, and padding stay put,
+so block-id and section tagging on the rest of the block are preserved.
+QUALIFIED-ID is the fragment identifier used to tag the inserted chars.
+
+_COLLAPSED is intentionally unused: visibility on the inserted chars
+matches the body's current visibility, not caller-supplied state."
   (let* ((body-start (map-elt body-range :start))
          (body-end (map-elt body-range :end))
          (state (get-text-property (max body-start (1- body-end))
@@ -311,10 +326,13 @@ stay visible regardless of how `:collapsed' was stored)."
             (agent-shell-ui--apply-trailing-whitespace-invisible
              insert-start insert-end)))))))
 
-(defun agent-shell-ui--surgical-replace-label (qualified-id section new-text)
-  "Replace SECTION region of fragment QUALIFIED-ID with NEW-TEXT.
-SECTION is one of `label-left' or `label-right'.  Other sections in
-the block stay untouched."
+(defun agent-shell-ui--replace-label (qualified-id section new-text)
+  "Replace the SECTION region of fragment QUALIFIED-ID with NEW-TEXT.
+
+SECTION is one of `label-left' or `label-right'.  Only the named label
+region is rewritten — the other label, the indicator, and the body of
+the same block stay untouched, so block tagging and fragment identity
+are preserved across label updates."
   (when (stringp new-text)
     (when-let* ((block-match
                  (save-excursion
