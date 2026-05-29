@@ -706,16 +706,21 @@ When NO-UNDO is non-nil, disable undo recording."
 (defun agent-shell-ui--indent-text (text &optional indent-string)
   "Indent TEXT visually without affecting copied text.
 INDENT-STRING defaults to two spaces.
-Uses `line-prefix' display property so indentation is visual only."
+Uses `line-prefix' display property so indentation is visual only.
+
+TEXT's caller-set text properties (eg. `agent-shell-markdown-frozen'
+on a pre-rendered diff) are preserved on every char — the previous
+split-and-rejoin reconstructed the inter-line `\\n's as bare strings,
+which broke contiguous property ranges and made the markdown
+renderer's avoid-range checks miss header / blockquote matches
+that span a line break."
   (when text
-    (let* ((indent (or indent-string "  "))
-           (lines (split-string text "\n")))
-      (concat
-       (propertize (car lines) 'line-prefix indent 'wrap-prefix indent)
-       (mapconcat (lambda (line)
-                    (propertize (concat "\n" line) 'line-prefix indent 'wrap-prefix indent))
-                  (cdr lines)
-                  "")))))
+    (let ((indent (or indent-string "  "))
+          (copy (copy-sequence text)))
+      (add-text-properties 0 (length copy)
+                           `(line-prefix ,indent wrap-prefix ,indent)
+                           copy)
+      copy)))
 
 (defun agent-shell-ui-forward-block ()
   "Jump to the next block."

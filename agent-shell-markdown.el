@@ -428,11 +428,21 @@ with face `agent-shell-markdown-header-2' on \"My title\"."
                      markup-start markup-end avoid-ranges)))
         (if avoid
             (goto-char (cdr avoid))
-          (let ((level (- (match-end 1) (match-beginning 1)))
-                (text (buffer-substring (match-beginning 2) (match-end 2))))
+          (let* ((level (- (match-end 1) (match-beginning 1)))
+                 (text (buffer-substring (match-beginning 2) (match-end 2)))
+                 ;; The trailing `\\n' we re-insert below would otherwise
+                 ;; punch a hole in the caller's contiguous block range
+                 ;; (eg. `invisible'/`agent-shell-ui-section') and break
+                 ;; toggle/replace operations — same hazard called out in
+                 ;; `--style-source-blocks'.  Carry over the original
+                 ;; newline's caller props.
+                 (carried (agent-shell-markdown--carry-properties
+                           (1- markup-end))))
             (delete-region markup-start markup-end)
             (goto-char markup-start)
             (insert text "\n")
+            (when carried
+              (add-text-properties markup-start (point) carried))
             (add-face-text-property markup-start
                                     (+ markup-start (length text))
                                     (intern (format "agent-shell-markdown-header-%d"

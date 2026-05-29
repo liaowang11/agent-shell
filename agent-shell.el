@@ -2382,6 +2382,13 @@ DIFF should be in the form returned by `agent-shell--make-diff-info':
                   (add-text-properties line-start line-end
                                        '(font-lock-face diff-hunk-header))))
                 (forward-line 1)))
+            ;; Tag the whole diff as already-rendered output so the
+            ;; markdown renderer's avoid-ranges include it — context
+            ;; lines like ` # Foo' or ` > Bar' must display verbatim,
+            ;; not as a header / blockquote.  See PR #597.
+            (add-text-properties (point-min) (point-max)
+                                 '(agent-shell-markdown-frozen t
+                                   rear-nonsticky (agent-shell-markdown-frozen)))
             (buffer-string)))
       (delete-file old-file)
       (delete-file new-file))))
