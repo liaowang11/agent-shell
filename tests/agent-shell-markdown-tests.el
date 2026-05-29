@@ -999,6 +999,36 @@ A " nil)
       (should (eq (get-text-property (+ (point-min) i) 'face)
                   'agent-shell-markdown-header-1)))))
 
+(ert-deftest agent-shell-markdown-frozen-region-skips-header-pass ()
+  ;; Callers (eg. `agent-shell--format-diff-as-text') tag pre-rendered
+  ;; content with `agent-shell-markdown-frozen t' so it displays verbatim.
+  ;; The header pass must respect that tag — a diff context line like
+  ;; ` # Foo' must not be rewritten as an H1.  See PR #597.
+  (with-temp-buffer
+    (insert (propertize "@@ -1,2 +1,2 @@\n # Test Document Title\n-old\n+new\n"
+                        'agent-shell-markdown-frozen t))
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "@@ -1,2 +1,2 @@\n # Test Document Title\n-old\n+new\n"))))
+
+(ert-deftest agent-shell-markdown-header-preserves-caller-text-properties ()
+  ;; The header pass deletes the matched `#…\n' and re-inserts the
+  ;; faced title plus a fresh `\n'.  The inserted newline must carry
+  ;; the caller's text properties — otherwise it punches a hole in any
+  ;; contiguous block tagging (eg. `invisible' / `agent-shell-ui-section')
+  ;; that brackets the body, breaking toggle/replace operations on the
+  ;; surrounding fragment.  See PR #597.
+  (with-temp-buffer
+    (insert (propertize "# Title\nbody line\n"
+                        'agent-shell-ui-section 'body
+                        'invisible t))
+    (agent-shell-markdown-replace-markup)
+    (dotimes (i (1- (point-max)))
+      (let ((pos (1+ i)))
+        (should (eq 'body
+                    (get-text-property pos 'agent-shell-ui-section)))
+        (should (eq t (get-text-property pos 'invisible)))))))
+
 (ert-deftest agent-shell-markdown-watermark-keeps-pending-table-in-scope ()
   ;; When table rows stream in one at a time, the table needs at least
   ;; two consecutive pipe-rows in scope before `--find-tables' will
