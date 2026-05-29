@@ -5355,13 +5355,30 @@ Returns a buffer object or nil."
     (with-current-buffer shell-buffer
       (goto-char comint-last-input-start))))
 
+(defun agent-shell--command-and-response-at-point ()
+  "Like `shell-maker--command-and-response-at-point' but preserves
+visual padding emitted by the markdown renderer inside fragments
+(e.g. source-block top/bottom vpad).  Delegates the raw extraction
+to shell-maker and runs the result through `agent-shell-trim'."
+  (when-let ((cell (shell-maker--command-and-response-at-point :trimmed nil)))
+    (cons (agent-shell-trim (car cell))
+          (agent-shell-trim (cdr cell)))))
+
+(defun agent-shell--next-command-and-response (&optional backwards)
+  "Like `shell-maker-next-command-and-response' but preserves
+visual padding inside fragments — see
+`agent-shell--command-and-response-at-point'."
+  (when-let ((cell (shell-maker-next-command-and-response backwards :trimmed nil)))
+    (cons (agent-shell-trim (car cell))
+          (agent-shell-trim (cdr cell)))))
+
 (defun agent-shell-interaction-at-point ()
   "Return the interaction at point in the shell buffer.
 Result is of the form ((:prompt . PROMPT) (:response . RESPONSE))."
   (when-let ((shell-buffer (agent-shell--shell-buffer))
              (result (with-current-buffer shell-buffer
-                       (or (shell-maker--command-and-response-at-point)
-                           (shell-maker-next-command-and-response t)))))
+                       (or (agent-shell--command-and-response-at-point)
+                           (agent-shell--next-command-and-response t)))))
     `((:prompt . ,(car result))
       (:response . ,(cdr result)))))
 
@@ -7465,6 +7482,41 @@ or select a specific request to remove."
                             (length (map-elt agent-shell--state :pending-requests))))
       (map-put! agent-shell--state :pending-requests nil)
       (message "Removed all pending requests"))))
+
+(defun agent-shell-trim (text)
+  "Strip surrounding whitespace from TEXT, preserving renderer padding.
+
+Like `string-trim', but whitespace chars carrying the
+`agent-shell-non-trimmable' text property are treated as
+intentional padding (e.g. the top/bottom vpad `\\n's the
+source-block renderer inserts inside a fragment body) and left
+alone.  A blind `string-trim' would consume those chars on the
+first / last block of a response and visibly clip the panel.
+
+For example:
+
+  (agent-shell-trim \"\\n\\n  hello  \\n\\n\")
+  => \"hello\"
+
+  (agent-shell-trim
+   (concat \"\\n\\nhello\\n\"
+           (propertize \"\\n\" \\='agent-shell-non-trimmable t)
+           \"\\n\\n\"))
+  => \"hello\\n\\n\"  ;; tagged trailing `\\n' preserved"
+  (and-let* ((text text)
+             (start 0)
+             (end (length text)))
+    (while (and (< start end)
+                (memq (seq-elt text start) '(?\s ?\t ?\n ?\r))
+                (not (get-text-property
+                      start 'agent-shell-non-trimmable text)))
+      (setq start (1+ start)))
+    (while (and (< start end)
+                (memq (seq-elt text (1- end)) '(?\s ?\t ?\n ?\r))
+                (not (get-text-property
+                      (1- end) 'agent-shell-non-trimmable text)))
+      (setq end (1- end)))
+    (substring text start end)))
 
 (provide 'agent-shell)
 

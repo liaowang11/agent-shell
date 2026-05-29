@@ -42,6 +42,7 @@
 
 (declare-function agent-shell--current-shell "agent-shell")
 (declare-function agent-shell--display-buffer "agent-shell")
+(declare-function agent-shell--next-command-and-response "agent-shell")
 (declare-function agent-shell--get-region "agent-shell")
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
 (declare-function agent-shell--make-header "agent-shell")
@@ -843,7 +844,7 @@ buffer from the snapshot and switch to edit mode."
                                      (comint-next-prompt 1)
                                      (= orig-line (point))))
                              (error "No next page")))
-                         (shell-maker-next-command-and-response backwards))))
+                         (agent-shell--next-command-and-response backwards))))
         (agent-shell-viewport--initialize
          :prompt (car next) :response (cdr next))
         (goto-char (if start-at-top
