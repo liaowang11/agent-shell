@@ -1161,7 +1161,7 @@ are correctly measured by `string-width' and skip the pixel path."
         (len (length str))
         (found nil))
     (while (and (not found) (< i len))
-      (let ((c (aref str i)))
+      (let ((c (seq-elt str i)))
         (when (or (= c #x200D)
                   (and (>= c #x1F1E6) (<= c #x1F1FF)))
           (setq found t)))
@@ -1241,9 +1241,9 @@ Preserves text properties across wrapped lines."
         (let ((end-pos pos)
               (line-width 0))
           (while (and (< end-pos len)
-                      (<= (+ line-width (char-width (aref text end-pos)))
+                      (<= (+ line-width (char-width (seq-elt text end-pos)))
                           width))
-            (setq line-width (+ line-width (char-width (aref text end-pos))))
+            (setq line-width (+ line-width (char-width (seq-elt text end-pos))))
             (setq end-pos (1+ end-pos)))
           ;; Make sure at least one char advances even when the very
           ;; first char already exceeds WIDTH (e.g. wide glyph).
@@ -1254,14 +1254,14 @@ Preserves text properties across wrapped lines."
             (when (< end-pos len)
               (let ((scan (1- end-pos)))
                 (while (and (> scan pos)
-                            (not (memq (aref text scan) '(?\s ?\t))))
+                            (not (memq (seq-elt text scan) '(?\s ?\t))))
                   (setq scan (1- scan)))
                 (when (> scan pos)
                   (setq break-pos (1+ scan)))))
             (push (string-trim-right (substring text pos break-pos)) lines)
             (setq pos break-pos)
             (while (and (< pos len)
-                        (memq (aref text pos) '(?\s ?\t)))
+                        (memq (seq-elt text pos) '(?\s ?\t)))
               (setq pos (1+ pos))))))
       (nreverse lines)))))
 
@@ -1375,7 +1375,7 @@ logical rows (skipping the visual continuation lines)."
 
 (cl-defun agent-shell-markdown--preprocess-table (&key rows window)
   "Parse cells in ROWS and compute natural column widths.
-Returns a plist with :natural-widths and :processed-rows.
+Returns an alist with `:natural-widths' and `:processed-rows'.
 
 `:min-widths' (wrap-allocation widths from longest words) is no
 longer computed here — it's only needed when the table has to be
@@ -1405,8 +1405,8 @@ containing emoji/CJK line up with the column's right border."
                 (setq widths (append widths (list dw))))
               (setq col (1+ col))))
           (push (cons row (nreverse processed-cells)) processed-rows))))
-    (list :natural-widths widths
-          :processed-rows (nreverse processed-rows))))
+    (list (cons :natural-widths widths)
+          (cons :processed-rows (nreverse processed-rows)))))
 
 (cl-defun agent-shell-markdown--table-min-widths (&key processed-rows window)
   "Return the minimum (longest-word) widths per column.
@@ -1515,8 +1515,8 @@ prone to a few-pixel drift on emoji-heavy tables."
            (separator-row-num (agent-shell-markdown--find-separator-row-num rows))
            (preprocessed (agent-shell-markdown--preprocess-table
                           :rows rows :window window))
-           (natural-widths (plist-get preprocessed :natural-widths))
-           (processed-rows (plist-get preprocessed :processed-rows))
+           (natural-widths (map-elt preprocessed :natural-widths))
+           (processed-rows (map-elt preprocessed :processed-rows))
            (target-width (when agent-shell-markdown-table-wrap-columns
                            (floor (* (agent-shell-markdown--display-width)
                                      agent-shell-markdown-table-max-width-fraction))))
@@ -1762,7 +1762,7 @@ is consulted for aliases before the `-mode' suffix is appended."
   (when (and lang (not (string-empty-p (string-trim lang))))
     (let* ((normalized (downcase (string-trim lang)))
            (resolved (or (map-elt agent-shell-markdown-language-mapping
-                                  normalized nil #'equal)
+                                  normalized)
                          normalized))
            (mode (intern (concat resolved "-mode"))))
       (when (fboundp mode)
@@ -2027,7 +2027,7 @@ the same range on every match inside it."
           (candidate nil))
       (while (< lo hi)
         (let* ((mid (/ (+ lo hi) 2))
-               (range (aref avoid-ranges mid)))
+               (range (seq-elt avoid-ranges mid)))
           (if (<= (car range) start)
               (setq candidate range
                     lo (1+ mid))
@@ -2144,7 +2144,8 @@ TEXT in full.
 
 For example:
 
-  (agent-shell-markdown--deconstruct (agent-shell-markdown-convert \"_my_ **text**\"))
+  (agent-shell-markdown--deconstruct
+   (agent-shell-markdown-convert \"_my_ **text**\"))
   => ((\"my\" (italic)) (\" \" nil) (\"text\" (bold)))"
   (let ((runs '())
         (pos 0)
