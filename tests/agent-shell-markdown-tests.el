@@ -708,6 +708,70 @@ after" nil)))))
 │ Carol │ 42  │
 "))))
 
+(ert-deftest agent-shell-markdown-pad-table-string-accepts-force-pixel ()
+  ;; `--pad-table-string' grew a `:force-pixel' keyword so the per-line
+  ;; padding can be pinned to the pixel path for every wrapped line of
+  ;; a non-ASCII cell.  This pins the keyword in the signature — if it
+  ;; gets dropped, the row-renderer (which always passes it) would
+  ;; error with "Keyword argument :force-pixel not one of ...".
+  ;; In batch (no graphic display) the pixel path is unreachable, so
+  ;; both `:force-pixel t' and `:force-pixel nil' fall back to the
+  ;; ASCII path and produce the same string.  The test just guards the
+  ;; signature and the ASCII-path result.
+  (should (equal "hi  "
+                 (agent-shell-markdown--pad-table-string
+                  :str "hi" :width 4 :force-pixel nil)))
+  (should (equal "hi  "
+                 (agent-shell-markdown--pad-table-string
+                  :str "hi" :width 4 :force-pixel t))))
+
+(ert-deftest agent-shell-markdown-pad-table-string-empty-line ()
+  ;; Empty continuation lines (the `""' a row-renderer hands to padding
+  ;; when a cell wraps fewer times than the row's max) must always
+  ;; render as exactly WIDTH spaces.  The pixel path used to be skipped
+  ;; for empty strings via the row-renderer's caller-side guard — pin
+  ;; the contract here so the guard stays in place.
+  (should (equal "    "
+                 (agent-shell-markdown--pad-table-string
+                  :str "" :width 4)))
+  (should (equal "    "
+                 (agent-shell-markdown--pad-table-string
+                  :str "" :width 4 :force-pixel t))))
+
+(ert-deftest agent-shell-markdown-table-wrap-text-respects-vs-16-width ()
+  ;; `⚠' alone has `string-width' 1, but `⚠\\uFE0F' (`⚠️') renders 2
+  ;; cells (VS-16 forces emoji presentation).  `string-width' reports
+  ;; 8 for `⚠️ Review' while the rendered width is 9 — without VS-16
+  ;; awareness the wrap function lets it fit in a 8-col column and the
+  ;; rendered cell overflows by 1, pushing every subsequent pipe right.
+  ;; By contrast `❌ Killed' (`string-width' 9) wraps in the same
+  ;; column, producing visibly asymmetric misalignment.  Both should
+  ;; wrap.
+  (should (equal '("⚠️" "Review")
+                 (agent-shell-markdown--table-wrap-text "⚠️ Review" 8)))
+  (should (equal '("❌" "Killed")
+                 (agent-shell-markdown--table-wrap-text "❌ Killed" 8)))
+  ;; Both fit at col 9 (matching their rendered widths).
+  (should (equal '("⚠️ Review")
+                 (agent-shell-markdown--table-wrap-text "⚠️ Review" 9)))
+  (should (equal '("❌ Killed")
+                 (agent-shell-markdown--table-wrap-text "❌ Killed" 9))))
+
+(ert-deftest agent-shell-markdown-table-apply-height-scaling-short-circuits ()
+  ;; ASCII-only strings skip the per-char height measurement loop and
+  ;; pass through unchanged (the costly `window-text-pixel-size'
+  ;; measurement is only worth it when there are non-ASCII glyphs
+  ;; that might render taller than the default line height).  In
+  ;; non-graphic display (`display-graphic-p' nil — batch / TTY) the
+  ;; whole pass is a no-op since the measurement APIs aren't available.
+  (let ((input "Auth System"))
+    (should (equal input
+                   (agent-shell-markdown--table-apply-height-scaling input))))
+  ;; In batch (no graphic display), even non-ASCII passes through
+  ;; unchanged.  The function still returns a string.
+  (should (stringp
+           (agent-shell-markdown--table-apply-height-scaling "⚠️ Review"))))
+
 (ert-deftest agent-shell-markdown-table-next-cell-walks-cells-in-order ()
   ;; Cells walk row-by-row, skipping the separator, and signal
   ;; `user-error' at the table boundary.

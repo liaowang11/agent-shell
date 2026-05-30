@@ -1145,42 +1145,105 @@ its font width changes."
           (setq agent-shell-markdown--table-char-pixel-cache (cons fw sw))
           sw)))))
 
-(defun agent-shell-markdown--table-needs-pixel-p (str)
-  "Return non-nil if STR contains chars that `string-width' miscounts.
-Specifically:
-  - U+200D ZERO WIDTH JOINER, which combines surrounding emoji into
-    one rendered glyph (family / profession sequences).
-  - U+1F1E6 .. U+1F1FF REGIONAL INDICATOR SYMBOLs, which pair into
-    a single flag glyph.
+(defvar agent-shell-markdown--table-default-line-height nil
+  "Cached default line height in pixels.
+Computed once per session by `agent-shell-markdown--table-char-height-scale'.")
 
-For these sequences `string-width' sums the codepoint widths but
-the glyph renders narrower, so column sizing must fall back to
-`window-text-pixel-size'.  ASCII, CJK, and single-codepoint emoji
-are correctly measured by `string-width' and skip the pixel path."
-  (let ((i 0)
-        (len (length str))
-        (found nil))
-    (while (and (not found) (< i len))
-      (let ((c (seq-elt str i)))
-        (when (or (= c #x200D)
-                  (and (>= c #x1F1E6) (<= c #x1F1FF)))
-          (setq found t)))
-      (setq i (1+ i)))
-    found))
+(defconst agent-shell-markdown--table-min-height-scale 0.75
+  "Minimum height scale factor.
+Characters needing more aggressive scaling than this are left
+unscaled — shrinking text below 75% makes it unreadable.  This
+allows emoji (~0.77) and CJK (~0.90) through while skipping
+scripts with tall ascenders/descenders like Arabic (~0.63).")
+
+(defvar agent-shell-markdown--table-height-scale-cache (make-hash-table :test 'eq)
+  "Cache of height scale factors keyed by character.")
+
+(defun agent-shell-markdown--table-measure-line-height (win str)
+  "Return the rendered pixel height of STR as a single line in WIN."
+  (with-temp-buffer
+    (set-window-buffer win (current-buffer))
+    (insert str "\n")
+    (cdr (window-text-pixel-size win 1 3))))
+
+(defun agent-shell-markdown--table-char-height-scale (char)
+  "Return the display height scale needed for CHAR, or nil if none.
+
+Color emoji and CJK glyphs typically render taller than the default
+line height, which makes cells containing them taller than ASCII-only
+cells in the same row.  When a table has rows of mixed glyph types,
+the vertical borders end up at different y-positions and the
+column lines look broken.  Scaling tall glyphs down via the
+`display' `height' property forces a uniform line height across
+all rows so borders connect cleanly.
+
+The needed scale is just `default-h / char-h' — the factor that
+brings the glyph back to the default height.  Results are cached."
+  (let ((cached (gethash char agent-shell-markdown--table-height-scale-cache
+                         'miss)))
+    (if (eq cached 'miss)
+        (let ((scale
+               (let ((win (selected-window))
+                     (orig-buf (window-buffer)))
+                 (unwind-protect
+                     (let* ((default-h
+                             (or agent-shell-markdown--table-default-line-height
+                                 (setq agent-shell-markdown--table-default-line-height
+                                       (agent-shell-markdown--table-measure-line-height
+                                        win "A"))))
+                            (char-h (agent-shell-markdown--table-measure-line-height
+                                     win (string char))))
+                       (when (> char-h default-h)
+                         (let ((ratio (/ (float default-h) char-h)))
+                           (and (>= ratio
+                                    agent-shell-markdown--table-min-height-scale)
+                                ratio))))
+                   (set-window-buffer win orig-buf)))))
+          (puthash char scale agent-shell-markdown--table-height-scale-cache)
+          scale)
+      cached)))
+
+(defun agent-shell-markdown--table-apply-height-scaling (str)
+  "Add display height scaling to tall characters in STR.
+Returns a new string with `display' `(height N)' on glyphs that
+would otherwise cause uneven row heights — emoji, CJK, etc.
+ASCII-only strings short-circuit and are returned unchanged."
+  (if (or (not (display-graphic-p))
+          (string-match-p (rx bos (* ascii) eos) str))
+      str
+    (let ((result (copy-sequence str))
+          (len (length str)))
+      (dotimes (i len)
+        (let* ((ch (seq-elt result i))
+               (scale (agent-shell-markdown--table-char-height-scale ch)))
+          ;; Also scale a base char that's about to be widened by VS-16
+          ;; (forces emoji presentation, which is what makes ⚠ become ⚠️).
+          (unless scale
+            (when (and (< (1+ i) len)
+                       (= (seq-elt result (1+ i)) #xFE0F))
+              (setq scale (agent-shell-markdown--table-char-height-scale
+                           #xFE0F))))
+          (when scale
+            (put-text-property i (1+ i) 'display
+                               `(height ,scale)
+                               result))))
+      result)))
 
 (cl-defun agent-shell-markdown--table-display-width (&key str window)
   "Return display width of STR in character units.
 
-Uses `string-width' for the vast majority of content — ASCII, CJK,
-and single-codepoint emoji are all measured correctly by it.
-Falls back to `window-text-pixel-size' only for sequences that
-`string-width' miscounts (ZWJ compound emoji, regional-indicator
-flag pairs); see `agent-shell-markdown--table-needs-pixel-p'."
+ASCII content uses the cheap `string-width'.  Any non-ASCII
+content routes through `window-text-pixel-size' so that column
+widths reflect the actual rendered pixel width rather than a
+`string-width' approximation.  Mixing the two paths within a
+column (some rows ASCII-padded, some pixel-padded) accumulates
+fractional drift on the right edge of the column and visibly
+misaligns the vertical pipes between rows."
   (if (and window
            (window-live-p window)
            (fboundp 'window-text-pixel-size)
            (display-graphic-p)
-           (agent-shell-markdown--table-needs-pixel-p str))
+           (not (string-match-p (rx bos (* ascii) eos) str)))
       (condition-case nil
           (let ((char-px (agent-shell-markdown--table-char-pixel-width window))
                 (real-px (agent-shell-markdown--table-measure-string str window)))
@@ -1225,25 +1288,56 @@ Accounts for borders and padding (`| X | Y |' = 2 padding +
                         (max m (floor (- w (* s ratio)))))
                       natural-widths min-widths shrinkable)))))))
 
+(defun agent-shell-markdown--table-wrap-char-width (text pos)
+  "Return the display width contribution of the char at POS in TEXT.
+
+Mostly `char-width', but with one correction: U+FE0F VARIATION
+SELECTOR-16 forces emoji presentation on the preceding char,
+widening that glyph to 2 cells (e.g. `⚠' alone renders 1 col,
+`⚠\\uFE0F' / `⚠️' renders 2).  `char-width' reports 1 for `⚠' and
+0 for VS-16 — summing to 1 — even though the combined grapheme
+takes 2 cells.  We compensate by attributing width 1 to VS-16
+itself so the running total over the grapheme equals 2."
+  (let ((ch (seq-elt text pos)))
+    (if (= ch #xFE0F) 1 (char-width ch))))
+
 (defun agent-shell-markdown--table-wrap-text (text width)
   "Wrap TEXT to fit within WIDTH, returning a list of lines.
-Preserves text properties across wrapped lines."
+Preserves text properties across wrapped lines.
+
+Uses the VS-16-aware width helper so that emoji presentation
+sequences (`⚠️') count as their actual rendered width (2 cells)
+rather than the `string-width' approximation (1 cell), which
+would otherwise let a 9-rendered-col cell fit inside a 8-col
+column and overflow the table border on render."
   (cond
    ((or (null text) (string-empty-p text)) (list ""))
-   ((<= (string-width text) width) (list text))
+   ((<= (string-width text)
+        ;; Subtract VS-16 occurrences from WIDTH for the fit check —
+        ;; each VS-16 widens its base char by 1 cell beyond what
+        ;; `string-width' reports, so the effective budget shrinks
+        ;; by one per VS-16 present.
+        (- width
+           (seq-count (lambda (c) (= c #xFE0F)) text)))
+    (list text))
    (t
     (let ((lines '())
           (pos 0)
           (len (length text)))
       (while (< pos len)
         ;; Greedily consume chars until adding the next one would
-        ;; exceed WIDTH.
+        ;; exceed WIDTH (using VS-16-aware widths).
         (let ((end-pos pos)
               (line-width 0))
           (while (and (< end-pos len)
-                      (<= (+ line-width (char-width (seq-elt text end-pos)))
+                      (<= (+ line-width
+                             (agent-shell-markdown--table-wrap-char-width
+                              text end-pos))
                           width))
-            (setq line-width (+ line-width (char-width (seq-elt text end-pos))))
+            (setq line-width
+                  (+ line-width
+                     (agent-shell-markdown--table-wrap-char-width
+                      text end-pos)))
             (setq end-pos (1+ end-pos)))
           ;; Make sure at least one char advances even when the very
           ;; first char already exceeds WIDTH (e.g. wide glyph).
@@ -1265,20 +1359,28 @@ Preserves text properties across wrapped lines."
               (setq pos (1+ pos))))))
       (nreverse lines)))))
 
-(cl-defun agent-shell-markdown--pad-table-string (&key str width window)
+(cl-defun agent-shell-markdown--pad-table-string (&key str width window force-pixel)
   "Pad STR with spaces to reach WIDTH columns.
 
-`string-width' is reliable for ASCII, CJK, and single-codepoint
-emoji, so the cheap padding path is taken for almost all content.
-The pixel-accurate `display'-space path runs only for strings
-flagged by `agent-shell-markdown--table-needs-pixel-p' (ZWJ compound
-emoji, regional-indicator flag pairs) where `string-width' would
-otherwise miscount and the column right-border would drift."
+ASCII-only strings take the cheap `string-width' + spaces path.
+Any non-ASCII content (single-codepoint emoji, CJK, ZWJ
+sequences, regional-indicator flags, VS-16 emoji) routes through
+pixel-accurate measurement.  Mixing the two paths within a
+column accumulates fractional drift between rows and visibly
+misaligns the right-edge pipes.
+
+When FORCE-PIXEL is non-nil, the pixel path is taken regardless of
+STR's content.  Callers use this to keep all wrapped lines of one
+multi-line cell on the same path — otherwise a wrapped cell that
+splits non-ASCII content (e.g. an em dash) onto one line and pure
+ASCII content onto another would render those continuation lines
+via different paths and drift sub-pixel on their right edge."
   (if (and window
            (window-live-p window)
            (fboundp 'window-text-pixel-size)
            (display-graphic-p)
-           (agent-shell-markdown--table-needs-pixel-p str))
+           (or force-pixel
+               (not (string-match-p (rx bos (* ascii) eos) str))))
       (condition-case nil
           (let* ((char-px (agent-shell-markdown--table-char-pixel-width window))
                  (target-px (* width char-px))
@@ -1343,18 +1445,37 @@ logical rows (skipping the visual continuation lines)."
                    (lambda (cell width)
                      (agent-shell-markdown--table-wrap-text cell width))
                    processed-cells col-widths))
+         ;; Per-cell "force pixel padding" flag, decided once from the
+         ;; un-wrapped cell content and applied to every wrapped line
+         ;; of that cell.  Without this, a cell whose wrap splits
+         ;; non-ASCII content (e.g. an em dash) onto one line and pure
+         ;; ASCII onto another would render those lines via different
+         ;; padding paths and drift sub-pixel apart on their right edge.
+         (force-pixel-flags
+          (mapcar (lambda (cell)
+                    (not (string-match-p (rx bos (* ascii) eos) cell)))
+                  processed-cells))
          (max-lines (apply #'max 1 (mapcar #'length wrapped)))
          (lines '()))
     (dotimes (line-idx max-lines)
       (let ((parts '()))
         (seq-mapn
-         (lambda (cell-lines width)
+         (lambda (cell-lines width force-pixel)
            (let* ((line (if (< line-idx (length cell-lines))
                             (nth line-idx cell-lines)
                           ""))
                   (padded (concat " "
                                   (agent-shell-markdown--pad-table-string
-                                   :str line :width width :window window)
+                                   :str line :width width :window window
+                                   ;; Empty continuation lines have no
+                                   ;; content to measure — leaving them
+                                   ;; on the ASCII path avoids a wasted
+                                   ;; pixel measurement that some Emacs
+                                   ;; builds appear to mishandle for an
+                                   ;; empty range.
+                                   :force-pixel (and force-pixel
+                                                     (not (string-empty-p
+                                                           line))))
                                   " ")))
              (when row-face
                (add-face-text-property 0 (length padded) row-face t padded))
@@ -1366,7 +1487,7 @@ logical rows (skipping the visual continuation lines)."
              (when (and (zerop line-idx) (> (length padded) 1))
                (put-text-property 1 2 'agent-shell-markdown-table-cell-start t padded))
              (push padded parts)))
-         wrapped col-widths)
+         wrapped col-widths force-pixel-flags)
         (push (concat styled-pipe
                       (string-join (nreverse parts) styled-pipe)
                       styled-pipe)
@@ -1396,7 +1517,8 @@ containing emoji/CJK line up with the column's right border."
               (col 0)
               (processed-cells nil))
           (dolist (cell cells)
-            (let* ((processed (map-elt cell :content))
+            (let* ((processed (agent-shell-markdown--table-apply-height-scaling
+                               (map-elt cell :content)))
                    (dw (agent-shell-markdown--table-display-width
                         :str processed :window window)))
               (push processed processed-cells)
