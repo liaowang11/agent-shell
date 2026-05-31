@@ -41,7 +41,7 @@
 (declare-function agent-shell--dwim "agent-shell")
 
 (defcustom agent-shell-hermes-acp-command
-  '(hermes acp)
+  '("hermes" "acp")
   "Command and parameters for the Hermes agent client.
 
 The first element is the command name, and the rest are command parameters."
