@@ -2407,6 +2407,38 @@ code block content
     (let ((agent-shell-dot-subdir-function (lambda (_subdir) "  ")))
       (should-error (agent-shell--dot-subdir "screenshots") :type 'error))))
 
+(ert-deftest agent-shell--ensure-gitignore-writes-to-git-exclude-test ()
+  "Test that `agent-shell--ensure-gitignore' writes /.agent-shell/ to .git/info/exclude."
+  (let ((temp-dir (make-temp-file "agent-shell-test" t)))
+    (unwind-protect
+        (let ((default-directory temp-dir))
+          (process-file "git" nil nil nil "init")
+          (agent-shell--ensure-gitignore temp-dir)
+          (should (string-match-p
+                   (regexp-quote "/.agent-shell/")
+                   (with-temp-buffer
+                     (insert-file-contents
+                      (expand-file-name ".git/info/exclude" temp-dir))
+                     (buffer-string)))))
+      (delete-directory temp-dir t))))
+
+
+(ert-deftest agent-shell--ensure-gitignore-noop-when-already-ignored-test ()
+  "Test that `agent-shell--ensure-gitignore' does not add a duplicate entry."
+  (let ((temp-dir (make-temp-file "agent-shell-test" t)))
+    (unwind-protect
+        (let* ((default-directory temp-dir)
+               (exclude-file (expand-file-name ".git/info/exclude" temp-dir)))
+          (process-file "git" nil nil nil "init")
+          (make-directory (expand-file-name ".agent-shell" temp-dir) t)
+          (write-region "/.agent-shell/\n" nil exclude-file t 'no-message)
+          (agent-shell--ensure-gitignore temp-dir)
+          (should (= 1 (with-temp-buffer
+                         (insert-file-contents exclude-file)
+                         (count-matches (regexp-quote "/.agent-shell/")
+                                        (point-min) (point-max))))))
+      (delete-directory temp-dir t))))
+
 (ert-deftest agent-shell--on-request-calls-permission-request-handler-test ()
   "Test `agent-shell--on-request' calls handler and :respond auto-approves."
   (with-temp-buffer

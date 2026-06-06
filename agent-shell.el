@@ -2646,13 +2646,26 @@ For example:
                         (expand-file-name ".agent-shell" (agent-shell-cwd)))))
 
 (defun agent-shell--ensure-gitignore (project-root)
-  "If .agent-shell/ is not ignored under PROJECT-ROOT, add it to .gitignore."
+  "If .agent-shell/ is not ignored under PROJECT-ROOT, add it to .git/info/exclude."
   (condition-case nil
       (when-let* (((eq 'Git (vc-responsible-backend project-root t)))
                   (default-directory project-root)
                   ((not (zerop (process-file "git" nil nil nil
-                                             "check-ignore" "-q" ".agent-shell")))))
-        (vc-ignore "/.agent-shell/" project-root))
+                                             "check-ignore" "-q" ".agent-shell"))))
+                  (git-dir (with-temp-buffer
+                              (when (zerop (process-file "git" nil t nil
+                                                         "rev-parse" "--git-dir"))
+                                (string-trim (buffer-string)))))
+                  (exclude-file (expand-file-name "info/exclude" git-dir)))
+        (make-directory (file-name-directory exclude-file) t)
+        (with-temp-buffer
+          (when (file-exists-p exclude-file)
+            (insert-file-contents exclude-file))
+          (goto-char (point-max))
+          (unless (bolp)
+            (insert "\n"))
+          (insert "/.agent-shell/\n")
+          (write-region nil nil exclude-file)))
     (error nil)))
 
 (cl-defun agent-shell--capture-screenshot (&key destination-dir)
