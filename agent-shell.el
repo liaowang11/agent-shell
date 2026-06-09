@@ -1095,7 +1095,9 @@ Works from both shell and viewport buffers."
                      'new))
          (config (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
                           :agent-config))
-         (shell-dir (buffer-local-value 'default-directory shell-buffer)))
+         (shell-dir (buffer-local-value 'default-directory shell-buffer))
+         ;; Remember where the shell is currently displayed
+         (windows (get-buffer-window-list shell-buffer nil t)))
     (with-current-buffer shell-buffer
       (when (and (agent-shell--active-requests-p (agent-shell--state))
                  (not (y-or-n-p "Agent is busy.  Restart anyway?")))
@@ -1112,7 +1114,13 @@ Works from both shell and viewport buffers."
       (if (or from-viewport agent-shell-prefer-viewport-interaction)
           (agent-shell-viewport--show-buffer
            :shell-buffer new-shell-buffer)
-        (agent-shell--display-buffer new-shell-buffer)))))
+        ;; Reuse the original window(s) when still live
+        (if-let ((live-windows (seq-filter #'window-live-p windows)))
+            (progn
+              (dolist (window live-windows)
+                (set-window-buffer window new-shell-buffer))
+              (select-window (car live-windows)))
+          (agent-shell--display-buffer new-shell-buffer))))))
 
 ;;;###autoload
 (defun agent-shell-reload ()
