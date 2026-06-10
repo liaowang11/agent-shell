@@ -640,7 +640,12 @@ configuration alist for backwards compatibility."
 
 `last', `first-last', and `full' all require the agent to
 advertise `session/load' support.  When unavailable, restore
-falls back to `minimal' behavior."
+falls back to `minimal' behavior.
+
+`minimal' uses `session/resume' when available.  When the agent
+doesn't support `session/resume' but does support
+`session/load', restore falls forward to `first-last' so some
+context is shown rather than nothing."
   :type '(choice (const :tag "Title only (minimal)" minimal)
                  (const :tag "Last response (last)" last)
                  (const :tag "First prompt + last response (first-last)" first-last)
@@ -5202,13 +5207,37 @@ overwrites an existing fragment with equivalent content."
    (t
     (map-elt state :supports-session-load))))
 
+(defun agent-shell--effective-restore-verbosity (state)
+  "Return the verbosity in effect for STATE's restore.
+
+Falls back from `agent-shell-session-restore-verbosity' when the
+agent's protocol support requires it:
+
+  `minimal' without `session/resume' (but with `session/load') →
+  `first-last' (replay via load).
+
+  `last', `first-last', or `full' without `session/load' →
+  `minimal' (replay unavailable).
+
+  Otherwise returns the configured value."
+  (cond
+   ((and (eq agent-shell-session-restore-verbosity 'minimal)
+         (not (map-elt state :supports-session-resume))
+         (map-elt state :supports-session-load))
+    'first-last)
+   ((and (memq agent-shell-session-restore-verbosity '(last first-last full))
+         (not (map-elt state :supports-session-load)))
+    'minimal)
+   (t agent-shell-session-restore-verbosity)))
+
 (defun agent-shell--has-pending-restore-p (state)
   "Return non-nil when STATE should buffer notifications during restore.
 
-Only true when `agent-shell-session-restore-verbosity' is `last'
-or `first-last' and the agent supports `session/load' (so the
+Only true when the effective verbosity (see
+`agent-shell--effective-restore-verbosity') is `last' or
+`first-last' and the agent supports `session/load' (so the
 buffered prompt turns can be replayed after the load completes)."
-  (and (memq agent-shell-session-restore-verbosity '(last first-last))
+  (and (memq (agent-shell--effective-restore-verbosity state) '(last first-last))
        (map-elt state :supports-session-load)))
 
 (defun agent-shell--make-pending-restore ()
@@ -5303,7 +5332,7 @@ pending-restore state once replay completes."
       (map-put! state :active-requests
                 (cons (list (cons :method "session/load")) saved-active-requests))
       (unwind-protect
-          (pcase agent-shell-session-restore-verbosity
+          (pcase (agent-shell--effective-restore-verbosity state)
             ('last
              (when (> count 1)
                (agent-shell--update-fragment
@@ -5336,6 +5365,16 @@ SESSION-TITLE is an optional display title for the resumed session."
    :block-id "starting"
    :body (format "\n\nLoading session %s..." session-id)
    :append t)
+  (unless (eq (agent-shell--effective-restore-verbosity (agent-shell--state))
+              agent-shell-session-restore-verbosity)
+    (agent-shell--update-fragment
+     :state (agent-shell--state)
+     :namespace-id "bootstrapping"
+     :block-id "restore_fallback"
+     :body (agent-shell--make-boxed-message
+            :text (format "Warning: %s unsupported. Using %s loading"
+                          agent-shell-session-restore-verbosity
+                          (agent-shell--effective-restore-verbosity (agent-shell--state))))))
   (let ((use-load (agent-shell--use-session-load-p (agent-shell--state))))
     (when (and use-load (agent-shell--has-pending-restore-p (agent-shell--state)))
       (map-put! (agent-shell--state) :pending-restore
@@ -5469,6 +5508,16 @@ SESSION-TITLE is an optional display title for the resumed session."
                                     :block-id "starting"
                                     :body (format "\n\nLoading session %s..." acp-session-id)
                                     :append t)
+                                   (unless (eq (agent-shell--effective-restore-verbosity (agent-shell--state))
+                                               agent-shell-session-restore-verbosity)
+                                     (agent-shell--update-fragment
+                                      :state (agent-shell--state)
+                                      :namespace-id "bootstrapping"
+                                      :block-id "restore_fallback"
+                                      :body (agent-shell--make-boxed-message
+                                             :text (format "Warning: %s unsupported. Using %s loading"
+                                                           agent-shell-session-restore-verbosity
+                                                           (agent-shell--effective-restore-verbosity (agent-shell--state))))))
                                    (when (and use-load
                                               (agent-shell--has-pending-restore-p (agent-shell--state)))
                                      (map-put! (agent-shell--state) :pending-restore
@@ -5513,9 +5562,9 @@ SESSION-TITLE is an optional display title for the resumed session."
                                                   (agent-shell--update-fragment
                                                    :state (agent-shell--state)
                                                    :namespace-id "bootstrapping"
-                                                   :block-id "starting"
-                                                   :body "\n\nCould not load existing session. Creating a new one..."
-                                                   :append t)
+                                                   :block-id "restore_fallback"
+                                                   :body (agent-shell--make-boxed-message
+                                                          :text "Warning: Could not load existing session. Starting new"))
                                                   (agent-shell--initiate-new-session
                                                    :shell-buffer shell-buffer
                                                    :on-session-init on-session-init))))
@@ -5525,6 +5574,12 @@ SESSION-TITLE is an optional display title for the resumed session."
                      (quit
                       (agent-shell--emit-event :event 'session-selection-cancelled)))))
    :on-failure (lambda (_acp-error _raw-message)
+                 (agent-shell--update-fragment
+                  :state (agent-shell--state)
+                  :namespace-id "bootstrapping"
+                  :block-id "restore_fallback"
+                  :body (agent-shell--make-boxed-message
+                         :text "Warning: Could not list existing sessions. Starting new"))
                  (agent-shell--initiate-new-session
                   :shell-buffer shell-buffer
                   :on-session-init on-session-init))))
