@@ -40,6 +40,11 @@
                  '(("hello " nil)
                    ("world" (agent-shell-markdown-italic))))))
 
+(ert-deftest agent-shell-markdown-convert-italic-underscore-intraword ()
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "Echo _hello_world"))
+                 '(("Echo _hello_world" nil)))))
+
 (ert-deftest agent-shell-markdown-convert-multiple ()
   (should (equal (agent-shell-markdown--deconstruct
                   (agent-shell-markdown-convert "_my_ **text**"))
