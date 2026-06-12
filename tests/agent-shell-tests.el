@@ -3305,6 +3305,80 @@ and it must handle that cleanly."
     (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
       (should (equal result "Use foo-bar for that.")))))
 
+(ert-deftest agent-shell-record-block-source-appends-raw-markdown ()
+  "Streaming append accumulates the exact raw markdown per block."
+  (let* ((sources (make-hash-table :test 'equal))
+         (state `((:block-sources . ,sources))))
+    (agent-shell--record-block-source
+     :state state :qualified-id "7-assistant" :body "**a**")
+    (agent-shell--record-block-source
+     :state state :qualified-id "7-assistant" :body " _b_" :append t)
+    (should (equal "**a** _b_" (gethash "7-assistant" sources)))))
+
+(ert-deftest agent-shell-record-block-source-replaces-without-append ()
+  "Without APPEND, a block's source is overwritten, not accumulated."
+  (let* ((sources (make-hash-table :test 'equal))
+         (state `((:block-sources . ,sources))))
+    (agent-shell--record-block-source
+     :state state :qualified-id "1-assistant" :body "first")
+    (agent-shell--record-block-source
+     :state state :qualified-id "1-assistant" :body "second")
+    (should (equal "second" (gethash "1-assistant" sources)))))
+
+(ert-deftest agent-shell-markdown-in-region-returns-stored-source ()
+  "A block with stored source yields its raw markdown, not rendered text."
+  (let ((sources (make-hash-table :test 'equal)))
+    (puthash "1-a" "[t](http://x)\n```python\ncode\n```" sources)
+    (with-temp-buffer
+      (insert (propertize "rendered link  python code"
+                          'agent-shell-ui-state '((:qualified-id . "1-a"))))
+      (should (equal "[t](http://x)\n```python\ncode\n```"
+                     (agent-shell--markdown-in-region
+                      :start (point-min) :end (point-max) :sources sources))))))
+
+(ert-deftest agent-shell-markdown-in-region-joins-blocks-in-order ()
+  "Multiple blocks emit their stored source in buffer order, blank-separated."
+  (let ((sources (make-hash-table :test 'equal)))
+    (puthash "1-a" "first" sources)
+    (puthash "1-b" "second" sources)
+    (with-temp-buffer
+      (insert (propertize "AAA" 'agent-shell-ui-state '((:qualified-id . "1-a"))))
+      (insert "\n\n")
+      (insert (propertize "BBB" 'agent-shell-ui-state '((:qualified-id . "1-b"))))
+      (should (equal "first\n\nsecond"
+                     (agent-shell--markdown-in-region
+                      :start (point-min) :end (point-max) :sources sources))))))
+
+(ert-deftest agent-shell-markdown-in-region-falls-back-to-visible-text ()
+  "A block with no stored source falls back to filtered visible text."
+  (let ((sources (make-hash-table :test 'equal)))
+    (with-temp-buffer
+      (insert (propertize "plain visible" 'agent-shell-ui-state
+                          '((:qualified-id . "1-z"))))
+      (should (equal "plain visible"
+                     (agent-shell--markdown-in-region
+                      :start (point-min) :end (point-max) :sources sources))))))
+
+(ert-deftest agent-shell-block-bounds-at-point-spans-tagged-block ()
+  "Point inside a tagged block returns that block's start and end."
+  (with-temp-buffer
+    (insert "pad")
+    (let ((start (point)))
+      (insert (propertize "BLOCK BODY" 'agent-shell-ui-state
+                          '((:qualified-id . "1-a"))))
+      (let ((end (point)))
+        (insert "pad")
+        (goto-char (+ start 3))
+        (should (equal (cons start end)
+                       (agent-shell--block-bounds-at-point)))))))
+
+(ert-deftest agent-shell-block-bounds-at-point-untagged-returns-nil ()
+  "Point on untagged text returns nil."
+  (with-temp-buffer
+    (insert "no block here")
+    (goto-char (point-min))
+    (should-not (agent-shell--block-bounds-at-point))))
+
 (ert-deftest agent-shell-trim-strips-untagged-whitespace ()
   ;; Plain `string-trim'-style behavior when nothing is tagged: outer
   ;; whitespace is removed.
