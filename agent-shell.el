@@ -859,6 +859,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
                              (cons :title nil)))
         (cons :config-options nil)
         (cons :last-entry-type nil)
+        (cons :block-sources (make-hash-table :test 'equal))
         (cons :chunked-group-count 0)
         (cons :request-count 0)
         (cons :last-activity-time nil)
@@ -1572,6 +1573,7 @@ If DELETE is non-nil, delete the text between START and END."
   "C-c C-t" #'agent-shell-set-session-thought-level
   "C-c C-o" #'agent-shell-other-buffer
   "C-c C-s" #'agent-shell-set-session-config-option
+  "C-c M-w" #'agent-shell-copy-as-markdown
   "<remap> <yank>" #'agent-shell-yank-dwim)
 
 (shell-maker-define-major-mode (agent-shell--make-shell-maker-config) agent-shell-mode-map)
@@ -3385,6 +3387,51 @@ variable (see makunbound)"))
       (error "Editing the wrong buffer: %s" (current-buffer)))
     (agent-shell-ui-delete-fragment :namespace-id (map-elt state :request-count) :block-id block-id :no-undo t)))
 
+(cl-defun agent-shell--record-block-source (&key state qualified-id body append)
+  "Store raw markdown BODY for QUALIFIED-ID in STATE's block-source table.
+When APPEND is non-nil, concatenate BODY onto any source already recorded
+for QUALIFIED-ID; otherwise replace it.  Recorded source lets
+`agent-shell-copy-as-markdown' recover the original markdown, since the
+renderer deletes markup in place while rendering.
+
+For example, streaming \"**a**\" then \" _b_\" with APPEND records
+\"**a** _b_\" for the block."
+  (when-let* ((sources (and body (map-elt state :block-sources))))
+    (puthash qualified-id
+             (if append (concat (gethash qualified-id sources "") body) body)
+             sources)))
+
+(cl-defun agent-shell--compose-block-source (&key label-right body)
+  "Return stored markdown source for LABEL-RIGHT and BODY.
+
+For example, LABEL-RIGHT \"Run `echo hi`\" and BODY \"done\" returns
+\"Run `echo hi`\n\ndone\"."
+  (cond
+   ((and label-right body (not (string-empty-p body)))
+    (concat label-right "\n\n" body))
+   (label-right label-right)
+   (t body)))
+
+(cl-defun agent-shell--block-source-update (&key current-source label-right body append)
+  "Return the raw markdown update for CURRENT-SOURCE, LABEL-RIGHT, and BODY.
+
+When APPEND is non-nil and CURRENT-SOURCE already equals LABEL-RIGHT, the
+first body chunk is prefixed with a blank line so copied markdown matches
+the rendered title/body block."
+  (if append
+      (cond
+       ((null body) nil)
+       ((or (null current-source)
+            (string-empty-p current-source))
+        (agent-shell--compose-block-source :label-right label-right :body body))
+       ((and label-right
+             body
+             (equal current-source label-right)
+             (not (string-empty-p body)))
+        (concat "\n\n" body))
+       (t body))
+    (agent-shell--compose-block-source :label-right label-right :body body)))
+
 (cl-defun agent-shell--update-fragment (&key state namespace-id block-id label-left label-right
                                              body append create-new navigation expanded
                                              render-body-images above-last-prompt)
@@ -3423,6 +3470,19 @@ turn)."
                "`")
            "Snippet\n\n```\n\\1\n```\n"
            label-right)))
+  (let* ((qualified-id (format "%s-%s" (or namespace-id (map-elt state :request-count)) block-id))
+         (sources (map-elt state :block-sources))
+         (source-update (agent-shell--block-source-update
+                         :current-source (and sources
+                                              (gethash qualified-id sources))
+                         :label-right label-right
+                         :body body
+                         :append append)))
+    (agent-shell--record-block-source
+     :state state
+     :qualified-id qualified-id
+     :body source-update
+     :append append))
   (when-let* (((map-elt state :buffer))
               (viewport-buffer (agent-shell-viewport--buffer
                                 :shell-buffer (map-elt state :buffer)
@@ -8458,6 +8518,82 @@ commands when the agent has reported them."
   (if (shell-maker-busy)
       (agent-shell--enqueue-request :prompt prompt)
     (agent-shell--insert-to-shell-buffer :text prompt :submit t :no-focus t)))
+
+(cl-defun agent-shell--markdown-in-region (&key start end sources)
+  "Return raw markdown for the fragment blocks between START and END.
+SOURCES is a block-source hash table (see `agent-shell--record-block-source').
+Each block contributes its stored raw markdown once, in buffer order; a block
+with no stored source falls back to its visible text via
+`agent-shell--filter-buffer-substring'.  Blocks are separated by a blank line.
+
+For example, a region covering two blocks whose stored sources are \"first\"
+and \"second\" returns \"first\\n\\nsecond\"."
+  (let ((order '())
+        (fallbacks (make-hash-table :test 'equal)))
+    (save-excursion
+      (goto-char start)
+      (while (< (point) end)
+        (let ((qualified-id (map-elt (get-text-property (point) 'agent-shell-ui-state)
+                                     :qualified-id))
+              (next (or (next-single-property-change
+                         (point) 'agent-shell-ui-state nil end)
+                        end)))
+          (when qualified-id
+            (unless (member qualified-id order)
+              (push qualified-id order))
+            (unless (when-let* ((source (gethash qualified-id sources)))
+                      (not (string-empty-p source)))
+              (puthash qualified-id
+                       (concat (gethash qualified-id fallbacks "")
+                               (agent-shell--filter-buffer-substring (point) next))
+                       fallbacks)))
+          (goto-char next))))
+    (string-join
+     (seq-map (lambda (qualified-id)
+                (or (when-let* ((source (gethash qualified-id sources)))
+                      (unless (string-empty-p source)
+                        source))
+                    (gethash qualified-id fallbacks)))
+              (nreverse order))
+     "\n\n")))
+
+(defun agent-shell--block-bounds-at-point ()
+  "Return a cons (START . END) of the fragment block at point, or nil.
+The block is the span sharing point's `agent-shell-ui-state' text property."
+  (when (get-text-property (point) 'agent-shell-ui-state)
+    (cons (or (previous-single-property-change (point) 'agent-shell-ui-state)
+              (point-min))
+          (or (next-single-property-change (point) 'agent-shell-ui-state)
+              (point-max)))))
+
+(defun agent-shell-copy-as-markdown ()
+  "Copy the active region (or the response block at point) as raw markdown.
+A regular copy yields the rendered text; this recovers the original markdown
+that produced each block, preserving link URLs, fenced-code languages,
+emphasis delimiters, and table source.  A selection touching a block emits
+that block's whole source.  Blocks with no recorded source fall back to their
+visible text."
+  (declare (modes agent-shell-mode agent-shell-viewport-view-mode))
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-mode 'agent-shell-viewport-view-mode)
+    (error "Not in a shell"))
+  (when-let* ((bounds (or (and (region-active-p)
+                               (cons (region-beginning) (region-end)))
+                          (agent-shell--block-bounds-at-point)
+                          (user-error "No response block at point")))
+              (shell-buffer (if (derived-mode-p 'agent-shell-viewport-view-mode)
+                                (agent-shell-viewport--shell-buffer)
+                              (current-buffer)))
+              (markdown (agent-shell--markdown-in-region
+                         :start (car bounds) :end (cdr bounds)
+                         :sources (with-current-buffer shell-buffer
+                                    (or (map-elt agent-shell--state :block-sources)
+                                        (make-hash-table :test 'equal))))))
+    (when (string-empty-p (string-trim markdown))
+      (user-error "Nothing to copy"))
+    (kill-new markdown)
+    (deactivate-mark)
+    (message "Copied as markdown")))
 
 (defun agent-shell-quote-region ()
   "Quote the active region into the shell's latest prompt.
