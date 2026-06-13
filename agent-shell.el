@@ -6075,30 +6075,13 @@ Returns a buffer object or nil."
     (with-current-buffer shell-buffer
       (goto-char comint-last-input-start))))
 
-(defun agent-shell--command-and-response-at-point ()
-  "Like `shell-maker--command-and-response-at-point' but preserves
-visual padding emitted by the markdown renderer inside fragments
-(e.g. source-block top/bottom vpad).  Delegates the raw extraction
-to shell-maker and runs the result through `agent-shell-trim'."
-  (when-let* ((cell (shell-maker--command-and-response-at-point :trimmed nil)))
-    (cons (agent-shell-trim (car cell))
-          (agent-shell-trim (cdr cell)))))
-
-(defun agent-shell--next-command-and-response (&optional backwards)
-  "Like `shell-maker-next-command-and-response' but preserves
-visual padding inside fragments — see
-`agent-shell--command-and-response-at-point'."
-  (when-let* ((cell (shell-maker-next-command-and-response backwards :trimmed nil)))
-    (cons (agent-shell-trim (car cell))
-          (agent-shell-trim (cdr cell)))))
-
 (defun agent-shell-interaction-at-point ()
   "Return the interaction at point in the shell buffer.
 Result is of the form ((:prompt . PROMPT) (:response . RESPONSE))."
   (when-let* ((shell-buffer (agent-shell--shell-buffer))
               (result (with-current-buffer shell-buffer
-                        (or (agent-shell--command-and-response-at-point)
-                            (agent-shell--next-command-and-response t)))))
+                        (or (shell-maker--command-and-response-at-point :trimmed nil)
+                            (shell-maker-next-command-and-response t :trimmed nil)))))
     `((:prompt . ,(car result))
       (:response . ,(cdr result)))))
 

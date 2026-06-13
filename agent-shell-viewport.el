@@ -35,7 +35,6 @@
 (require 'flymake)
 (require 'agent-shell-list-edit)
 (require 'agent-shell-markdown)
-(require 'markdown-overlays)
 (require 'shell-maker)
 (require 'transient)
 
@@ -45,13 +44,11 @@
 (declare-function agent-shell--block-quote "agent-shell")
 (declare-function agent-shell--current-shell "agent-shell")
 (declare-function agent-shell--display-buffer "agent-shell")
-(declare-function agent-shell--next-command-and-response "agent-shell")
 (declare-function agent-shell--get-region "agent-shell")
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
 (declare-function agent-shell--make-header "agent-shell")
 (declare-function agent-shell--context "agent-shell")
 (declare-function agent-shell--shell-buffer "agent-shell")
-(declare-function agent-shell--start "agent-shell")
 (declare-function agent-shell--state "agent-shell")
 (declare-function agent-shell--filter-buffer-substring "agent-shell")
 (declare-function agent-shell-buffers "agent-shell")
@@ -70,8 +67,6 @@
 (declare-function agent-shell-next-permission-button "agent-shell")
 (declare-function agent-shell-other-buffer "agent-shell")
 (declare-function agent-shell-previous-permission-button "agent-shell")
-(declare-function agent-shell-project-buffers "agent-shell")
-(declare-function agent-shell-select-config "agent-shell")
 (declare-function agent-shell-set-session-mode "agent-shell")
 (declare-function agent-shell-set-session-model "agent-shell")
 (declare-function agent-shell-set-session-thought-level "agent-shell")
@@ -232,7 +227,7 @@ Returns an alist with insertion details or nil otherwise:
       (user-error "Not in a shell viewport buffer"))
     (let ((shell-buffer (agent-shell-viewport--shell-buffer))
           (viewport-buffer (current-buffer))
-          (prompt (string-trim (buffer-string))))
+          (prompt (buffer-string)))
       (when (string-empty-p (string-trim prompt))
         (agent-shell-viewport--initialize)
         (user-error "Nothing to send"))
@@ -307,8 +302,8 @@ Optionally set its PROMPT and RESPONSE."
          prompt)))
     (when response
       (insert response))
-    (let ((inhibit-read-only t))
-      (markdown-overlays-put))))
+    ;; TODO: Render prompt markdown?
+    ))
 
 (defun agent-shell-viewport--ensure-buffer ()
   "Ensure current buffer is a viewport and err otherwise."
@@ -324,12 +319,11 @@ Optionally set its PROMPT and RESPONSE."
                            (point-min)
                          (next-single-property-change (point-min) 'agent-shell-viewport-prompt)))
                 (found (get-text-property start 'agent-shell-viewport-prompt)))
-      (string-trim
-       (buffer-substring-no-properties
-        start
-        (or (next-single-property-change
-             start 'agent-shell-viewport-prompt)
-            (point-max)))))))
+      (buffer-substring-no-properties
+       start
+       (or (next-single-property-change
+            start 'agent-shell-viewport-prompt)
+           (point-max))))))
 
 (defun agent-shell-viewport--response ()
   "Return the buffer response."
@@ -844,7 +838,7 @@ buffer from the snapshot and switch to edit mode."
                                       (comint-next-prompt 1)
                                       (= orig-line (point))))
                               (error "No next page")))
-                          (agent-shell--next-command-and-response backwards))))
+                          (shell-maker-next-command-and-response backwards :trimmed nil))))
         (agent-shell-viewport--initialize
          :prompt (car next) :response (cdr next))
         (goto-char (if start-at-top
