@@ -777,6 +777,53 @@ bar
         (should (equal (map-elt (map-elt data :usage) :total-tokens)
                        1500))))))
 
+(ert-deftest agent-shell--send-command-preserves-viewport-edit-draft-test ()
+  "Sending a command must not discard an in-progress viewport edit draft.
+
+When a queued request is processed while the user is composing a
+message in the viewport edit buffer, `agent-shell--send-command'
+switches the viewport to view mode and re-initializes (erasing)
+the buffer.  The draft must be saved to the compose snapshot so
+it can be restored when the user returns to edit mode."
+  (let ((agent-shell-header-style 'graphical)
+        (agent-shell-show-busy-indicator nil)
+        (agent-shell--state (list (cons :buffer (current-buffer))
+                                  (cons :event-subscriptions nil)
+                                  (cons :client 'test-client)
+                                  (cons :session (list (cons :id "test-session")
+                                                       (cons :title "a title")))
+                                  (cons :last-entry-type nil)
+                                  (cons :tool-calls nil)
+                                  (cons :idle-timer nil))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--append-transcript)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--set-session-title)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell-viewport--update-header)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell-viewport--position)
+               (lambda (&rest _) nil)))
+      (with-temp-buffer
+        (let ((viewport-buffer (current-buffer)))
+          (agent-shell-viewport-edit-mode)
+          (insert "my important draft")
+          (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer)))
+            (agent-shell--send-command
+             :prompt "queued prompt"
+             :shell-buffer (current-buffer)))
+          ;; The buffer now shows the submitted prompt in view mode,
+          ;; and the in-progress draft was wiped from the buffer...
+          (should-not (string-match-p "my important draft" (buffer-string)))
+          ;; ...but the draft survived in the compose snapshot.
+          (should agent-shell-viewport--compose-snapshot)
+          (should (equal (map-elt agent-shell-viewport--compose-snapshot :content)
+                         "my important draft")))))))
+
 (ert-deftest agent-shell--format-diff-as-text-test ()
   "Test `agent-shell--format-diff-as-text' function."
   ;; Test nil input

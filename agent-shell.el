@@ -6110,6 +6110,16 @@ Each marked span is replaced by its `agent-shell-region-text' value."
                                   :shell-buffer shell-buffer
                                   :existing-only t)))
       (with-current-buffer viewport-buffer
+        ;; When a command is sent (e.g. a queued request executing)
+        ;; while the user is composing in the viewport edit buffer,
+        ;; preserve the draft so it can be restored on the next return
+        ;; to edit mode instead of being wiped by the view-mode switch.
+        (when (and (derived-mode-p 'agent-shell-viewport-edit-mode)
+                   (not (string-empty-p (string-trim (buffer-string))))
+                   (not agent-shell-viewport--compose-snapshot))
+          (setq agent-shell-viewport--compose-snapshot
+                `((:content . ,(buffer-string))
+                  (:location . ,(point)))))
         (agent-shell-viewport-view-mode)
         (agent-shell-viewport--initialize
          :prompt  prompt)))
