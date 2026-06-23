@@ -668,6 +668,67 @@ bar
    3: 
    4: bar"))))
 
+(ert-deftest agent-shell--get-region-context-strips-source-properties ()
+  "Region context must not carry text properties from the source buffer.
+
+A markdown-mode source buffer fonts emphasis markup (e.g. underscores)
+with `invisible' and `face' properties.  When a single-line region is
+grabbed for the file-link preview, those foreign properties must not
+leak into the context, otherwise the compose buffer renders the text
+with the source mode's styling (underscores hidden, inner text italic)
+instead of as literal text."
+  (let* ((temp-file (make-temp-file "agent-shell-region" nil ".txt"))
+         (default-directory (file-name-directory temp-file)))
+    (unwind-protect
+        (progn
+          (with-temp-file temp-file
+            (insert "_hello_world_"))
+          (with-current-buffer (find-file-noselect temp-file)
+            ;; Simulate markdown-mode font-lock properties on the
+            ;; underscores, as a real markdown/poly-markdown buffer
+            ;; would carry.
+            (put-text-property (point-min) (point-max)
+                               'face 'markdown-markup-face)
+            (goto-char (point-min))
+            (while (search-forward "_" nil t)
+              (put-text-property (1- (point)) (point)
+                                 'invisible 'markdown-markup))
+            (goto-char (point-min))
+            (set-mark (point-max))
+            (activate-mark)
+            (let ((ctx (agent-shell--get-region-context :deactivate t)))
+              (should-not (text-property-any 0 (length ctx)
+                                             'invisible 'markdown-markup ctx))
+              (should-not (text-property-any 0 (length ctx)
+                                             'face 'markdown-markup-face ctx)))))
+      (when (get-file-buffer temp-file)
+        (with-current-buffer (get-file-buffer temp-file)
+          (set-buffer-modified-p nil)))
+      (ignore-errors (delete-file temp-file)))))
+
+(ert-deftest agent-shell--get-numbered-region-strips-source-properties ()
+  "Numbered region preview must not carry source-buffer text properties.
+
+A multi-line region spanning lines that carry foreign properties (e.g.
+markdown-mode's `invisible' on emphasis markup) must come back clean so
+the compose buffer shows literal source text, not the source mode's
+rendering."
+  (with-temp-buffer
+    (insert "_hello_
+_world_")
+    (put-text-property (point-min) (point-max) 'face 'markdown-markup-face)
+    (goto-char (point-min))
+    (while (search-forward "_" nil t)
+      (put-text-property (1- (point)) (point) 'invisible 'markdown-markup))
+    (let ((result (agent-shell--get-numbered-region
+                   :buffer (current-buffer)
+                   :from (point-min)
+                   :to (point-max))))
+      (should-not (text-property-any 0 (length result)
+                                     'invisible 'markdown-markup result))
+      (should-not (text-property-any 0 (length result)
+                                     'face 'markdown-markup-face result)))))
+
 (ert-deftest agent-shell--expand-truncated-regions-test ()
   "Test `agent-shell--expand-truncated-regions' substitutes marked spans for their full text."
   ;; No marked regions: prompt unchanged.
