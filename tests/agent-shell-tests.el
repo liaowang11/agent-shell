@@ -387,6 +387,50 @@
 
       (delete-file temp-file))))
 
+(ert-deftest agent-shell--content-block-to-markdown-test ()
+  "Test `agent-shell--content-block-to-markdown'.
+
+Agent `session/update' content blocks may be text OR image (a content block
+whose `type' is \"image\", e.g. an agent returning a screenshot, with a file
+`uri' and/or base64 `data').  The render path historically extracted only
+`(content text)', silently dropping image blocks.  This helper makes
+extraction image-aware so images flow into the existing markdown
+image-rendering path as `![alt](uri)'."
+  ;; Text block -> its text, unchanged.
+  (should (equal (agent-shell--content-block-to-markdown
+                  '((type . "text") (text . "hello world")))
+                 "hello world"))
+
+  ;; Image block with a file URI -> a markdown image referencing that URI,
+  ;; so `agent-shell--render-markdown :render-images t' renders it inline.
+  (should (equal (agent-shell--content-block-to-markdown
+                  '((type . "image")
+                    (mimeType . "image/png")
+                    (uri . "file:///tmp/shot.png")))
+                 "\n\n![image](file:///tmp/shot.png)\n\n"))
+
+  ;; Image block with an explicit alt/name is honored in the alt text.
+  (should (equal (agent-shell--content-block-to-markdown
+                  '((type . "image")
+                    (mimeType . "image/png")
+                    (name . "chart")
+                    (uri . "file:///tmp/chart.png")))
+                 "\n\n![chart](file:///tmp/chart.png)\n\n"))
+
+  ;; THE BUG: an image block must NOT extract to nil/empty -- that is the
+  ;; silent drop. Any non-empty rendering is acceptable here.
+  (should-not (string-empty-p
+               (or (agent-shell--content-block-to-markdown
+                    '((type . "image")
+                      (mimeType . "image/png")
+                      (uri . "file:///tmp/x.png")))
+                   "")))
+
+  ;; Unknown block type with no text -> empty string (graceful, not error).
+  (should (equal (agent-shell--content-block-to-markdown
+                  '((type . "audio") (mimeType . "audio/wav")))
+                 "")))
+
 (ert-deftest agent-shell--collect-attached-files-test ()
   "Test agent-shell--collect-attached-files function."
   ;; Test with empty list

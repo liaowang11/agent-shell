@@ -1911,20 +1911,21 @@ pretty-printed JSON inside a json fence."
            ;; below the transcript's ## section headers.  Applied
            ;; per-chunk: if a header is split across chunks it may
            ;; not be indented (graceful degradation).
-           (agent-shell--append-transcript
-            :text (agent-shell--indent-markdown-headers
-                   (map-nested-elt acp-notification '(params update content text)))
-            :file-path agent-shell--transcript-file)
-           (agent-shell--update-fragment
-            :state state
-            :block-id (format "%s-agent_message_chunk"
-                              (map-elt state :chunked-group-count))
-            :body (map-nested-elt acp-notification '(params update content text))
-            :create-new (not (equal (map-elt state :last-entry-type)
-                                    "agent_message_chunk"))
-            :append t
-            :navigation 'never
-            :render-body-images t)
+           (let ((chunk-md (agent-shell--content-block-to-markdown
+                            (map-nested-elt acp-notification '(params update content)))))
+             (agent-shell--append-transcript
+              :text (agent-shell--indent-markdown-headers chunk-md)
+              :file-path agent-shell--transcript-file)
+             (agent-shell--update-fragment
+              :state state
+              :block-id (format "%s-agent_message_chunk"
+                                (map-elt state :chunked-group-count))
+              :body chunk-md
+              :create-new (not (equal (map-elt state :last-entry-type)
+                                      "agent_message_chunk"))
+              :append t
+              :navigation 'never
+              :render-body-images t))
            (map-put! state :last-entry-type "agent_message_chunk"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "user_message_chunk")
            ;; Only handle user_message_chunks when there's an active session/load
@@ -5819,6 +5820,33 @@ If FILE-PATH is not an image, returns nil."
               (is-image (string-prefix-p "image/" mime-type))
               (type-supported (image-supported-file-p file-path)))
     (create-image file-path nil nil :max-width max-width)))
+
+(defun agent-shell--content-block-to-markdown (content-block)
+  "Return markdown for a `session/update' CONTENT-BLOCK.
+
+Text blocks return their text.  Image blocks (a content block whose `type'
+is \"image\", e.g. an agent returning a screenshot) return a markdown image
+so the existing image-rendering path (`agent-shell--render-markdown' with
+:render-images t) displays them inline rather than dropping them.  An image
+block with no file uri returns an empty string.
+
+Examples:
+
+  (agent-shell--content-block-to-markdown
+   \\='((type . \"text\") (text . \"hello\")))
+  => \"hello\"
+
+  (agent-shell--content-block-to-markdown
+   \\='((type . \"image\") (uri . \"file:///tmp/shot.png\")))
+  => \"\\n\\n![image](file:///tmp/shot.png)\\n\\n\""
+  (cond
+   ((not (equal (map-elt content-block 'type) "image"))
+    (or (map-elt content-block 'text) ""))
+   ((map-elt content-block 'uri)
+    (format "\n\n![%s](%s)\n\n"
+            (or (map-elt content-block 'name) "image")
+            (map-elt content-block 'uri)))
+   (t "")))
 
 (cl-defun agent-shell--collect-attached-files (content-blocks)
   "Collect attached resource uris from CONTENT-BLOCKS."
