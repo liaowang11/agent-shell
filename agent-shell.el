@@ -934,6 +934,29 @@ With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an
    (t
     (agent-shell--dwim))))
 
+(defun agent-shell--display-and-insert-context (shell-buffer text)
+  "Display SHELL-BUFFER and insert TEXT into it.
+
+When SHELL-BUFFER uses the `prompt' session strategy and has no session id
+yet, defer displaying and inserting until the `session-selected' event;
+otherwise do so immediately.  TEXT may be nil, in which case nothing is
+inserted."
+  (if (and (eq (buffer-local-value 'agent-shell-session-strategy shell-buffer) 'prompt)
+           (not (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                                '(:session :id))))
+      (agent-shell-subscribe-to
+       :shell-buffer shell-buffer
+       :event 'session-selected
+       :on-event (lambda (_event)
+                   (agent-shell--display-buffer shell-buffer)
+                   (when text
+                     (agent-shell--insert-to-shell-buffer :text text
+                                                          :shell-buffer shell-buffer))))
+    (agent-shell--display-buffer shell-buffer)
+    (when text
+      (agent-shell--insert-to-shell-buffer :text text
+                                           :shell-buffer shell-buffer))))
+
 (cl-defun agent-shell--dwim (&key config new-shell switch-to-shell)
   "Start or reuse an agent shell with DWIM behavior.
 
@@ -989,11 +1012,16 @@ handles viewport mode detection, existing shell reuse, and project context."
                (agent-shell--insert-to-shell-buffer :text text
                                                     :shell-buffer shell-buffer))))
           (new-shell
-           (agent-shell-start :config (or config
-                                          (agent-shell--resolve-preferred-config)
-                                          (agent-shell-select-config
-                                           :prompt "Start new agent: ")
-                                          (error "No agent config found"))))
+           (let* ((shell-buffer (agent-shell--start
+                                 :config (or config
+                                             (agent-shell--resolve-preferred-config)
+                                             (agent-shell-select-config
+                                              :prompt "Start new agent: ")
+                                             (error "No agent config found"))
+                                 :no-focus t
+                                 :new-session t))
+                  (text (agent-shell--context :shell-buffer shell-buffer)))
+             (agent-shell--display-and-insert-context shell-buffer text)))
           (t
            (if (derived-mode-p 'agent-shell-mode)
                (let* ((shell-buffer (agent-shell--shell-buffer :no-create t))
@@ -1004,22 +1032,7 @@ handles viewport mode detection, existing shell reuse, and project context."
                                                         :shell-buffer shell-buffer)))
              (let* ((shell-buffer (agent-shell--shell-buffer))
                     (text (agent-shell--context :shell-buffer shell-buffer)))
-               (if (and (eq (buffer-local-value 'agent-shell-session-strategy shell-buffer) 'prompt)
-                        (not (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                                             '(:session :id))))
-                   ;; Defer viewport display until session is selected.
-                   (agent-shell-subscribe-to
-                    :shell-buffer shell-buffer
-                    :event 'session-selected
-                    :on-event (lambda (_event)
-                                (agent-shell--display-buffer shell-buffer)
-                                (when text
-                                  (agent-shell--insert-to-shell-buffer :text text
-                                                                       :shell-buffer shell-buffer))))
-                 (agent-shell--display-buffer shell-buffer)
-                 (when text
-                   (agent-shell--insert-to-shell-buffer :text text
-                                                        :shell-buffer shell-buffer)))))))))
+               (agent-shell--display-and-insert-context shell-buffer text)))))))
 
 ;;;###autoload
 (defun agent-shell-toggle ()
@@ -7281,22 +7294,22 @@ With \\[universal-argument] prefix ARG, force start a new shell.
 
 With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an existing shell."
   (interactive "P")
-  (let* ((shell-buffer
-          (cond
-           ((equal arg '(16))
-            (agent-shell--dwim :switch-to-shell t)
-            (agent-shell--shell-buffer))
-           ((equal arg '(4))
-            (agent-shell--dwim :new-shell t)
-            (agent-shell--shell-buffer))
-           (t
-            (agent-shell--shell-buffer))))
-         (text (agent-shell--context :shell-buffer shell-buffer)))
-    (if (with-current-buffer shell-buffer (shell-maker-busy))
-        (with-current-buffer shell-buffer
-          (agent-shell-queue-request
-           (agent-shell--read-queue-prompt :initial (concat text "\n\n"))))
-      (agent-shell-insert :text text :shell-buffer shell-buffer))))
+  (cond
+   ;; `agent-shell--dwim' already carries the context to the chosen shell
+   ;; (deferring until the session is selected when needed), so let it own
+   ;; the send rather than inserting a second time here.
+   ((equal arg '(16))
+    (agent-shell--dwim :switch-to-shell t))
+   ((equal arg '(4))
+    (agent-shell--dwim :new-shell t))
+   (t
+    (let* ((shell-buffer (agent-shell--shell-buffer))
+           (text (agent-shell--context :shell-buffer shell-buffer)))
+      (if (with-current-buffer shell-buffer (shell-maker-busy))
+          (with-current-buffer shell-buffer
+            (agent-shell-queue-request
+             (agent-shell--read-queue-prompt :initial (concat text "\n\n"))))
+        (agent-shell-insert :text text :shell-buffer shell-buffer))))))
 
 (cl-defun agent-shell-queue-request-dwim (&optional arg)
   "Queue a request with DWIM context for an existing shell.

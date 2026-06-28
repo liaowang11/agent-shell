@@ -1940,6 +1940,67 @@ remaining subscribers nor propagate out of `agent-shell--emit-event'."
                                "context from source"))))
           (kill-buffer shell-buffer))))))
 
+(ert-deftest agent-shell-send-dwim-with-prefix-appends-context-once-test ()
+  "Test `agent-shell-send-dwim' with a prefix arg appends context once.
+
+With \\[universal-argument] \\[universal-argument], the command picks an
+existing shell via `agent-shell--dwim' and must append the DWIM context to
+the viewport exactly once.  `agent-shell--dwim' already performs the append,
+so the command must not append a second time."
+  (let ((agent-shell-prefer-viewport-interaction t))
+    (with-temp-buffer
+      (let ((source-buffer (current-buffer))
+            (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+            (appends nil))
+        (unwind-protect
+            (progn
+              (with-current-buffer shell-buffer
+                (setq-local agent-shell-session-strategy 'reuse)
+                (setq-local agent-shell--state
+                            `((:buffer . ,shell-buffer)
+                              (:session . ((:id . "session-1"))))))
+              (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                         (lambda (&rest _) shell-buffer))
+                        ((symbol-function 'agent-shell--read-shell-buffer)
+                         (lambda (&rest _) shell-buffer))
+                        ((symbol-function 'agent-shell--context)
+                         (lambda (&key shell-buffer)
+                           (ignore shell-buffer)
+                           "context from source"))
+                        ((symbol-function 'shell-maker-busy)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'agent-shell-viewport--show-buffer)
+                         (lambda (&rest args)
+                           (push (plist-get args :append) appends))))
+                (with-current-buffer source-buffer
+                  (agent-shell-send-dwim '(16)))
+                (should (equal appends '("context from source")))))
+          (kill-buffer shell-buffer))))))
+
+(ert-deftest agent-shell-send-dwim-without-prefix-appends-context-once-test ()
+  "Test `agent-shell-send-dwim' without a prefix arg appends context once."
+  (let ((agent-shell-prefer-viewport-interaction t))
+    (with-temp-buffer
+      (let ((source-buffer (current-buffer))
+            (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+            (appends nil))
+        (unwind-protect
+            (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell--context)
+                       (lambda (&key shell-buffer)
+                         (ignore shell-buffer)
+                         "context from source"))
+                      ((symbol-function 'shell-maker-busy)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--show-buffer)
+                       (lambda (&rest args)
+                         (push (plist-get args :append) appends))))
+              (with-current-buffer source-buffer
+                (agent-shell-send-dwim))
+              (should (equal appends '("context from source"))))
+          (kill-buffer shell-buffer))))))
+
 (ert-deftest agent-shell-queue-request-dwim-prefills-context-test ()
   "Test `agent-shell-queue-request-dwim' prefills context before queueing."
   (with-temp-buffer
