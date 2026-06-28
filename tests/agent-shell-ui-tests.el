@@ -323,6 +323,62 @@ navigatable block, not on the non-navigatable block's own start."
             (should (equal (agent-shell-ui-backward-block) first-start))))
       (kill-buffer buf))))
 
+;;; label growth vs body replacement
+
+(defun agent-shell-ui-tests--section-text (qualified-id section)
+  "Return SECTION's text for fragment QUALIFIED-ID (no properties)."
+  (save-mark-and-excursion
+    (when-let* ((start (agent-shell-ui-tests--fragment-start qualified-id)))
+      (goto-char start)
+      (when-let* ((m (text-property-search-forward
+                      'agent-shell-ui-section section t t)))
+        (string-trim
+         (buffer-substring-no-properties (prop-match-beginning m)
+                                         (prop-match-end m)))))))
+
+(defun agent-shell-ui-tests--body-text (qualified-id)
+  "Return the body-section text of fragment QUALIFIED-ID (no properties)."
+  (agent-shell-ui-tests--section-text qualified-id 'body))
+
+(ert-deftest agent-shell-ui-label-growth-does-not-strand-body-tail-test ()
+  "A same-update label change must not strand the previous body's tail.
+
+`agent-shell-ui-update-fragment' replaces the label before the body.
+Replacing a label whose length differs shifts every buffer position
+after it — including the body — so the body range must be derived
+*after* the label edit.  Deriving it before (the regression) makes
+`--replace-body' delete the wrong span and leave the old body's tail
+behind, which compounds across streaming tool-call updates and breaks
+later markdown fence pairing.  The stale range also reaches into the
+just-grown label, so `--replace-body' eats the label's tail too — the
+header renders a mid-stream truncation of the command.  See pi-acp
+`run' rendering."
+  (let ((buf (agent-shell-ui-tests--make-buffer-with-fragments
+              '(((:namespace-id . "ns") (:block-id . "1")
+                 (:label-left . "run") (:label-right . "short")
+                 (:body . "PREVIOUS-BODY-CONTENT") (:expanded . t))))))
+    (unwind-protect
+        (with-current-buffer buf
+          ;; Grow the label-right and replace the body in one update,
+          ;; the way a streaming tool call does as its title lengthens.
+          (agent-shell-ui-update-fragment
+           (agent-shell-ui-make-fragment-model
+            :namespace-id "ns" :block-id "1"
+            :label-right "a-considerably-longer-label-right-than-before"
+            :body "REPLACEMENT-BODY")
+           :append nil :navigation 'always)
+          ;; Body is exactly the replacement, with no stranded old tail.
+          (should (equal (agent-shell-ui-tests--body-text "ns-1")
+                         "REPLACEMENT-BODY"))
+          (should-not (string-match-p "PREVIOUS-BODY"
+                                      (buffer-substring-no-properties
+                                       (point-min) (point-max))))
+          ;; Header (label-right) survives intact — not chopped by the
+          ;; body replacement landing inside it.
+          (should (equal (agent-shell-ui-tests--section-text "ns-1" 'label-right)
+                         "a-considerably-longer-label-right-than-before")))
+      (kill-buffer buf))))
+
 ;;; provide
 
 (provide 'agent-shell-ui-tests)

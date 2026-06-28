@@ -500,6 +500,48 @@ image-rendering path as `![alt](uri)'."
                     (data . "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")))
                  "\n\n![image](file:///tmp/shot.png)\n\n")))
 
+(ert-deftest agent-shell--tool-call-content-text-test ()
+  "Test `agent-shell--tool-call-content-text'.
+
+Tool call CONTENT items wrap a content block under `content'.  Each block
+is rendered via `agent-shell--content-block-to-markdown' so image,
+resource_link, and embedded resource blocks render richly rather than
+being dropped when they carry no `text'."
+  ;; A wrapped text block -> its text.
+  (should (equal (agent-shell--tool-call-content-text
+                  [((type . "content")
+                    (content . ((type . "text") (text . "hello"))))])
+                 "hello"))
+
+  ;; A wrapped image block -> a markdown image, not a silent drop.
+  (should (equal (agent-shell--tool-call-content-text
+                  [((type . "content")
+                    (content . ((type . "image")
+                                (mimeType . "image/png")
+                                (uri . "file:///tmp/shot.png"))))])
+                 "\n\n![image](file:///tmp/shot.png)\n\n"))
+
+  ;; A wrapped resource_link -> a clickable markdown link.
+  (should (equal (agent-shell--tool-call-content-text
+                  [((type . "content")
+                    (content . ((type . "resource_link")
+                                (name . "report.pdf")
+                                (uri . "file:///tmp/report.pdf"))))])
+                 "\n\n[report.pdf](file:///tmp/report.pdf)\n\n"))
+
+  ;; A bare text item (no `content' wrapper) still contributes its text.
+  (should (equal (agent-shell--tool-call-content-text
+                  [((type . "text") (text . "bare"))])
+                 "bare"))
+
+  ;; Multiple items are joined with blank lines.
+  (should (equal (agent-shell--tool-call-content-text
+                  [((type . "content")
+                    (content . ((type . "text") (text . "a"))))
+                   ((type . "content")
+                    (content . ((type . "text") (text . "b"))))])
+                 "a\n\nb")))
+
 (ert-deftest agent-shell--image-data-to-file-test ()
   "Test `agent-shell--image-data-to-file'.
 
@@ -603,6 +645,352 @@ block -- covering the dispatch path, not just the helper in isolation."
                                       (mimeType . "image/png")
                                       (uri . "file:///tmp/x.png"))))))
       (should (equal rendered "\n\n![image](file:///tmp/x.png)\n\n")))))
+
+(ert-deftest agent-shell--on-notification-tool-call-display-terminal-renders-title-command-test ()
+  "Display-only terminal execute calls should render the full title in the body.
+
+Agents like pi-acp send execute commands in `title' and attach terminal output
+via terminal content plus `_meta', without populating `rawInput.command'.  The
+header should stay one-line while the body shows the full multi-line command."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)))
+        (rendered-body nil)
+        (rendered-title nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (equal (plist-get args :block-id) "tc1")
+                   (setq rendered-body (plist-get args :body))
+                   (setq rendered-title (plist-get args :label-right))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "cd /tmp/project\ngit status")
+           (status . "pending")
+           (kind . "execute")
+           (content . [((type . "terminal")
+                        (terminalId . "tc1"))])))))
+      (should (string-match-p
+               (regexp-quote "```console\ncd /tmp/project\ngit status\n```")
+               rendered-body))
+      (should (equal (substring-no-properties rendered-title)
+                     "cd /tmp/project")))))
+
+(ert-deftest agent-shell--on-notification-tool-call-display-terminal-output-accumulates-test ()
+  "Display-only terminal output deltas should append across updates."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)))
+        (rendered-body nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (equal (plist-get args :block-id) "tc1")
+                   (setq rendered-body (plist-get args :body))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "printf 'hi'\npwd")
+           (status . "pending")
+           (kind . "execute")
+           (content . [((type . "terminal")
+                        (terminalId . "tc1"))])))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call_update")
+           (toolCallId . "tc1")
+           (_meta
+            (terminal_output
+             (terminal_id . "tc1")
+             (data . "first line\n")))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call_update")
+           (toolCallId . "tc1")
+           (_meta
+            (terminal_output
+             (terminal_id . "tc1")
+             (data . "second line\n")))))))
+      (should (string-match-p (regexp-quote "first line\nsecond line") rendered-body))
+      (should (equal (map-nested-elt state '(:tool-calls "tc1" :terminal-output))
+                     "first line\nsecond line\n")))))
+
+(ert-deftest agent-shell--on-notification-tool-call-display-terminal-preserves-output-on-sparse-update-test ()
+  "Sparse updates should keep already-seen display-terminal output visible."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)))
+        (rendered-body nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--delete-fragment)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (equal (plist-get args :block-id) "tc1")
+                   (setq rendered-body (plist-get args :body))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "printf 'hi'")
+           (status . "pending")
+           (kind . "execute")
+           (content . [((type . "terminal")
+                        (terminalId . "tc1"))])))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call_update")
+           (toolCallId . "tc1")
+           (_meta
+            (terminal_output
+             (terminal_id . "tc1")
+             (data . "hello from terminal\n")))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call_update")
+           (toolCallId . "tc1")
+           (status . "completed")))))
+      (should (string-match-p (regexp-quote "hello from terminal") rendered-body)))))
+
+(ert-deftest agent-shell--on-notification-tool-call-display-terminal-exit-fails-status-test ()
+  "Non-zero display-terminal exits should mark the tool call as failed."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil))))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _args) nil)))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "false")
+           (status . "pending")
+           (kind . "execute")
+           (content . [((type . "terminal")
+                        (terminalId . "tc1"))])))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call_update")
+           (toolCallId . "tc1")
+           (_meta
+            (terminal_exit
+             (terminal_id . "tc1")
+             (exit_code . 1)))))))
+      (should (equal (map-nested-elt state '(:tool-calls "tc1" :status))
+                     "failed")))))
+
+(ert-deftest agent-shell--on-notification-tool-call-rawinput-command-still-renders-test ()
+  "Execute calls with `rawInput.command' should keep rendering as before."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)))
+        (rendered-body nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (equal (plist-get args :block-id) "tc1")
+                   (setq rendered-body (plist-get args :body))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "Bash")
+           (status . "pending")
+           (kind . "execute")
+           (rawInput
+            (command . "printf 'hello'\npwd"))))))
+      (should (string-match-p
+               (regexp-quote "```console\nprintf 'hello'\npwd\n```")
+               rendered-body)))))
+
+(ert-deftest agent-shell--on-notification-read-tool-call-shows-path-test ()
+  "Read calls with a generic title should show the path in the header.
+
+Agents like pi-acp send `read' calls with `title' \"read\" and the file path
+only in `rawInput.path' / `locations'.  The header must surface the path rather
+than repeating the kind as \"read  read\"."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)))
+        (rendered-title nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (equal (plist-get args :block-id) "tc1")
+                   (setq rendered-title (plist-get args :label-right))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "read")
+           (status . "pending")
+           (kind . "read")
+           (locations . [((path . "/tmp/project/modules/darwin/common.nix"))])
+           (rawInput (path . "modules/darwin/common.nix"))))))
+      (setq rendered-title (substring-no-properties (or rendered-title "")))
+      ;; The path is shown, ...
+      (should (string-match-p (regexp-quote "modules/darwin/common.nix")
+                              rendered-title))
+      ;; ... and the redundant bare "read" title is not repeated.
+      (should-not (equal (string-trim rendered-title) "read")))))
+
+(ert-deftest agent-shell--format-console-block-escapes-nested-fences-test ()
+  "A console block must outlive any ``` fences inside its own content.
+
+Command output that contains its own fenced block (eg. `cat'ing a markdown
+file) would otherwise close the wrapper early and leak literal fences."
+  ;; Plain text keeps the canonical 3-backtick fence.
+  (let ((block (agent-shell--format-console-block "plain output")))
+    (should (string-prefix-p "```console\n" block))
+    (should-not (string-prefix-p "````" block)))
+  ;; Content with a ``` run gets a longer (4-backtick) fence.
+  (let ((block (agent-shell--format-console-block "before\n```sh\nx\n```\nafter")))
+    (should (string-prefix-p "````console\n" block))
+    (should (string-suffix-p "\n````" block))))
+
+(ert-deftest agent-shell--on-notification-read-body-renders-verbatim-test ()
+  "Read file content must render verbatim, not as markdown.
+
+A read body is raw file content; markdown-significant syntax (#, ```, *)
+must survive rendering instead of being interpreted as headers/code/bold."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)))
+        (rendered-body nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (equal (plist-get args :block-id) "tc1")
+                   (setq rendered-body (plist-get args :body))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "read")
+           (status . "completed")
+           (kind . "read")
+           (rawInput (path . "notes.md"))
+           (content . [((type . "content")
+                        (content (type . "text")
+                                 (text . "# Heading\ntext\n```sh\ncode\n```\n")))])))))
+      ;; The body wraps the content in a fence ...
+      (should (string-match-p (rx bos (* (any " \n")) (>= 3 "`")) rendered-body))
+      ;; ... long enough to contain the inner ``` run ...
+      (should (string-match-p "````" rendered-body))
+      ;; ... and rendering it preserves the literal '#' (not a header).
+      (with-temp-buffer
+        (insert rendered-body)
+        (agent-shell-markdown-replace-markup :render-images nil :highlight-blocks t)
+        (should (string-match-p "# Heading"
+                                (buffer-substring-no-properties (point-min) (point-max))))))))
 
 (ert-deftest agent-shell--collect-attached-files-test ()
   "Test agent-shell--collect-attached-files function."

@@ -1798,6 +1798,134 @@ COMMAND, when present, may be a shell command string or an argv vector."
         ((null command) nil)
         (t (error "Unexpected tool-call command type: %S" (type-of command)))))
 
+(defun agent-shell--tool-call-content-items (content)
+  "Return tool call CONTENT as a list of items.
+
+CONTENT may arrive as a vector, list, or nil."
+  (cond ((vectorp content) (append content nil))
+        ((listp content) content)
+        (t nil)))
+
+(defun agent-shell--display-terminal-tool-call-p (&optional content meta)
+  "Return non-nil when CONTENT/META describes a display-only terminal.
+
+Some ACP agents render execute calls as display-only terminals: the full
+command lives in `title', `content' contains a terminal item, and streamed
+output arrives through `_meta.terminal_output' rather than `rawInput.command'."
+  (or (seq-some (lambda (item)
+                  (equal (map-elt item 'type) "terminal"))
+                (agent-shell--tool-call-content-items content))
+      (map-elt meta 'terminal_info)
+      (map-elt meta 'terminal_output)
+      (map-elt meta 'terminal_exit)))
+
+(defun agent-shell--tool-call-content-text (content)
+  "Render user-visible markdown from tool call CONTENT items.
+
+Each item's inner content block is rendered via
+`agent-shell--content-block-to-markdown', so image, resource_link, and
+embedded resource blocks render richly rather than being dropped when
+they carry no `text'."
+  (mapconcat #'identity
+             (seq-filter #'identity
+                         (mapcar (lambda (item)
+                                   (pcase (map-elt item 'type)
+                                     ("content" (when-let* ((block (map-elt item 'content)))
+                                                  (agent-shell--content-block-to-markdown block)))
+                                     ("text" (map-elt item 'text))
+                                     (_ nil)))
+                                 (agent-shell--tool-call-content-items content)))
+             "\n\n"))
+
+(defun agent-shell--format-console-block (text &optional lang)
+  "Return TEXT fenced as a code block tagged LANG, or nil when TEXT is empty.
+
+LANG defaults to \"console\".  The fence is made longer than any backtick
+run in TEXT so content that contains its own ``` fences (eg. command output
+or a file read that includes fenced code) cannot close the block early and
+leak literal fences."
+  (when (and (stringp text)
+             (not (string-empty-p text)))
+    (let ((fence (make-string (max 3 (1+ (agent-shell--longest-backtick-run text))) ?`)))
+      (concat fence (or lang "console") "\n"
+              text
+              (unless (string-suffix-p "\n" text)
+                "\n")
+              fence))))
+
+(defun agent-shell--join-non-empty-sections (&rest sections)
+  "Join non-empty SECTIONS with blank lines.
+
+Whitespace-only sections are discarded."
+  (mapconcat #'identity
+             (seq-filter (lambda (section)
+                           (and (stringp section)
+                                (not (string-empty-p (string-trim section)))))
+                         sections)
+             "\n\n"))
+
+(defun agent-shell--tool-call-command-for-body (tool-call)
+  "Return the command to display in TOOL-CALL's body, if any.
+
+Prefer the canonical `:command' value sourced from `rawInput.command'.  For
+display-only terminals, fall back to the full `:title' when no command was
+sent separately."
+  (or (map-elt tool-call :command)
+      (when (and (equal (map-elt tool-call :kind) "execute")
+                 (map-elt tool-call :display-terminal-p))
+        (when-let* ((title (map-elt tool-call :title))
+                    ((not (string-empty-p title))))
+          title))))
+
+(defun agent-shell--tool-call-body (tool-call)
+  "Build the rendered body for TOOL-CALL from saved state."
+  (let* ((saved-command (agent-shell--tool-call-command-for-body tool-call))
+         (command-block (agent-shell--format-console-block saved-command))
+         (tool-call-kind (map-elt tool-call :kind))
+         (saved-input (map-elt tool-call :raw-input))
+         (input-block (when (and (member tool-call-kind '(nil "other"))
+                                 saved-input
+                                 (not saved-command))
+                        (agent-shell--format-tool-call-input saved-input)))
+         (terminal-output-block
+          (agent-shell--format-console-block (map-elt tool-call :terminal-output)))
+         (content-text (agent-shell--tool-call-content-text (map-elt tool-call :content)))
+         (diff-text (agent-shell--format-diff-as-text (map-elt tool-call :diff)))
+         (body-text (cond
+                     (diff-text
+                      (agent-shell--join-non-empty-sections
+                       content-text
+                       "╭─────────╮\n│ changes │\n╰─────────╯"
+                       diff-text))
+                     ;; Read returns verbatim file content; fence it so
+                     ;; markdown-significant syntax in the file (#, ```, *)
+                     ;; renders literally instead of as headers/code/bold.
+                     ((and (equal tool-call-kind "read")
+                           content-text
+                           (not (string-empty-p content-text)))
+                      (agent-shell--format-console-block
+                       content-text
+                       (file-name-extension (or (agent-shell--tool-call-path tool-call) ""))))
+                     (t content-text)))
+         (body (agent-shell--join-non-empty-sections
+                (or command-block input-block)
+                terminal-output-block
+                body-text)))
+    (unless (string-empty-p body)
+      body)))
+
+(cl-defun agent-shell--render-tool-call-fragment (&key state tool-call-id)
+  "Render tool call TOOL-CALL-ID from STATE using the saved tool-call data."
+  (let* ((tool-call-labels (agent-shell-make-tool-call-label state tool-call-id))
+         (tool-call (map-nested-elt state `(:tool-calls ,tool-call-id))))
+    (agent-shell--update-fragment
+     :state state
+     :block-id tool-call-id
+     :label-left (map-elt tool-call-labels :status)
+     :label-right (map-elt tool-call-labels :title)
+     :body (agent-shell--tool-call-body tool-call)
+     :expanded agent-shell-tool-use-expand-by-default)))
+
 (defun agent-shell--active-requests-p (state)
   "Return non-nil if STATE has in-flight requests awaiting responses."
   (map-elt state :active-requests))
@@ -1954,45 +2082,62 @@ pretty-printed JSON inside a json fence."
             :append t
             :above-last-prompt t))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
-           (agent-shell--save-tool-call
-            state
-            (map-nested-elt acp-notification '(params update toolCallId))
-            (append (list (cons :title (cond
-                                        ((and (string= (map-nested-elt acp-notification '(params update title)) "Skill")
-                                              (map-nested-elt acp-notification '(params update rawInput command)))
-                                         (format "Skill: %s"
-                                                 (agent-shell--tool-call-command-to-string
-                                                  (map-nested-elt acp-notification '(params update rawInput command)))))
-                                        (t
-                                         (map-nested-elt acp-notification '(params update title)))))
-                          (cons :status (map-nested-elt acp-notification '(params update status)))
-                          (cons :kind (map-nested-elt acp-notification '(params update kind)))
-                          (cons :command (agent-shell--tool-call-command-to-string
-                                          (map-nested-elt acp-notification '(params update rawInput command))))
-                          (cons :description (map-nested-elt acp-notification '(params update rawInput description)))
-                          (cons :content (map-nested-elt acp-notification '(params update content)))
-                          (cons :raw-input (map-nested-elt acp-notification '(params update rawInput))))
-                    (when-let* ((diff (agent-shell--make-diff-info
-                                       :acp-tool-call (map-nested-elt acp-notification '(params update)))))
-                      (list (cons :diff diff)))))
+           (let* ((tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
+                  (content (map-nested-elt acp-notification '(params update content)))
+                  (meta (map-nested-elt acp-notification '(params update _meta)))
+                  (display-terminal-p (agent-shell--display-terminal-tool-call-p content meta))
+                  (terminal-output (map-nested-elt acp-notification '(params update _meta terminal_output data)))
+                  (terminal-exit-code (or (map-nested-elt acp-notification '(params update _meta terminal_exit exit_code))
+                                          (map-nested-elt acp-notification '(params update _meta terminal_exit exitCode))))
+                  (terminal-exit-signal (map-nested-elt acp-notification '(params update _meta terminal_exit signal)))
+                  (status (if (and (not (member (map-nested-elt acp-notification '(params update status))
+                                                '("completed" "failed")))
+                                   (or terminal-exit-signal
+                                       (and terminal-exit-code
+                                            (not (equal terminal-exit-code 0)))))
+                              "failed"
+                            (map-nested-elt acp-notification '(params update status)))))
+             (agent-shell--save-tool-call
+              state
+              tool-call-id
+              (append (list (cons :title (cond
+                                          ((and (string= (map-nested-elt acp-notification '(params update title)) "Skill")
+                                                (map-nested-elt acp-notification '(params update rawInput command)))
+                                           (format "Skill: %s"
+                                                   (agent-shell--tool-call-command-to-string
+                                                    (map-nested-elt acp-notification '(params update rawInput command)))))
+                                          (t
+                                           (map-nested-elt acp-notification '(params update title)))))
+                            (cons :status status)
+                            (cons :kind (map-nested-elt acp-notification '(params update kind)))
+                            (cons :command (agent-shell--tool-call-command-to-string
+                                            (map-nested-elt acp-notification '(params update rawInput command))))
+                            (cons :description (map-nested-elt acp-notification '(params update rawInput description)))
+                            (cons :content content)
+                            (cons :raw-input (map-nested-elt acp-notification '(params update rawInput))))
+                      (when display-terminal-p
+                        (list (cons :display-terminal-p t)))
+                      (when terminal-output
+                        (list (cons :terminal-output terminal-output)))
+                      (when (or terminal-exit-code terminal-exit-signal)
+                        (append (when terminal-exit-code
+                                  (list (cons :terminal-exit-code terminal-exit-code)))
+                                (when terminal-exit-signal
+                                  (list (cons :terminal-exit-signal terminal-exit-signal)))))
+                      (when-let* ((diff (agent-shell--make-diff-info
+                                         :acp-tool-call (map-nested-elt acp-notification '(params update)))))
+                        (list (cons :diff diff)))))
            (agent-shell--cancel-idle-timer)
            (agent-shell--emit-event
             :event 'tool-call-update
-            :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
-                        (cons :tool-call (map-nested-elt state (list :tool-calls (map-nested-elt acp-notification '(params update toolCallId)))))))
-           (let ((tool-call-labels (agent-shell-make-tool-call-label
-                                    state (map-nested-elt acp-notification '(params update toolCallId)))))
-             (agent-shell--update-fragment
-              :state state
-              :block-id (map-nested-elt acp-notification '(params update toolCallId))
-              :label-left (map-elt tool-call-labels :status)
-              :label-right (map-elt tool-call-labels :title)
-              :expanded agent-shell-tool-use-expand-by-default)
+            :data (list (cons :tool-call-id tool-call-id)
+                        (cons :tool-call (map-nested-elt state (list :tool-calls tool-call-id)))))
+           (agent-shell--render-tool-call-fragment :state state :tool-call-id tool-call-id)
              ;; Display plan as markdown block if present
              (when (map-nested-elt acp-notification '(params update rawInput plan))
                (agent-shell--update-fragment
                 :state state
-                :block-id (concat (map-nested-elt acp-notification '(params update toolCallId)) "-plan")
+                :block-id (concat tool-call-id "-plan")
                 :label-left (propertize "Proposed plan" 'font-lock-face 'font-lock-doc-markup-face)
                 :body (agent-shell--format-plan (map-nested-elt acp-notification '(params update rawInput plan)))
                 :expanded t)))
@@ -2078,41 +2223,69 @@ pretty-printed JSON inside a json fence."
             :expanded t)
            (map-put! state :last-entry-type "plan"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call_update")
-           ;; Update stored tool call data with new status and content
-           (agent-shell--save-tool-call
-            state
-            (map-nested-elt acp-notification '(params update toolCallId))
-            (append (list (cons :status (map-nested-elt acp-notification '(params update status)))
-                          (cons :content (map-nested-elt acp-notification '(params update content))))
-                    ;; The initial tool_call notification often has a
-                    ;; generic title (eg. "grep", "bash", "Read").
-                    ;; The tool_call_update may have a more descriptive
-                    ;; title (eg. 'grep -i -n "tool" /path/to/file').
-                    ;; Upgrade to the more descriptive title when available.
-                    ;; See https://github.com/xenodium/agent-shell/issues/182
-                    ;; See https://github.com/xenodium/agent-shell/issues/309
-                    (when-let* ((new-title (map-nested-elt acp-notification '(params update title)))
-                                ((not (string-empty-p new-title))))
-                      (list (cons :title new-title)))
-                    (when-let* ((description (agent-shell--tool-call-command-to-string
-                                              (map-nested-elt acp-notification '(params update rawInput description)))))
-                      (list (cons :description description)))
-                    (when-let* ((command (agent-shell--tool-call-command-to-string
-                                          (map-nested-elt acp-notification '(params update rawInput command)))))
-                      (list (cons :command command)))
-                    (when-let* ((raw-input (map-nested-elt acp-notification '(params update rawInput))))
-                      (list (cons :raw-input raw-input)))
-                    (when-let* ((locations (map-nested-elt acp-notification '(params update locations))))
-                      (list (cons :locations locations)))
-                    (when-let* ((diff (agent-shell--make-diff-info
-                                       :acp-tool-call (map-nested-elt acp-notification '(params update)))))
-                      (list (cons :diff diff)))))
+           (let* ((tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
+                  (old-tool-call (map-nested-elt state `(:tool-calls ,tool-call-id)))
+                  (content (map-nested-elt acp-notification '(params update content)))
+                  (meta (map-nested-elt acp-notification '(params update _meta)))
+                  (display-terminal-p (agent-shell--display-terminal-tool-call-p content meta))
+                  (new-terminal-output (map-nested-elt acp-notification '(params update _meta terminal_output data)))
+                  (terminal-output (when new-terminal-output
+                                     (concat (or (map-elt old-tool-call :terminal-output) "")
+                                             new-terminal-output)))
+                  (terminal-exit-code (or (map-nested-elt acp-notification '(params update _meta terminal_exit exit_code))
+                                          (map-nested-elt acp-notification '(params update _meta terminal_exit exitCode))))
+                  (terminal-exit-signal (map-nested-elt acp-notification '(params update _meta terminal_exit signal)))
+                  (status (if (and (not (member (map-nested-elt acp-notification '(params update status))
+                                                '("completed" "failed")))
+                                   (or terminal-exit-signal
+                                       (and terminal-exit-code
+                                            (not (equal terminal-exit-code 0)))))
+                              "failed"
+                            (or (map-nested-elt acp-notification '(params update status))
+                                (map-elt old-tool-call :status)))))
+             ;; Update stored tool call data with new status and content.
+             (agent-shell--save-tool-call
+              state
+              tool-call-id
+              (append (list (cons :status status)
+                            (cons :content content))
+                      ;; The initial tool_call notification often has a
+                      ;; generic title (eg. "grep", "bash", "Read").
+                      ;; The tool_call_update may have a more descriptive
+                      ;; title (eg. 'grep -i -n "tool" /path/to/file').
+                      ;; Upgrade to the more descriptive title when available.
+                      ;; See https://github.com/xenodium/agent-shell/issues/182
+                      ;; See https://github.com/xenodium/agent-shell/issues/309
+                      (when-let* ((new-title (map-nested-elt acp-notification '(params update title)))
+                                  ((not (string-empty-p new-title))))
+                        (list (cons :title new-title)))
+                      (when-let* ((description (agent-shell--tool-call-command-to-string
+                                                (map-nested-elt acp-notification '(params update rawInput description)))))
+                        (list (cons :description description)))
+                      (when-let* ((command (agent-shell--tool-call-command-to-string
+                                            (map-nested-elt acp-notification '(params update rawInput command)))))
+                        (list (cons :command command)))
+                      (when-let* ((raw-input (map-nested-elt acp-notification '(params update rawInput))))
+                        (list (cons :raw-input raw-input)))
+                      (when-let* ((locations (map-nested-elt acp-notification '(params update locations))))
+                        (list (cons :locations locations)))
+                      (when display-terminal-p
+                        (list (cons :display-terminal-p t)))
+                      (when terminal-output
+                        (list (cons :terminal-output terminal-output)))
+                      (when (or terminal-exit-code terminal-exit-signal)
+                        (append (when terminal-exit-code
+                                  (list (cons :terminal-exit-code terminal-exit-code)))
+                                (when terminal-exit-signal
+                                  (list (cons :terminal-exit-signal terminal-exit-signal)))))
+                      (when-let* ((diff (agent-shell--make-diff-info
+                                         :acp-tool-call (map-nested-elt acp-notification '(params update)))))
+                        (list (cons :diff diff)))))
            ;; OpenCode sends tool_call_update with the populated rawInput
            ;; after session/request_permission, so an open permission
            ;; dialog needs a re-render to surface the arguments.
            ;; See https://github.com/xenodium/agent-shell/issues/617
-           (when-let* ((tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
-                       (tool-call (map-nested-elt state (list :tool-calls tool-call-id)))
+           (when-let* ((tool-call (map-nested-elt state (list :tool-calls tool-call-id)))
                        ((map-elt tool-call :permission-request-id)))
              (agent-shell--update-fragment
               :state state
@@ -2128,36 +2301,22 @@ pretty-printed JSON inside a json fence."
            (agent-shell--cancel-idle-timer)
            (agent-shell--emit-event
             :event 'tool-call-update
-            :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
-                        (cons :tool-call (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)))))))
-           (let* ((diff (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :diff)))
-                  (output (concat
-                           "\n\n"
-                           (mapconcat #'agent-shell--content-block-to-markdown
-                                      (seq-keep (lambda (item) (map-elt item 'content))
-                                                (map-nested-elt acp-notification '(params update content)))
-                                      "\n\n")
-                           "\n\n"))
-                  (diff-text (agent-shell--format-diff-as-text diff))
-                  (body-text (if diff-text
-                                 (concat output
-                                         "\n\n"
-                                         "╭─────────╮\n"
-                                         "│ changes │\n"
-                                         "╰─────────╯\n\n" diff-text)
-                               output)))
+            :data (list (cons :tool-call-id tool-call-id)
+                        (cons :tool-call (map-nested-elt state `(:tool-calls ,tool-call-id)))))
+           (let* ((tool-call (map-nested-elt state `(:tool-calls ,tool-call-id)))
+                  (body-text (or (agent-shell--tool-call-body tool-call) "")))
              ;; Log tool call to transcript when completed or failed
              (when (and (map-nested-elt acp-notification '(params update status))
                         (member (map-nested-elt acp-notification '(params update status)) '("completed" "failed")))
                (agent-shell--append-transcript
                 :text (agent-shell--make-transcript-tool-call-entry
                        :status (map-nested-elt acp-notification '(params update status))
-                       :title (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :title))
-                       :kind (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :kind))
-                       :description (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :description))
-                       :command (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :command))
+                       :title (map-elt tool-call :title)
+                       :kind (map-elt tool-call :kind)
+                       :description (map-elt tool-call :description)
+                       :command (map-elt tool-call :command)
                        :parameters (agent-shell--extract-tool-parameters
-                                    (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :raw-input)))
+                                    (map-elt tool-call :raw-input))
                        :output body-text)
                 :file-path agent-shell--transcript-file))
              ;; Hide permission after sending response.
@@ -2168,40 +2327,8 @@ pretty-printed JSON inside a json fence."
                            '("completed" "failed"))
                ;; block-id must be the same as the one used as
                ;; agent-shell--update-fragment param by "session/request_permission".
-               (agent-shell--delete-fragment :state state :block-id (format "permission-%s" (map-nested-elt acp-notification '(params update toolCallId)))))
-             (let* ((tool-call-labels (agent-shell-make-tool-call-label state (map-nested-elt acp-notification '(params update toolCallId))))
-                    (tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
-                    (saved-command (map-nested-elt state `(:tool-calls ,tool-call-id :command)))
-                    ;; Prepend fenced command to body for Bash-like
-                    ;; tools.
-                    (command-block (when saved-command
-                                     (concat "```console\n" saved-command "\n```")))
-                    ;; For tools without a `command' parameter such
-                    ;; as MCP tools, render the input parameters
-                    ;; above the body so the user can inspect
-                    ;; them.  Standard tool kinds like "read" have
-                    ;; their parameters baked into the title, so we
-                    ;; only render parameters for non-standard tools
-                    ;; like MCP calls.
-                    (tool-call-kind (map-nested-elt state `(:tool-calls ,tool-call-id :kind)))
-                    (saved-input (map-nested-elt state `(:tool-calls ,tool-call-id :raw-input)))
-                    (input-block (when (and (member tool-call-kind '(nil "other"))
-                                            saved-input
-                                            (not saved-command))
-                                   (agent-shell--format-tool-call-input saved-input))))
-               (agent-shell--update-fragment
-                :state state
-                :block-id (map-nested-elt acp-notification '(params update toolCallId))
-                :label-left (map-elt tool-call-labels :status)
-                :label-right (map-elt tool-call-labels :title)
-                :body (cond
-                       (command-block
-                        (concat command-block "\n\n" (string-trim body-text)))
-                       (input-block
-                        (concat input-block "\n\n" (string-trim body-text)))
-                       (t
-                        (string-trim body-text)))
-                :expanded agent-shell-tool-use-expand-by-default)))
+               (agent-shell--delete-fragment :state state :block-id (format "permission-%s" tool-call-id)))
+             (agent-shell--render-tool-call-fragment :state state :tool-call-id tool-call-id)))
            (map-put! state :last-entry-type "tool_call_update"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "available_commands_update")
            (map-put! state :available-commands (map-nested-elt acp-notification '(params update availableCommands)))
@@ -3081,6 +3208,15 @@ With INCLUDE-PROJECT
                                 ""
                                 (or text "")))))
 
+(defun agent-shell--tool-call-path (tool-call)
+  "Return the file path TOOL-CALL operates on, if any.
+
+Prefers `rawInput.path'; falls back to the first `locations' entry.  Used
+to label tool calls whose `title' is just the generic kind name (eg. pi-acp
+sends `title' \"read\" with the path only in `rawInput.path'/`locations')."
+  (or (map-nested-elt tool-call '(:raw-input path))
+      (map-elt (seq-first (map-elt tool-call :locations)) 'path)))
+
 (defun agent-shell-make-tool-call-label (state tool-call-id)
   "Create tool call label from STATE using TOOL-CALL-ID.
 
@@ -3093,12 +3229,20 @@ Returns propertized labels in :status and :title propertized."
                     ;; Strip kind prefix from title to avoid
                     ;; redundancy "[read] Read file.el" becomes
                     ;; "[read] file.el"
-                    (if (and (map-elt tool-call :kind)
-                             (string-match-p (concat "\\`" (regexp-quote
-                                                            (map-elt tool-call :kind)) " ")
-                                             (downcase text)))
-                        (string-trim-left (substring text (length (map-elt tool-call :kind))))
-                      text)))
+                    (let ((stripped (if (and (map-elt tool-call :kind)
+                                             (string-match-p (concat "\\`" (regexp-quote
+                                                                            (map-elt tool-call :kind)) " ")
+                                                             (downcase text)))
+                                        (string-trim-left (substring text (length (map-elt tool-call :kind))))
+                                      text)))
+                      ;; A title that merely repeats the kind (eg. "read" for
+                      ;; kind "read") carries no information beyond the status
+                      ;; label.  Use the file path instead when one is known.
+                      (if (equal (downcase (string-trim stripped))
+                                 (downcase (or (map-elt tool-call :kind) "")))
+                          (or (agent-shell--shorten-paths (agent-shell--tool-call-path tool-call))
+                              stripped)
+                        stripped))))
            (description (or (agent-shell--shorten-paths
                              (map-elt tool-call :description))
                             ;; Fall back to the first line of the command when
