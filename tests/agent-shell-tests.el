@@ -799,6 +799,154 @@ header should stay one-line while the body shows the full multi-line command."
                (regexp-quote "```console\nprintf 'hello'\npwd\n```")
                rendered-body)))))
 
+(ert-deftest agent-shell--on-notification-read-tool-call-shows-path-test ()
+  "Read calls with a generic title should show the path in the header.
+
+Agents like pi-acp send `read' calls with `title' \"read\" and the file path
+only in `rawInput.path' / `locations'.  The header must surface the path rather
+than repeating the kind as \"read  read\"."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)))
+        (rendered-title nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (equal (plist-get args :block-id) "tc1")
+                   (setq rendered-title (plist-get args :label-right))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "read")
+           (status . "pending")
+           (kind . "read")
+           (locations . [((path . "/tmp/project/modules/darwin/common.nix"))])
+           (rawInput (path . "modules/darwin/common.nix"))))))
+      (setq rendered-title (substring-no-properties (or rendered-title "")))
+      ;; The path is shown, ...
+      (should (string-match-p (regexp-quote "modules/darwin/common.nix")
+                              rendered-title))
+      ;; ... and the redundant bare "read" title is not repeated.
+      (should-not (equal (string-trim rendered-title) "read")))))
+
+(ert-deftest agent-shell--format-console-block-escapes-nested-fences-test ()
+  "A console block must outlive any ``` fences inside its own content.
+
+Command output that contains its own fenced block (eg. `cat'ing a markdown
+file) would otherwise close the wrapper early and leak literal fences."
+  ;; Plain text keeps the canonical 3-backtick fence.
+  (let ((block (agent-shell--format-console-block "plain output")))
+    (should (string-prefix-p "```console\n" block))
+    (should-not (string-prefix-p "````" block)))
+  ;; Content with a ``` run gets a longer (4-backtick) fence.
+  (let ((block (agent-shell--format-console-block "before\n```sh\nx\n```\nafter")))
+    (should (string-prefix-p "````console\n" block))
+    (should (string-suffix-p "\n````" block))))
+
+(ert-deftest agent-shell--on-notification-read-body-renders-verbatim-test ()
+  "Read file content must render verbatim, not as markdown.
+
+A read body is raw file content; markdown-significant syntax (#, ```, *)
+must survive rendering instead of being interpreted as headers/code/bold."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)))
+        (rendered-body nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (equal (plist-get args :block-id) "tc1")
+                   (setq rendered-body (plist-get args :body))))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "tool_call")
+           (toolCallId . "tc1")
+           (title . "read")
+           (status . "completed")
+           (kind . "read")
+           (rawInput (path . "notes.md"))
+           (content . [((type . "content")
+                        (content (type . "text")
+                                 (text . "# Heading\ntext\n```sh\ncode\n```\n")))])))))
+      ;; The body wraps the content in a fence ...
+      (should (string-match-p (rx bos (* (any " \n")) (>= 3 "`")) rendered-body))
+      ;; ... long enough to contain the inner ``` run ...
+      (should (string-match-p "````" rendered-body))
+      ;; ... and rendering it preserves the literal '#' (not a header).
+      (with-temp-buffer
+        (insert rendered-body)
+        (agent-shell-markdown-replace-markup :render-images nil :highlight-blocks t)
+        (should (string-match-p "# Heading"
+                                (buffer-substring-no-properties (point-min) (point-max))))))))
+
+(ert-deftest agent-shell--on-notification-session-info-update-sets-title-test ()
+  "`session_info_update' should update the session title, not fall to Unhandled.
+
+Agents like pi-acp push the session title via a `session_info_update'
+notification; agent-shell must consume it (updating `(:session :title)') instead
+of rendering the \"Unhandled notification\" feature-request block."
+  (let* ((session (list (cons :id "s1") (cons :title "seed-title")))
+         (state (list (cons :buffer (current-buffer))
+                      (cons :session session)
+                      (cons :tool-calls nil)
+                      (cons :last-entry-type "agent_message_chunk")
+                      (cons :last-activity-time nil)))
+         (block-ids nil)
+         (acp-logging-enabled t)
+         (agent-shell--state state))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (push (plist-get args :block-id) block-ids))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "session_info_update")
+           (title . "Investigate rendering bugs")
+           (updatedAt . "2026-06-29T15:24:55.636Z")))))
+      ;; Title updated ...
+      (should (equal (map-nested-elt state '(:session :title))
+                     "Investigate rendering bugs"))
+      ;; ... and no Unhandled fragment rendered.
+      (should-not (member "unhandled-notification" block-ids)))))
+
 (ert-deftest agent-shell--collect-attached-files-test ()
   "Test agent-shell--collect-attached-files function."
   ;; Test with empty list

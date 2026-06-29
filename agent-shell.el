@@ -1779,15 +1779,21 @@ output arrives through `_meta.terminal_output' rather than `rawInput.command'."
                                  (agent-shell--tool-call-content-items content)))
              "\n\n"))
 
-(defun agent-shell--format-console-block (text)
-  "Return TEXT fenced as a console code block, or nil when TEXT is empty."
+(defun agent-shell--format-console-block (text &optional lang)
+  "Return TEXT fenced as a code block tagged LANG, or nil when TEXT is empty.
+
+LANG defaults to \"console\".  The fence is made longer than any backtick
+run in TEXT so content that contains its own ``` fences (eg. command output
+or a file read that includes fenced code) cannot close the block early and
+leak literal fences."
   (when (and (stringp text)
              (not (string-empty-p text)))
-    (concat "```console\n"
-            text
-            (unless (string-suffix-p "\n" text)
-              "\n")
-            "```")))
+    (let ((fence (make-string (max 3 (1+ (agent-shell--longest-backtick-run text))) ?`)))
+      (concat fence (or lang "console") "\n"
+              text
+              (unless (string-suffix-p "\n" text)
+                "\n")
+              fence))))
 
 (defun agent-shell--join-non-empty-sections (&rest sections)
   "Join non-empty SECTIONS with blank lines.
@@ -1827,12 +1833,22 @@ sent separately."
           (agent-shell--format-console-block (map-elt tool-call :terminal-output)))
          (content-text (agent-shell--tool-call-content-text (map-elt tool-call :content)))
          (diff-text (agent-shell--format-diff-as-text (map-elt tool-call :diff)))
-         (body-text (if diff-text
-                        (agent-shell--join-non-empty-sections
-                         content-text
-                         "╭─────────╮\n│ changes │\n╰─────────╯"
-                         diff-text)
-                      content-text))
+         (body-text (cond
+                     (diff-text
+                      (agent-shell--join-non-empty-sections
+                       content-text
+                       "╭─────────╮\n│ changes │\n╰─────────╯"
+                       diff-text))
+                     ;; Read returns verbatim file content; fence it so
+                     ;; markdown-significant syntax in the file (#, ```, *)
+                     ;; renders literally instead of as headers/code/bold.
+                     ((and (equal tool-call-kind "read")
+                           content-text
+                           (not (string-empty-p content-text)))
+                      (agent-shell--format-console-block
+                       content-text
+                       (file-name-extension (or (agent-shell--tool-call-path tool-call) ""))))
+                     (t content-text)))
          (body (agent-shell--join-non-empty-sections
                 (or command-block input-block)
                 terminal-output-block
@@ -2285,6 +2301,14 @@ pretty-printed JSON inside a json fence."
             :state state
             :acp-update (map-nested-elt acp-notification '(params update)))
            ;; Update header to reflect new context usage indicator
+           (agent-shell--update-header-and-mode-line)
+           ;; Note: This is session-level state, no need to set :last-entry-type
+           nil)
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "session_info_update")
+           ;; Agents (eg. pi-acp) push the session title here.  Reuse the same
+           ;; title plumbing as the `session/list' pull path so consumers get
+           ;; the `session-title-changed' event and the header refreshes.
+           (agent-shell--set-session-title (map-nested-elt acp-notification '(params update title)))
            (agent-shell--update-header-and-mode-line)
            ;; Note: This is session-level state, no need to set :last-entry-type
            nil)
@@ -3127,6 +3151,15 @@ With INCLUDE-PROJECT
                                 ""
                                 (or text "")))))
 
+(defun agent-shell--tool-call-path (tool-call)
+  "Return the file path TOOL-CALL operates on, if any.
+
+Prefers `rawInput.path'; falls back to the first `locations' entry.  Used
+to label tool calls whose `title' is just the generic kind name (eg. pi-acp
+sends `title' \"read\" with the path only in `rawInput.path'/`locations')."
+  (or (map-nested-elt tool-call '(:raw-input path))
+      (map-elt (seq-first (map-elt tool-call :locations)) 'path)))
+
 (defun agent-shell-make-tool-call-label (state tool-call-id)
   "Create tool call label from STATE using TOOL-CALL-ID.
 
@@ -3139,12 +3172,20 @@ Returns propertized labels in :status and :title propertized."
                     ;; Strip kind prefix from title to avoid
                     ;; redundancy "[read] Read file.el" becomes
                     ;; "[read] file.el"
-                    (if (and (map-elt tool-call :kind)
-                             (string-match-p (concat "\\`" (regexp-quote
-                                                            (map-elt tool-call :kind)) " ")
-                                             (downcase text)))
-                        (string-trim-left (substring text (length (map-elt tool-call :kind))))
-                      text)))
+                    (let ((stripped (if (and (map-elt tool-call :kind)
+                                             (string-match-p (concat "\\`" (regexp-quote
+                                                                            (map-elt tool-call :kind)) " ")
+                                                             (downcase text)))
+                                        (string-trim-left (substring text (length (map-elt tool-call :kind))))
+                                      text)))
+                      ;; A title that merely repeats the kind (eg. "read" for
+                      ;; kind "read") carries no information beyond the status
+                      ;; label.  Use the file path instead when one is known.
+                      (if (equal (downcase (string-trim stripped))
+                                 (downcase (or (map-elt tool-call :kind) "")))
+                          (or (agent-shell--shorten-paths (agent-shell--tool-call-path tool-call))
+                              stripped)
+                        stripped))))
            (description (or (agent-shell--shorten-paths
                              (map-elt tool-call :description))
                             ;; Fall back to the first line of the command when
