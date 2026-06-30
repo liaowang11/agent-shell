@@ -603,6 +603,11 @@ buffer."
               ((<= (point-min) pos (point-max))))
     (goto-char pos)))
 
+(defun agent-shell-viewport--interaction-response (interaction)
+  "Return INTERACTION's renderable response, including any after-turn tail."
+  (concat (or (map-elt interaction :response) "")
+          (or (map-elt interaction :after-turn) "")))
+
 (defun agent-shell-viewport-view-last ()
   "Display the last request/response interaction."
   (declare (modes agent-shell-viewport-view-mode
@@ -614,7 +619,7 @@ buffer."
     (agent-shell-viewport-view-mode)
     (agent-shell-viewport--initialize
      :prompt (map-elt current :prompt)
-     :response (map-elt current :response))
+     :response (agent-shell-viewport--interaction-response current))
     (goto-char (point-min))
     current))
 
@@ -628,7 +633,7 @@ buffer."
               (current (agent-shell-interaction-at-point)))
     (agent-shell-viewport--initialize
      :prompt (map-elt current :prompt)
-     :response (map-elt current :response))
+     :response (agent-shell-viewport--interaction-response current))
     (goto-char (point-min))
     current))
 
