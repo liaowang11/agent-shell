@@ -190,6 +190,39 @@ backticks; values are the corresponding Emacs mode prefix (the
 
   (\"elisp\" . \"emacs-lisp\")  ; ```elisp -> emacs-lisp-mode")
 
+(defvar agent-shell-markdown-render-functions nil
+  "Abnormal hook of external renderers, run before the styling passes.
+
+Lets a third-party package (e.g. a LaTeX-math renderer) claim and
+render regions of the buffer that the built-in passes should not
+touch.  Each function receives a single alist CONTEXT and runs with
+the buffer narrowed to the streaming region.  A renderer renders
+its regions in place and tags the rendered chars with text
+property `agent-shell-markdown-frozen' so the built-in passes
+\(bold, italic, links, tables, ...) leave them alone, the same
+mechanism fenced code blocks use.  Renderers run before the
+emphasis passes, so raw delimiters are claimed before those passes
+could mangle them; a renderer should skip already-frozen content
+so streaming re-runs don't reprocess it.
+
+CONTEXT keys:
+
+  :source-ranges  Vector of (BEG . END) markers covering fenced
+                  code blocks, so a renderer can skip delimiters
+                  that fall inside code.
+
+Each function returns an alist (nil for no-op).  Recognised keys:
+
+  :watermark  Buffer position the streaming frontier must not pass,
+              so an unclosed delimiter at the buffer tail (e.g. an
+              open `$$') is re-examined on the next chunk.  The
+              earliest :watermark across all renderers is honoured.
+
+For example, a renderer holding the frontier behind an open `$$'
+at position 1200 returns:
+
+  ((:watermark . 1200))")
+
 (cl-defun agent-shell-markdown-convert (markdown)
   "Convert MARKDOWN string into propertized text.
 
@@ -254,69 +287,101 @@ body un-fontified."
       (with-silent-modifications
         (remove-text-properties (point-min) (point-max)
                                 '(agent-shell-markdown-watermark nil))))
-    (let ((watermark (agent-shell-markdown--watermark-start)))
+    (let ((watermark (agent-shell-markdown--watermark-start))
+          (external-results)
+          (source-ranges)
+          (rendered-ranges)
+          (inline-ranges)
+          (avoid-ranges))
       (save-restriction
         (narrow-to-region watermark (point-max))
-        (let* ((source-ranges (agent-shell-markdown--sort-ranges
-                               (agent-shell-markdown--make-markers
-                                (agent-shell-markdown--source-block-ranges))))
-               (rendered-ranges (agent-shell-markdown--make-markers
-                                 (agent-shell-markdown--frozen-ranges)))
-               (inline-ranges (agent-shell-markdown--make-markers
-                               (agent-shell-markdown--inline-code-ranges
-                                :avoid-ranges (agent-shell-markdown--sort-ranges
-                                               source-ranges rendered-ranges))))
-               (avoid-ranges (agent-shell-markdown--sort-ranges
-                              source-ranges rendered-ranges inline-ranges)))
-          (while (let ((italic-changed (agent-shell-markdown--replace-italics
-                                        :avoid-ranges avoid-ranges))
-                       (bold-changed (agent-shell-markdown--replace-bolds
+        (setq source-ranges (agent-shell-markdown--sort-ranges
+                             (agent-shell-markdown--make-markers
+                              (agent-shell-markdown--source-block-ranges))))
+        ;; Run external renderers before the styling passes. They tag
+        ;; their regions `agent-shell-markdown-frozen', so the frozen
+        ;; ranges captured here (and `avoid-ranges' below) pick them up
+        ;; and the styling passes skip them.
+        (setq external-results (agent-shell-markdown--run-render-functions
+                                source-ranges))
+        (setq rendered-ranges (agent-shell-markdown--make-markers
+                               (agent-shell-markdown--frozen-ranges)))
+        (setq inline-ranges (agent-shell-markdown--make-markers
+                             (agent-shell-markdown--inline-code-ranges
+                              :avoid-ranges (agent-shell-markdown--sort-ranges
+                                             source-ranges rendered-ranges))))
+        (setq avoid-ranges (agent-shell-markdown--sort-ranges
+                            source-ranges rendered-ranges inline-ranges))
+        (while (let ((italic-changed (agent-shell-markdown--replace-italics
                                       :avoid-ranges avoid-ranges))
-                       (strike-changed (agent-shell-markdown--replace-strikethroughs
-                                        :avoid-ranges avoid-ranges)))
-                   (or italic-changed bold-changed strike-changed)))
-          (agent-shell-markdown--replace-headers :avoid-ranges avoid-ranges)
-          (agent-shell-markdown--style-inline-code :avoid-ranges source-ranges)
-          (agent-shell-markdown--replace-links :avoid-ranges avoid-ranges)
-          (when render-images
-            (agent-shell-markdown--replace-images
-             :avoid-ranges avoid-ranges
-             :image-cache-directory image-cache-directory)
-            (agent-shell-markdown--replace-image-file-paths
-             :avoid-ranges avoid-ranges))
-          (agent-shell-markdown--style-dividers :avoid-ranges avoid-ranges)
-          (agent-shell-markdown--style-blockquotes :avoid-ranges avoid-ranges)
-          (agent-shell-markdown--style-source-blocks
-           :highlight-blocks highlight-blocks)
-          ;; Tables run last so cell content has already been processed by
-          ;; every other pass (bold, italic, links, inline code, etc.).
-          ;; The cell parser respects face and `agent-shell-markdown-frozen'
-          ;; so it doesn't mis-split on pipes that got swallowed by other
-          ;; markup.  AVOID-RANGES protects content inside still-open
-          ;; fenced blocks (where the closing fence hasn't streamed in
-          ;; yet) — without it a table inside a code block would render
-          ;; eagerly and the fences would then strip out, leaving a
-          ;; rendered table.  Watermark backs off past any rendered
-          ;; table whose extension is still possible (see
-          ;; `--set-watermark'), so `--find-tables' under the narrow
-          ;; always sees the existing `agent-shell-markdown-table-source'
-          ;; needed to fold new rows in.
-          (agent-shell-markdown--style-tables :avoid-ranges source-ranges)
-          ;; Mirror every `face' we composed onto `font-lock-face' so our
-          ;; styling survives `font-lock-mode' re-fontification — comint
-          ;; / shell-maker / agent-shell buffers fontify on every output
-          ;; chunk and would otherwise clear our `face' properties.
-          (agent-shell-markdown--mirror-face-to-font-lock-face
-           (point-min) (point-max))
-          ;; Tag rendered chars so a yank into another buffer drops the
-          ;; styling, display overrides, internal markers, and keymaps
-          ;; we layered on — paste should give plain chars, not our
-          ;; implementation cruft.
-          (put-text-property (point-min) (point-max)
-                             'yank-handler
-                             (list (lambda (s)
-                                     (insert (substring-no-properties s))))))))
-    (agent-shell-markdown--set-watermark)))
+                     (bold-changed (agent-shell-markdown--replace-bolds
+                                    :avoid-ranges avoid-ranges))
+                     (strike-changed (agent-shell-markdown--replace-strikethroughs
+                                      :avoid-ranges avoid-ranges)))
+                 (or italic-changed bold-changed strike-changed)))
+        (agent-shell-markdown--replace-headers :avoid-ranges avoid-ranges)
+        (agent-shell-markdown--style-inline-code :avoid-ranges source-ranges)
+        (agent-shell-markdown--replace-links :avoid-ranges avoid-ranges)
+        (when render-images
+          (agent-shell-markdown--replace-images
+           :avoid-ranges avoid-ranges
+           :image-cache-directory image-cache-directory)
+          (agent-shell-markdown--replace-image-file-paths
+           :avoid-ranges avoid-ranges))
+        (agent-shell-markdown--style-dividers :avoid-ranges avoid-ranges)
+        (agent-shell-markdown--style-blockquotes :avoid-ranges avoid-ranges)
+        (agent-shell-markdown--style-source-blocks
+         :highlight-blocks highlight-blocks)
+        ;; Tables run last so cell content has already been processed by
+        ;; every other pass (bold, italic, links, inline code, etc.).
+        ;; The cell parser respects face and `agent-shell-markdown-frozen'
+        ;; so it doesn't mis-split on pipes that got swallowed by other
+        ;; markup.  AVOID-RANGES protects content inside still-open
+        ;; fenced blocks (where the closing fence hasn't streamed in
+        ;; yet) — without it a table inside a code block would render
+        ;; eagerly and the fences would then strip out, leaving a
+        ;; rendered table.  Watermark backs off past any rendered
+        ;; table whose extension is still possible (see
+        ;; `--update-watermark'), so `--find-tables' under the narrow
+        ;; always sees the existing `agent-shell-markdown-table-source'
+        ;; needed to fold new rows in.
+        (agent-shell-markdown--style-tables :avoid-ranges source-ranges)
+        ;; Mirror every `face' we composed onto `font-lock-face' so our
+        ;; styling survives `font-lock-mode' re-fontification — comint
+        ;; / shell-maker / agent-shell buffers fontify on every output
+        ;; chunk and would otherwise clear our `face' properties.
+        (agent-shell-markdown--mirror-face-to-font-lock-face
+         (point-min) (point-max))
+        ;; Tag rendered chars so a yank into another buffer drops the
+        ;; styling, display overrides, internal markers, and keymaps
+        ;; we layered on — paste should give plain chars, not our
+        ;; implementation cruft.
+        (put-text-property (point-min) (point-max)
+                           'yank-handler
+                           (list (lambda (s)
+                                   (insert (substring-no-properties s))))))
+      (agent-shell-markdown--update-watermark
+       :external-candidates (seq-keep (lambda (result) (map-elt result :watermark))
+                                      external-results)))))
+
+(defun agent-shell-markdown--run-render-functions (source-ranges)
+  "Run `agent-shell-markdown-render-functions' over the current buffer.
+
+Each registered function is called with a single alist context
+holding (:source-ranges . SOURCE-RANGES) and may render and freeze
+regions of the current (narrowed) buffer.  Returns the list of
+non-nil result alists, in hook order.
+
+For example, with one renderer returning `((:watermark . 1200))'
+this returns `(((:watermark . 1200)))'."
+  (let ((context (list (cons :source-ranges source-ranges)))
+        (results '()))
+    (run-hook-wrapped 'agent-shell-markdown-render-functions
+                      (lambda (fn)
+                        (when-let* ((result (funcall fn context)))
+                          (push result results))
+                        nil))
+    (nreverse results)))
 
 (cl-defun agent-shell-markdown--replace-bolds (&key avoid-ranges)
   "Replace `**X**' / `__X__' spans in current buffer with bold X.
@@ -2326,7 +2391,7 @@ point, a table from there can no longer accumulate."
            (t (setq continue nil))))
         (or rendered-table-start pending-table-start)))))
 
-(defun agent-shell-markdown--set-watermark ()
+(cl-defun agent-shell-markdown--update-watermark (&key external-candidates)
   "Stamp the safe-frontier on the first character as a text property.
 
 Safe-frontier = start of the last line in the buffer, clamped
@@ -2336,7 +2401,11 @@ back to the start of:
 - a rendered table that might still extend (see
   `--extending-table-start'), so `--find-tables' under the narrow
   on the next call still sees its stashed
-  `agent-shell-markdown-table-source' and folds streamed rows in.
+  `agent-shell-markdown-table-source' and folds streamed rows in;
+- any position in EXTERNAL-CANDIDATES, the `:watermark' values
+  returned by functions in `agent-shell-markdown-render-functions',
+  so a renderer can hold the watermark behind its own open
+  delimiter (e.g. an unclosed `$$').
 
 Any position before the frontier is fully rendered and stable;
 any position from the frontier onward may still resolve into new
@@ -2357,9 +2426,10 @@ only to end-of-line, so they're naturally within that zone."
             (save-excursion (goto-char (point-max))
                             (line-beginning-position)))
            (frontier (apply #'min
-                            (delq nil (list last-line-start
-                                            open-fence-start
-                                            extending-table-start)))))
+                            (delq nil (append (list last-line-start
+                                                    open-fence-start
+                                                    extending-table-start)
+                                              external-candidates)))))
       (with-silent-modifications
         (put-text-property (point-min) (1+ (point-min))
                            'agent-shell-markdown-watermark frontier)))))

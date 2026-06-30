@@ -1462,6 +1462,69 @@ Text/navigable files open in Emacs; binary files open externally."
       (delete-file text)
       (delete-file binary))))
 
+(ert-deftest agent-shell-markdown-render-functions-receives-source-ranges ()
+  ;; A render function is called with a `:source-ranges' vector covering
+  ;; fenced code blocks, so it can skip delimiters that live inside code.
+  (let ((vector-p nil)
+        (count nil)
+        (covered nil))
+    (with-temp-buffer
+      (let ((agent-shell-markdown-render-functions
+             (list (lambda (context)
+                     (let ((ranges (map-elt context :source-ranges)))
+                       (setq vector-p (vectorp ranges)
+                             count (length ranges))
+                       (when (> (length ranges) 0)
+                         (let ((range (aref ranges 0)))
+                           (setq covered (buffer-substring-no-properties
+                                          (car range) (cdr range))))))
+                     nil))))
+        (insert "text\n```\ncode\n```\n")
+        (agent-shell-markdown-replace-markup)))
+    (should vector-p)
+    (should (= count 1))
+    (should (string-match-p "code" covered))))
+
+(ert-deftest agent-shell-markdown-render-functions-frozen-region-protected ()
+  ;; A render function that tags its region `agent-shell-markdown-frozen'
+  ;; has it treated as an avoid-range: the emphasis passes leave `_'/`*'
+  ;; inside literal, while markup outside the region still renders.
+  (with-temp-buffer
+    (let ((agent-shell-markdown-render-functions
+           (list (lambda (_context)
+                   (goto-char (point-min))
+                   (when (re-search-forward "\\$\\$.*?\\$\\$" nil t)
+                     (put-text-property (match-beginning 0) (match-end 0)
+                                        'agent-shell-markdown-frozen t))
+                   nil))))
+      (insert "see **bold** and $$a_b*c*$$ end")
+      (agent-shell-markdown-replace-markup)
+      (should (equal (agent-shell-markdown--deconstruct (buffer-string))
+                     '(("see " nil)
+                       ("bold" (agent-shell-markdown-bold))
+                       (" and $$a_b*c*$$ end" nil)))))))
+
+(ert-deftest agent-shell-markdown-render-functions-watermark-held-back ()
+  ;; A render function returning `:watermark' holds the streaming frontier
+  ;; behind its own open delimiter, even when it spans lines above the last
+  ;; one (which the built-in start-of-last-line back-off wouldn't cover).
+  (with-temp-buffer
+    (let ((agent-shell-markdown-render-functions
+           (list (lambda (_context)
+                   (save-excursion
+                     (goto-char (point-min))
+                     (when (re-search-forward "\\$\\$" nil t)
+                       (list (cons :watermark (match-beginning 0)))))))))
+      (insert "intro\n$$\nx_y\nz_w")
+      (let ((open-dollar (save-excursion
+                           (goto-char (point-min))
+                           (re-search-forward "\\$\\$")
+                           (match-beginning 0))))
+        (agent-shell-markdown-replace-markup)
+        (should (= (get-text-property (point-min)
+                                      'agent-shell-markdown-watermark)
+                   open-dollar))))))
+
 (provide 'agent-shell-markdown-tests)
 
 ;;; agent-shell-markdown-tests.el ends here
