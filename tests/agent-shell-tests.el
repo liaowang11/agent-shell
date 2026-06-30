@@ -646,6 +646,169 @@ block -- covering the dispatch path, not just the helper in isolation."
                                       (uri . "file:///tmp/x.png"))))))
       (should (equal rendered "\n\n![image](file:///tmp/x.png)\n\n")))))
 
+(ert-deftest agent-shell--on-notification-out-of-turn-message-renders-content-test ()
+  "An out-of-turn `agent_message_chunk' renders its content directly, above the prompt.
+
+Reproduces the background-subagent burst that arrives after
+`end_turn' (claude-agent-acp issue #824): with no request in
+flight, the chunk renders as ordinary agent output above the fresh
+prompt -- unlabeled, not as an error fragment."
+  (let ((state (list (cons :chunked-group-count 0)
+                     ;; `:last-entry-type' is reset to nil at turn end, so the
+                     ;; first out-of-turn chunk starts a fresh group.
+                     (cons :last-entry-type nil)
+                     ;; No request in flight => the update is out of turn.
+                     (cons :active-requests nil)
+                     (cons :last-activity-time nil)))
+        (captured nil)
+        (above-flag nil))
+    (cl-letf (((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (setq captured args)
+                 (setq above-flag (bound-and-true-p agent-shell--render-above-prompt)))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((method . "session/update")
+                           (params
+                            (update
+                             (sessionUpdate . "agent_message_chunk")
+                             (content (type . "text") (text . "pong"))))))
+      ;; Content rendered, not the "ACP server bug" error body.
+      (should (equal (plist-get captured :body) "pong"))
+      ;; Rendered plainly, no label -- like ordinary agent output.
+      (should-not (plist-get captured :label-left))
+      ;; Dispatched with above-prompt placement active.
+      (should above-flag)
+      ;; First chunk of the burst starts a new group.
+      (should (plist-get captured :create-new)))))
+
+(ert-deftest agent-shell--on-notification-in-turn-message-unlabeled-test ()
+  "An in-turn `agent_message_chunk' renders inline, not above the prompt.
+
+Above-prompt placement applies only when no request is in flight;
+ordinary streaming output stays in the normal flow."
+  (let ((state (list (cons :chunked-group-count 0)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :active-requests '(((:method . "session/prompt"))))
+                     (cons :last-activity-time nil)))
+        (captured nil)
+        (above-flag 'unset))
+    (cl-letf (((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (setq captured args)
+                 (setq above-flag (bound-and-true-p agent-shell--render-above-prompt)))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((method . "session/update")
+                           (params
+                            (update
+                             (sessionUpdate . "agent_message_chunk")
+                             (content (type . "text") (text . "hello"))))))
+      (should (equal (plist-get captured :body) "hello"))
+      (should-not (plist-get captured :label-left))
+      (should-not above-flag))))
+
+(ert-deftest agent-shell--on-notification-out-of-turn-raises-busy-indicator-test ()
+  "An out-of-turn update raises the busy indicator and arms its debounce timer.
+
+The subagent burst arriving after `end_turn' has no request in flight and the
+normal heartbeat already stopped, so activity would otherwise appear with no
+notice.  Re-raise the heartbeat and arm a timer to clear it once the burst
+goes quiet."
+  (let ((heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
+        (state nil))
+    (setq state (list (cons :chunked-group-count 0)
+                      (cons :last-entry-type nil)
+                      (cons :active-requests nil)
+                      (cons :last-activity-time nil)
+                      (cons :heartbeat heartbeat)
+                      (cons :out-of-turn-timer nil)))
+    (cl-letf (((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment) #'ignore))
+      (unwind-protect
+          (progn
+            (agent-shell--on-notification
+             :state state
+             :acp-notification '((method . "session/update")
+                                 (params
+                                  (update
+                                   (sessionUpdate . "agent_message_chunk")
+                                   (content (type . "text") (text . "pong"))))))
+            (should (memq (map-nested-elt state '(:heartbeat :status)) '(started busy)))
+            (should (timerp (map-elt state :out-of-turn-timer))))
+        (when-let* ((timer (map-elt state :out-of-turn-timer)))
+          (cancel-timer timer))
+        (agent-shell-heartbeat-stop :heartbeat heartbeat)))))
+
+(ert-deftest agent-shell--on-notification-in-turn-does-not-arm-out-of-turn-timer-test ()
+  "An in-turn update leaves the out-of-turn debounce timer unarmed.
+
+While a request is in flight the normal heartbeat already runs, so the
+out-of-turn re-raise must not apply."
+  (let ((heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
+        (state nil))
+    (setq state (list (cons :chunked-group-count 0)
+                      (cons :last-entry-type "agent_message_chunk")
+                      (cons :active-requests '(((:method . "session/prompt"))))
+                      (cons :last-activity-time nil)
+                      (cons :heartbeat heartbeat)
+                      (cons :out-of-turn-timer nil)))
+    (cl-letf (((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment) #'ignore))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((method . "session/update")
+                           (params
+                            (update
+                             (sessionUpdate . "agent_message_chunk")
+                             (content (type . "text") (text . "hello"))))))
+      (should-not (map-elt state :out-of-turn-timer)))))
+
+(ert-deftest agent-shell--clear-out-of-turn-activity-respects-in-flight-request-test ()
+  "Clearing the out-of-turn indicator stops the heartbeat only when idle.
+
+A real turn that started during the debounce window keeps the busy indicator;
+otherwise the debounce stops it."
+  ;; Idle: heartbeat stops.
+  (let ((heartbeat (agent-shell-heartbeat-make :start t :on-heartbeat (lambda (_value _status)))))
+    (unwind-protect
+        (let ((state (list (cons :active-requests nil)
+                           (cons :heartbeat heartbeat)
+                           (cons :out-of-turn-timer 'armed))))
+          (agent-shell--clear-out-of-turn-activity state)
+          (should (eq (map-nested-elt state '(:heartbeat :status)) 'ended))
+          (should-not (map-elt state :out-of-turn-timer)))
+      (agent-shell-heartbeat-stop :heartbeat heartbeat)))
+  ;; Request in flight: heartbeat stays busy.
+  (let ((heartbeat (agent-shell-heartbeat-make :start t :on-heartbeat (lambda (_value _status)))))
+    (unwind-protect
+        (let ((state (list (cons :active-requests '(((:method . "session/prompt"))))
+                           (cons :heartbeat heartbeat)
+                           (cons :out-of-turn-timer 'armed))))
+          (agent-shell--clear-out-of-turn-activity state)
+          (should (memq (map-nested-elt state '(:heartbeat :status)) '(started busy))))
+      (agent-shell-heartbeat-stop :heartbeat heartbeat))))
+
+(ert-deftest agent-shell--busy-indicator-frame-marks-out-of-turn-test ()
+  "The busy indicator prefixes an after-turn glyph while an out-of-turn burst streams.
+
+An in-turn spinner stays bare; an out-of-turn one (with a live
+`:out-of-turn-timer') gets the `↩' cue so it does not read as a fresh turn."
+  (let ((base (list (cons :heartbeat (list (cons :status 'busy) (cons :value 3))))))
+    ;; In-turn: no out-of-turn timer, bare spinner.
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () (append base (list (cons :out-of-turn-timer nil))))))
+      (should (agent-shell--busy-indicator-frame))
+      (should-not (string-search "↩" (agent-shell--busy-indicator-frame))))
+    ;; Out-of-turn: timer armed, marker present.
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () (append base (list (cons :out-of-turn-timer 'armed))))))
+      (should (string-search "↩" (agent-shell--busy-indicator-frame))))))
+
 (ert-deftest agent-shell--on-notification-tool-call-display-terminal-renders-title-command-test ()
   "Display-only terminal execute calls should render the full title in the body.
 
@@ -991,6 +1154,49 @@ must survive rendering instead of being interpreted as headers/code/bold."
         (agent-shell-markdown-replace-markup :render-images nil :highlight-blocks t)
         (should (string-match-p "# Heading"
                                 (buffer-substring-no-properties (point-min) (point-max))))))))
+
+(ert-deftest agent-shell--on-notification-session-info-update-sets-title-test ()
+  "`session_info_update' should update the session title, not fall to Unhandled.
+
+Agents like pi-acp push the session title via a `session_info_update'
+notification; agent-shell must consume it (updating `(:session :title)') instead
+of rendering the \"Unhandled notification\" feature-request block."
+  (let* ((session (list (cons :id "s1") (cons :title "seed-title")))
+         (state (list (cons :buffer (current-buffer))
+                      (cons :session session)
+                      (cons :tool-calls nil)
+                      (cons :last-entry-type "agent_message_chunk")
+                      (cons :last-activity-time nil)))
+         (block-ids nil)
+         (acp-logging-enabled t)
+         (agent-shell--state state))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (push (plist-get args :block-id) block-ids))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "session_info_update")
+           (title . "Investigate rendering bugs")
+           (updatedAt . "2026-06-29T15:24:55.636Z")))))
+      ;; Title updated ...
+      (should (equal (map-nested-elt state '(:session :title))
+                     "Investigate rendering bugs"))
+      ;; ... and no Unhandled fragment rendered.
+      (should-not (member "unhandled-notification" block-ids)))))
 
 (ert-deftest agent-shell--collect-attached-files-test ()
   "Test agent-shell--collect-attached-files function."
