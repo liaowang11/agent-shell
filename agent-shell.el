@@ -3456,14 +3456,7 @@ turn)."
                 ;; Skip rendering when body is collapsed; it will be
                 ;; rendered on expand via
                 ;; `agent-shell-ui-post-expand-fragment-at-point-hook'.
-                ;; Check only the first char: a collapsed body has
-                ;; `invisible t' on every char, while a visible body
-                ;; may carry `invisible t' only on trailing whitespace
-                ;; (from `agent-shell-ui--apply-trailing-whitespace-invisible').
-                ;; `text-property-any' would match that trailing
-                ;; whitespace and incorrectly skip rendering for
-                ;; non-streamed bodies (e.g. plan blocks).
-                (unless (eq (get-text-property (point-min) 'invisible) t)
+                (unless (agent-shell-ui--body-invisible-p (point-min) (point-max))
                   (agent-shell--render-markdown :render-images render-body-images))))
             ;; Note: For now, we're skipping applying markdown
             ;; on left labels as they currently carry propertized text
@@ -3547,8 +3540,7 @@ turn)."
                ;; Skip rendering when body is collapsed; it will be
                ;; rendered on expand via
                ;; `agent-shell-ui-post-expand-fragment-at-point-hook'.
-               ;; See viewport counterpart above for rationale.
-               (unless (eq (get-text-property (point-min) 'invisible) t)
+               (unless (agent-shell-ui--body-invisible-p (point-min) (point-max))
                  (agent-shell--render-markdown))
                (widen))
              ;;
