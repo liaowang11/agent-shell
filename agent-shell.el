@@ -1070,7 +1070,7 @@ handles viewport mode detection, existing shell reuse, and project context."
                             (seq-first (agent-shell-buffers))))))
     (unless shell-buffer
       (user-error "No agent shell buffers available for current project"))
-    (if-let ((window (get-buffer-window shell-buffer)))
+    (if-let* ((window (get-buffer-window shell-buffer)))
         (quit-restore-window window 'bury)
       (agent-shell--display-buffer shell-buffer))))
 
@@ -1188,7 +1188,7 @@ Works from both shell and viewport buffers."
           (agent-shell-viewport--show-buffer
            :shell-buffer new-shell-buffer)
         ;; Reuse the original window(s) when still live
-        (if-let ((live-windows (seq-filter #'window-live-p windows)))
+        (if-let* ((live-windows (seq-filter #'window-live-p windows)))
             (progn
               (dolist (window live-windows)
                 (set-window-buffer window new-shell-buffer))
@@ -1272,9 +1272,9 @@ the session identified by SESSION-ID."
 
 If currently visiting an `agent-shell', transfer latest input."
   (interactive)
-  (if-let (((derived-mode-p 'agent-shell-mode))
-           ((shell-maker-point-at-last-prompt-p))
-           (input (agent-shell--input)))
+  (if-let* (((derived-mode-p 'agent-shell-mode))
+            ((shell-maker-point-at-last-prompt-p))
+            (input (agent-shell--input)))
       (progn
         ;; Clear shell prompt as it's now
         ;; transferred to the compose buffer.
@@ -1508,7 +1508,7 @@ associated viewport buffer exists, switch to that instead."
   (interactive)
   (unless (derived-mode-p 'agent-shell-mode)
     (user-error "Not in a shell"))
-  (if-let (session-id (map-nested-elt (agent-shell--state) '(:session :id)))
+  (if-let* ((session-id (map-nested-elt (agent-shell--state) '(:session :id))))
       (progn
         (kill-new session-id)
         (message "Copied session ID: %s" session-id))
@@ -4746,7 +4746,7 @@ Call ON-SUCCESS after state is updated from the response."
 
 (cl-defun agent-shell--config-option-set-model-id (&key model-id on-success on-failure)
   "Set current model to MODEL-ID."
-  (if-let ((model-option (agent-shell--config-option-by-category (agent-shell--state) "model")))
+  (if-let* ((model-option (agent-shell--config-option-by-category (agent-shell--state) "model")))
       (agent-shell--set-session-config-option
        :config-id (map-elt model-option :id)
        :value model-id
@@ -4782,7 +4782,7 @@ Call ON-SUCCESS after state is updated from the response."
 
 (cl-defun agent-shell--config-option-set-mode-id (&key mode-id on-success on-failure)
   "Set current session mode to MODE-ID."
-  (if-let ((mode-option (agent-shell--config-option-by-category (agent-shell--state) "mode")))
+  (if-let* ((mode-option (agent-shell--config-option-by-category (agent-shell--state) "mode")))
       (agent-shell--set-session-config-option
        :config-id (map-elt mode-option :id)
        :value mode-id
@@ -4817,7 +4817,7 @@ Call ON-SUCCESS after state is updated from the response."
 
 (cl-defun agent-shell--config-option-set-thought-level-id (&key thought-level-id on-success on-failure)
   "Set current thought level to THOUGHT-LEVEL-ID."
-  (if-let ((option (agent-shell--config-option-by-category (agent-shell--state) "thought_level")))
+  (if-let* ((option (agent-shell--config-option-by-category (agent-shell--state) "thought_level")))
       (agent-shell--set-session-config-option
        :config-id (map-elt option :id)
        :value thought-level-id
@@ -4897,7 +4897,7 @@ Must provide ON-SESSION-INIT (lambda ())."
      :body "\n\nCreating session..."
      :append t))
   ;; User requested forking session with explicit session ID.
-  (if-let ((fork-session-id (map-elt (agent-shell--state) :fork-session-id)))
+  (if-let* ((fork-session-id (map-elt (agent-shell--state) :fork-session-id)))
       (if (map-elt (agent-shell--state) :supports-session-fork)
           (agent-shell--initiate-session-fork-by-id
            :session-id fork-session-id
@@ -4910,7 +4910,7 @@ Must provide ON-SESSION-INIT (lambda ())."
          :shell-buffer shell-buffer
          :on-session-init on-session-init))
     ;; User requested resuming session with explicit session ID.
-    (if-let ((resume-session-id (map-elt (agent-shell--state) :resume-session-id)))
+    (if-let* ((resume-session-id (map-elt (agent-shell--state) :resume-session-id)))
         (if (or (map-elt (agent-shell--state) :supports-session-load)
                 (map-elt (agent-shell--state) :supports-session-resume))
             ;; Agent supports some form of resuming.
@@ -6438,9 +6438,9 @@ Uses AGENT-CWD to shorten file paths where necessary."
     (mapconcat (lambda (file)
                  (when agent-cwd
                    (setq file (expand-file-name file agent-cwd)))
-                 (if-let ((image-display (agent-shell--load-image
-                                          :file-path file
-                                          :max-width 200)))
+                 (if-let* ((image-display (agent-shell--load-image
+                                           :file-path file
+                                           :max-width 200)))
                      ;; Propertize text to display the image
                      (agent-shell-ui-add-action-to-text
                       (propertize (concat "@" file)
@@ -6962,8 +6962,8 @@ ACTIONS as per `agent-shell--make-permission-action'."
   (let ((shell-buffer (current-buffer)))
     (lambda ()
       (interactive)
-      (if-let ((existing (map-nested-elt state (list :tool-calls tool-call-id :diff-buffer)))
-               ((buffer-live-p existing)))
+      (if-let* ((existing (map-nested-elt state (list :tool-calls tool-call-id :diff-buffer)))
+                ((buffer-live-p existing)))
           (pop-to-buffer existing '((display-buffer-reuse-window
                                      display-buffer-use-some-window
                                      display-buffer-same-window)))
@@ -6992,14 +6992,14 @@ ACTIONS as per `agent-shell--make-permission-action'."
                                (with-current-buffer shell-buffer
                                  (agent-shell-interrupt t))))
                 :on-exit (lambda ()
-                           (if-let ((choice (condition-case nil
-                                                (if (y-or-n-p "Accept changes?")
-                                                    'accept
-                                                  'reject)
-                                              (quit 'ignore)))
-                                    (action (agent-shell--resolve-permission-choice-to-action
-                                             :choice choice
-                                             :actions actions)))
+                           (if-let* ((choice (condition-case nil
+                                                 (if (y-or-n-p "Accept changes?")
+                                                     'accept
+                                                   'reject)
+                                               (quit 'ignore)))
+                                     (action (agent-shell--resolve-permission-choice-to-action
+                                              :choice choice
+                                              :actions actions)))
                                (progn
                                  (agent-shell--send-permission-response
                                   :client client
@@ -7336,8 +7336,8 @@ Uses AGENT-CWD to shorten file paths where necessary."
                                                (lambda ()
                                                  (interactive)
                                                  (if (and (map-elt region :file) (file-exists-p (map-elt region :file)))
-                                                     (if-let ((window (when (get-file-buffer (map-elt region :file))
-                                                                        (get-buffer-window (get-file-buffer (map-elt region :file))))))
+                                                     (if-let* ((window (when (get-file-buffer (map-elt region :file))
+                                                                         (get-buffer-window (get-file-buffer (map-elt region :file))))))
                                                          (progn
                                                            (select-window window)
                                                            (goto-char (point-min))
@@ -7422,9 +7422,9 @@ If CAP is non-nil, truncate at CAP."
             (setq reversed-lines (nreverse reversed-lines)))
           ;; Apply cap before final join
           (let ((final-lines reversed-lines))
-            (if-let (((and cap (> (length final-lines) cap)))
-                     (full-text (string-join final-lines "\n"))
-                     (id (gensym "agent-shell-region-")))
+            (if-let* (((and cap (> (length final-lines) cap)))
+                      (full-text (string-join final-lines "\n"))
+                      (id (gensym "agent-shell-region-")))
                 (agent-shell--add-text-properties
                  (concat (string-join (seq-take final-lines cap) "\n")
                          "\n\n   "
@@ -7532,8 +7532,8 @@ TEXT is the error message."
               (end (when beg
                      (save-excursion
                        (goto-char beg)
-                       (if-let ((end-line (flycheck-error-end-line err))
-                                (end-col (flycheck-error-end-column err)))
+                       (if-let* ((end-line (flycheck-error-end-line err))
+                                 (end-col (flycheck-error-end-column err)))
                            (progn
                              (forward-line (- end-line (line-number-at-pos)))
                              (move-to-column end-col)
@@ -7717,7 +7717,7 @@ STATE is the agent shell state.
 
 Returns the modes list from session if available, otherwise from
 the agent's available modes."
-  (if-let ((mode-option (agent-shell--config-option-by-category state "mode")))
+  (if-let* ((mode-option (agent-shell--config-option-by-category state "mode")))
       (agent-shell--config-option-as-modes mode-option)
     (or (map-nested-elt state '(:session :modes))
         ;; Use agent-level availability as fallback.

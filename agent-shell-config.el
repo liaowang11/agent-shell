@@ -223,7 +223,7 @@ https://agentclientprotocol.com/protocol/session-config-options"
 
 When a config option with category \"model\" exists, converts its
 values to legacy model shape.  Otherwise returns session :models."
-  (if-let ((model-option (agent-shell--config-option-by-category state "model")))
+  (if-let* ((model-option (agent-shell--config-option-by-category state "model")))
       (agent-shell--config-option-as-models model-option)
     (map-nested-elt state '(:session :models))))
 
