@@ -2001,7 +2001,7 @@ pretty-printed JSON inside a json fence."
               :label-left  (concat
                             agent-shell-thought-process-icon
                             " "
-                            (propertize "Thinking" 'font-lock-face font-lock-doc-markup-face))
+                            (propertize "Thinking" 'font-lock-face 'font-lock-doc-markup-face))
               :body content
               :append (equal (map-elt state :last-entry-type)
                              "agent_thought_chunk")
