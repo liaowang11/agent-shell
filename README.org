@@ -225,10 +225,10 @@ For local ollama models, sudo permission is needed to initialize ~ollama.service
 
 #+begin_src bash
 curl -fsSL https://ollama.com/install.sh | sh
-opencode pull qwen2.5:7b
+ollama pull qwen2.5:7b
 #+end_src
 
-If you are behind a network proxy, ~opencode pull~ will timeout. You then need to add proxy settings inside ~/etc/systemd/system/ollama.service~
+If you are behind a network proxy, ~ollama pull~ will timeout. You then need to add proxy settings inside ~/etc/systemd/system/ollama.service~
 
 See https://ollama.com/ for details
 
