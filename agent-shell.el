@@ -1868,25 +1868,7 @@ pretty-printed JSON inside a json fence."
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
   (map-put! state :last-activity-time (current-time))
-  (cond ((and (not (agent-shell--active-requests-p state))
-              (agent-shell--session-bound-notification-p acp-notification))
-         ;; Turn-bound notification arriving with no agent request in
-         ;; flight is a protocol violation: these notifications must
-         ;; accompany an active `session/prompt', `session/load', or
-         ;; `session/push'.  Show it visibly above the fresh prompt so
-         ;; users can report it.  Session-level updates (usage_update,
-         ;; current_mode_update, session_info_update, etc.) fall
-         ;; through to their normal handlers below — they're
-         ;; legitimate any time.
-         (agent-shell--update-fragment
-          :state state
-          :block-id "out-of-turn-acp-bug"
-          :label-left (propertize "Out of turn - ACP server bug"
-                                  'font-lock-face 'font-lock-doc-markup-face)
-          :body (agent-shell--make-out-of-session-turn-notification-body state acp-notification)
-          :append t
-          :above-last-prompt t))
-        ((equal (map-elt acp-notification 'method) "session/update")
+  (cond ((equal (map-elt acp-notification 'method) "session/update")
          ;; Replayed user_message_chunks aren't followed by
          ;; shell-maker's end-of-prompt marker (no real
          ;; `comint-send-input').  Insert it on the first
@@ -1907,6 +1889,50 @@ pretty-printed JSON inside a json fence."
           ;; replayed through the normal dispatch path.
           ((map-elt state :pending-restore)
            (agent-shell--append-restore-notification state acp-notification))
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_message_chunk")
+           (unless (equal (map-elt state :last-entry-type) "agent_message_chunk")
+             (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
+             (agent-shell--append-transcript
+              :text (format "\n## Agent (%s)\n\n" (format-time-string "%F %T"))
+              :file-path agent-shell--transcript-file))
+           ;; Indent markdown headers in LLM output so they nest
+           ;; below the transcript's ## section headers.  Applied
+           ;; per-chunk: if a header is split across chunks it may
+           ;; not be indented (graceful degradation).
+           (let ((content (agent-shell--content-block-to-markdown
+                           (map-nested-elt acp-notification '(params update content)))))
+             (agent-shell--append-transcript
+              :text (agent-shell--indent-markdown-headers content)
+              :file-path agent-shell--transcript-file)
+             (agent-shell--update-fragment
+              :state state
+              :block-id (format "%s-agent_message_chunk"
+                                (map-elt state :chunked-group-count))
+              :body content
+              :create-new (not (equal (map-elt state :last-entry-type)
+                                      "agent_message_chunk"))
+              :append t
+              :navigation 'never
+              :render-body-images t
+              ;; Out of turn (no prompt request in flight) lands the
+              ;; message above the fresh prompt rather than after it.
+              :above-last-prompt (not (agent-shell--active-requests-p state))))
+           (map-put! state :last-entry-type "agent_message_chunk"))
+          ((and (not (agent-shell--active-requests-p state))
+                (agent-shell--session-bound-notification-p acp-notification))
+           ;; Turn-bound notification arriving with no agent request in
+           ;; flight is a protocol violation: these notifications must
+           ;; accompany an active `session/prompt', `session/load', or
+           ;; `session/push'.  Show it visibly above the fresh prompt so
+           ;; users can report it.
+           (agent-shell--update-fragment
+            :state state
+            :block-id "out-of-turn-acp-bug"
+            :label-left (propertize "Out of turn - ACP server bug"
+                                    'font-lock-face 'font-lock-doc-markup-face)
+            :body (agent-shell--make-out-of-session-turn-notification-body state acp-notification)
+            :append t
+            :above-last-prompt t))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
            (agent-shell--save-tool-call
             state
@@ -1959,7 +1985,7 @@ pretty-printed JSON inside a json fence."
               :text (format "## Agent's Thoughts (%s)\n\n" (format-time-string "%F %T"))
               :file-path agent-shell--transcript-file))
            (let ((content (agent-shell--content-block-to-markdown
-                            (map-nested-elt acp-notification '(params update content)))))
+                           (map-nested-elt acp-notification '(params update content)))))
              (agent-shell--append-transcript
               :text (agent-shell--indent-markdown-headers content)
               :file-path agent-shell--transcript-file)
@@ -1977,32 +2003,6 @@ pretty-printed JSON inside a json fence."
               :expanded agent-shell-thought-process-expand-by-default
               :render-body-images t))
            (map-put! state :last-entry-type "agent_thought_chunk"))
-          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_message_chunk")
-           (unless (equal (map-elt state :last-entry-type) "agent_message_chunk")
-             (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
-             (agent-shell--append-transcript
-              :text (format "\n## Agent (%s)\n\n" (format-time-string "%F %T"))
-              :file-path agent-shell--transcript-file))
-           ;; Indent markdown headers in LLM output so they nest
-           ;; below the transcript's ## section headers.  Applied
-           ;; per-chunk: if a header is split across chunks it may
-           ;; not be indented (graceful degradation).
-           (let ((content (agent-shell--content-block-to-markdown
-                           (map-nested-elt acp-notification '(params update content)))))
-             (agent-shell--append-transcript
-              :text (agent-shell--indent-markdown-headers content)
-              :file-path agent-shell--transcript-file)
-             (agent-shell--update-fragment
-              :state state
-              :block-id (format "%s-agent_message_chunk"
-                                (map-elt state :chunked-group-count))
-              :body content
-              :create-new (not (equal (map-elt state :last-entry-type)
-                                      "agent_message_chunk"))
-              :append t
-              :navigation 'never
-              :render-body-images t))
-           (map-put! state :last-entry-type "agent_message_chunk"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "user_message_chunk")
            ;; Only handle user_message_chunks when there's an active session/load
            ;; or session/push to avoid inserting a redundant shell prompt
