@@ -358,24 +358,13 @@ Optionally set its PROMPT and RESPONSE."
 
   ;; Recalculate and cache position
   (agent-shell-viewport--position :force-refresh t)
-  (let ((inhibit-read-only t)
-        (viewport-buffer (current-buffer)))
+  (let ((inhibit-read-only t))
     (erase-buffer)
     ;; A freshly-initialized compose buffer is not editing a pending
     ;; request unless a caller marks it one afterwards.  Clearing here
     ;; prevents a stale index from a previously-abandoned edit hijacking
     ;; the next compose.
     (setq agent-shell-viewport--edit-pending-index nil)
-    (when-let* ((shell-buffer (agent-shell-viewport--shell-buffer)))
-      (with-current-buffer shell-buffer
-        (unless (eq agent-shell-header-style 'graphical)
-          ;; Insert newline at point-min purely for
-          ;; display/layout. Only needed for non-graphical header.
-          (with-current-buffer viewport-buffer
-            (insert (propertize "\n"
-                                'cursor-intangible t
-                                'front-sticky '(cursor-intangible)
-                                'rear-nonsticky '(cursor-intangible)))))))
     (when prompt
       (insert
        (if (derived-mode-p 'agent-shell-viewport-view-mode)
@@ -394,6 +383,9 @@ Optionally set its PROMPT and RESPONSE."
     ;; `agent-shell-viewport-refresh' on switch) leave the header showing
     ;; the previously-rendered position.
     (agent-shell-viewport--update-header)
+    ;; Keep the compose spacer tied to the actual buffer contents, even
+    ;; when tests or callers stub header rendering.
+    (agent-shell-viewport--sync-layout-spacer)
     ;; TODO: Render prompt markdown?
     ))
 
@@ -775,13 +767,9 @@ QUOTED-TEXT is inserted as a block quote as part of the reply."
       (goto-char (point-max))
       (insert (if snapshot "\n\n" "")
               (agent-shell--block-quote quoted-text) "\n\n"))
-    ;; Skip past any cursor-intangible layout text (e.g. the
-    ;; newline inserted by `agent-shell-viewport--initialize')
-    ;; so callers like `agent-shell-viewport-reply-1' can insert.
-    (goto-char (if (or snapshot quoted-text)
-                   (point-max)
-                 (or (next-single-property-change (point-min) 'cursor-intangible)
-                     (point-max))))))
+    ;; Leave point at the end of any prefilled content so callers like
+    ;; `agent-shell-viewport-reply-1' can insert after it.
+    (goto-char (point-max))))
 
 (defun agent-shell-viewport-reply ()
   "Reply as a follow-up and compose another prompt/query."
@@ -1393,6 +1381,28 @@ Returns only suffixes whose function has a binding in KEYMAP."
                           (list :if-not pred)))))
             commands)))
 
+(defvar-local agent-shell-viewport--layout-spacer-overlay nil
+  "Display-only spacer overlay for text-header compose buffers.")
+;; Survives mode switches (edit <-> view) which clear buffer-local vars.
+;; Without this, a reply's view->edit switch orphans the previous overlay
+;; and stacks a new one, prepending an extra blank line per reply.
+(put 'agent-shell-viewport--layout-spacer-overlay 'permanent-local t)
+
+(defun agent-shell-viewport--sync-layout-spacer ()
+  "Keep the text-header compose spacer in sync with the current mode.
+
+The spacer is display-only so compose buffer text remains identical to the
+prompt bytes sent to the agent."
+  (when (overlayp agent-shell-viewport--layout-spacer-overlay)
+    (delete-overlay agent-shell-viewport--layout-spacer-overlay)
+    (setq agent-shell-viewport--layout-spacer-overlay nil))
+  (when (and (derived-mode-p 'agent-shell-viewport-edit-mode)
+             (eq agent-shell-header-style 'text))
+    (setq agent-shell-viewport--layout-spacer-overlay
+          (make-overlay (point-min) (point-min)))
+    (overlay-put agent-shell-viewport--layout-spacer-overlay
+                 'before-string "\n")))
+
 (defun agent-shell-viewport--update-header ()
   "Update header and mode line based on `agent-shell-header-style'.
 
@@ -1485,7 +1495,8 @@ on current major mode."
                                                     :menu-keys `((:model . ,model-binding)
                                                                  (:mode . ,mode-binding)
                                                                  (:thought-level . ,thought-level-binding))))))
-      (setq-local header-line-format header))))
+      (setq-local header-line-format header))
+    (agent-shell-viewport--sync-layout-spacer)))
 
 (defvar-local agent-shell-viewport--clean-up t)
 

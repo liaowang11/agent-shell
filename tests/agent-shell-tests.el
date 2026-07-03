@@ -5337,6 +5337,111 @@ with \"Method not found\"."
         (agent-shell--refresh-session-title)
         (should (equal sent-method "session/list"))))))
 
+(ert-deftest agent-shell-viewport--initialize-omits-leading-newline-test ()
+  "`agent-shell-viewport--initialize' must not prepend a layout newline.
+
+The compose buffer is sent to the agent verbatim (nothing trims it on
+the send path), so a leading newline reaches the agent as part of the
+prompt.  That breaks leading-sensitive input such as the `/compact'
+slash command, which must start at the beginning of the message."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (agent-shell-viewport-edit-mode)
+          (agent-shell-viewport--initialize)
+          (insert "/compact")
+          (should (equal (buffer-string) "/compact")))))))
+
+(ert-deftest agent-shell-viewport--initialize-text-header-adds-display-only-spacer-test ()
+  "Text headers should get a display-only spacer, not real buffer text."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (agent-shell-viewport-edit-mode)
+          (agent-shell-viewport--initialize)
+          (let ((spacers (seq-filter (lambda (ov)
+                                       (equal (overlay-get ov 'before-string) "\n"))
+                                     (overlays-in (point-min) (point-min)))))
+            (should (= (length spacers) 1)))
+          (insert "/compact")
+          (should (equal (buffer-string) "/compact")))))))
+
+(ert-deftest agent-shell-viewport--initialize-text-header-spacer-survives-reinit-and-editing-test ()
+  "Text-header spacer should stay unique and not block editing at point-min."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (agent-shell-viewport-edit-mode)
+          (agent-shell-viewport--initialize)
+          (agent-shell-viewport--initialize)
+          (let ((spacers (seq-filter (lambda (ov)
+                                       (equal (overlay-get ov 'before-string) "\n"))
+                                     (overlays-in (point-min) (point-min)))))
+            (should (= (length spacers) 1)))
+          (insert "/compact")
+          (goto-char (point-min))
+          (insert "hello ")
+          (should (equal (buffer-string) "hello /compact"))
+          (let ((spacers (seq-filter (lambda (ov)
+                                       (equal (overlay-get ov 'before-string) "\n"))
+                                     (overlays-in (point-min) (point-min)))))
+            (should (= (length spacers) 1))))))))
+
+(ert-deftest agent-shell-viewport--initialize-text-header-spacer-survives-mode-switch-test ()
+  "Text-header spacer must stay unique across a reply's view->edit switch.
+
+`agent-shell-viewport-reply' switches the viewport buffer from view to
+edit mode, and that mode switch clears buffer-local vars.  Unless the
+spacer overlay reference survives, the previous overlay is orphaned and a
+new one is stacked on top, prepending an extra blank line per reply."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (cl-flet ((count-spacers ()
+                      (length (seq-filter
+                               (lambda (ov)
+                                 (equal (overlay-get ov 'before-string) "\n"))
+                               (overlays-in (point-min) (point-min))))))
+            (agent-shell-viewport-edit-mode)
+            (agent-shell-viewport--initialize)
+            (should (= (count-spacers) 1))
+            ;; Simulate submit (-> view) then reply (-> edit) twice.
+            (dotimes (_ 2)
+              (agent-shell-viewport-view-mode)
+              (agent-shell-viewport-edit-mode)
+              (agent-shell-viewport--initialize)
+              (should (= (count-spacers) 1)))
+            (insert "/compact")
+            (should (equal (buffer-string) "/compact"))))))))
+
 (ert-deftest agent-shell--replace-pending-request-replaces-in-place-test ()
   "Test `agent-shell--replace-pending-request' replaces the request at INDEX."
   (with-temp-buffer
