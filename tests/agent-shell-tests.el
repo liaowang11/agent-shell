@@ -1457,6 +1457,52 @@ code block content
   (should (equal (agent-shell--indent-markdown-headers "### Tool Call [completed]: grep")
                  "##### Tool Call [completed]: grep")))
 
+(ert-deftest agent-shell--separate-transcript-after-agent-message-test ()
+  "Ensure a turn ending mid-agent-message leaves a blank-line separator.
+
+Reproduces the interrupted-turn bug where an interrupted agent
+message had no trailing newline, so the next `## User' heading was
+glued onto the same line as the partial message:
+
+    Actually, I should## User (2026-06-20 19:45:42)
+
+The separator must be written whether the turn ends in success or
+failure (interrupt), so `agent-shell--append-transcript' can be
+driven by a single helper on both paths."
+  (let ((file (make-temp-file "agent-shell-transcript")))
+    (unwind-protect
+        ;; `agent-shell--ensure-transcript-file' guards on the major mode
+        ;; and creates the file with a header; the file is pre-seeded
+        ;; here, so stub it to just hand back the path and exercise the
+        ;; real conditional + real `write-region' append.
+        (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                   (lambda () file)))
+          ;; Simulate content left by an interrupted agent_message_chunk:
+          ;; a header plus partial body with NO trailing newline.
+          (write-region (format "## Agent (%s)\n\nActually, I should"
+                                (format-time-string "%F %T"))
+                        nil file)
+          ;; The turn ending mid-message must add the blank-line separator.
+          (agent-shell--separate-transcript-after-agent-message
+           :last-entry-type "agent_message_chunk"
+           :file-path file)
+          (with-temp-buffer
+            (insert-file-contents file)
+            ;; The next `## User' must land on its own line, i.e. the
+            ;; agent's partial body must be followed by a blank line.
+            (should (string-suffix-p "Actually, I should\n\n"
+                                     (buffer-string))))
+          ;; When the turn did not end on an agent message, no separator
+          ;; is written (avoids spurious blank lines elsewhere).
+          (let ((size-before (file-attribute-size
+                              (file-attributes file))))
+            (agent-shell--separate-transcript-after-agent-message
+             :last-entry-type "tool_call"
+             :file-path file)
+            (should (= (file-attribute-size (file-attributes file))
+                       size-before))))
+      (delete-file file))))
+
 (ert-deftest agent-shell-mcp-servers-test ()
   "Test `agent-shell-mcp-servers' function normalization."
   ;; Test with nil
