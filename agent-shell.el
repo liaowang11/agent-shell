@@ -3965,6 +3965,7 @@ When provided, included in help-echo tooltips."
                                                                                  (propertize model-binding 'face 'help-key-binding)))
                                                             'mouse-face 'mode-line-highlight
                                                             'local-map (let ((map (make-sparse-keymap)))
+                                                                         (define-key map [header-line down-mouse-1] #'ignore)
                                                                          (define-key map [header-line mouse-1]
                                                                                      (agent-shell--mode-line-model-menu))
                                                                          map)))
@@ -3977,6 +3978,7 @@ When provided, included in help-echo tooltips."
                                                                                  (propertize thought-level-binding 'face 'help-key-binding)))
                                                             'mouse-face 'mode-line-highlight
                                                             'local-map (let ((map (make-sparse-keymap)))
+                                                                         (define-key map [header-line down-mouse-1] #'ignore)
                                                                          (define-key map [header-line mouse-1]
                                                                                      (agent-shell--mode-line-thought-level-menu))
                                                                          map)))
@@ -3989,6 +3991,7 @@ When provided, included in help-echo tooltips."
                                                                                  (propertize mode-binding 'face 'help-key-binding)))
                                                             'mouse-face 'mode-line-highlight
                                                             'local-map (let ((map (make-sparse-keymap)))
+                                                                         (define-key map [header-line down-mouse-1] #'ignore)
                                                                          (define-key map [header-line mouse-1]
                                                                                      (agent-shell--mode-line-mode-menu))
                                                                          map)))
@@ -4220,6 +4223,7 @@ When provided, included in help-echo tooltips."
                                   'help-echo "Click to open settings menu"
                                   'mouse-face 'mode-line-highlight
                                   'local-map (let ((map (make-sparse-keymap)))
+                                               (define-key map [header-line down-mouse-1] #'ignore)
                                                (define-key map [header-line mouse-1]
                                                            (agent-shell--mode-line-combined-menu))
                                                map))))
