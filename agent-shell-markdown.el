@@ -385,7 +385,15 @@ body un-fontified."
         (put-text-property (point-min) (point-max)
                            'yank-handler
                            (list (lambda (s)
-                                   (insert (substring-no-properties s))))))
+                                   (insert (substring-no-properties s)))))
+        ;; Mark rendered chars `fontified' so jit-lock never re-runs over
+        ;; them during a mouse drag.  We style via `face'/`font-lock-face'
+        ;; text properties, not font-lock keywords (`font-lock-defaults'
+        ;; is `(nil t)'), so an in-drag jit-lock pass applies nothing —
+        ;; but firing at all disturbs drag tracking and collapses the
+        ;; selection to empty, silently breaking mouse copy of rendered
+        ;; text (keyboard selection is unaffected).
+        (put-text-property (point-min) (point-max) 'fontified t))
       (agent-shell-markdown--update-watermark
        :source-blocks source-blocks
        :external-candidates (seq-keep (lambda (result) (map-elt result :watermark))
