@@ -7422,7 +7422,8 @@ Uses AGENT-CWD to shorten file paths where necessary."
                                             (max-preview-lines 5))
                                         (if (= (count-lines char-start char-end) 1)
                                             ;; Same line region? Avoid numbering.
-                                            (buffer-substring-no-properties char-start char-end)
+                                            (agent-shell--buffer-substring-with-faces
+                                             char-start char-end)
                                           (agent-shell--get-numbered-region
                                            :buffer buffer
                                            :from char-start
@@ -7433,6 +7434,23 @@ Uses AGENT-CWD to shorten file paths where necessary."
                                  file-link))
                            (map-elt region :content))))
     processed-text))
+
+(defun agent-shell--buffer-substring-with-faces (start end)
+  "Return text between START and END, preserving only face properties."
+  (let ((text (buffer-substring start end))
+        (pos 0))
+    (while (< pos (length text))
+      (let ((next (or (next-property-change pos text) (length text)))
+            (props (text-properties-at pos text))
+            remove-props)
+        (while props
+          (unless (memq (car props) '(face font-lock-face))
+            (setq remove-props (plist-put remove-props (car props) nil)))
+          (setq props (cddr props)))
+        (when remove-props
+          (remove-text-properties pos next remove-props text))
+        (setq pos next)))
+    text))
 
 (cl-defun agent-shell--get-numbered-region (&key buffer from to cap trim)
   "Get region from BUFFER between FROM and TO locations.
@@ -7456,10 +7474,10 @@ If CAP is non-nil, truncate at CAP."
         (goto-char (point-min))
         (forward-line (1- start-line))
         (while (<= current-line end-line)
-          (let ((line-content (buffer-substring-no-properties
+          (let ((line-content (agent-shell--buffer-substring-with-faces
                                (line-beginning-position)
                                (line-end-position))))
-            (push (format "   %d: %s" current-line line-content)
+            (push (concat (format "   %d: " current-line) line-content)
                   lines))
           (forward-line 1)
           (setq current-line (1+ current-line)))
