@@ -3632,7 +3632,7 @@ turn)."
              (when-let* ((label-right-start (map-nested-elt range '(:label-right :start)))
                          (label-right-end (map-nested-elt range '(:label-right :end))))
                (narrow-to-region label-right-start label-right-end)
-               (agent-shell--render-markdown)
+               (agent-shell--render-markdown :render-images nil)
                (widen))))
          (run-hook-with-args 'agent-shell-section-functions range))))
        (when late-prompt-start
