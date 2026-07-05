@@ -2814,6 +2814,66 @@ DIFF should be in the form returned by `agent-shell--make-diff-info':
             (buffer-string)))
       (delete-file old-file)
       (delete-file new-file))))
+
+(defun agent-shell--diff-line-stats (diff)
+  "Return added/removed line counts for DIFF, or nil.
+
+DIFF is in the form returned by `agent-shell--make-diff-info'.
+Counts come from a unified diff between the old and new text, so
+they reflect actual added and removed lines rather than net
+line-count change.
+
+For example, replacing 5 old lines with 23 new lines:
+
+  ((:old . \"...5 lines...\") (:new . \"...23 lines...\"))
+
+returns:
+
+  ((:added . 23) (:removed . 5))"
+  (when-let* (diff
+              (old-file (make-temp-file "agent-shell-old"))
+              (new-file (make-temp-file "agent-shell-new")))
+    (unwind-protect
+        (progn
+          (with-temp-file old-file (insert (or (map-elt diff :old) "")))
+          (with-temp-file new-file (insert (or (map-elt diff :new) "")))
+          (with-temp-buffer
+            (call-process diff-command nil t nil "-U0" old-file new-file)
+            (goto-char (point-min))
+            (let ((added 0) (removed 0))
+              (while (not (eobp))
+                (cond ((looking-at "^\\+\\+\\+"))
+                      ((looking-at "^---"))
+                      ((looking-at "^\\+") (setq added (1+ added)))
+                      ((looking-at "^-") (setq removed (1+ removed))))
+                (forward-line 1))
+              (list (cons :added added)
+                    (cons :removed removed)))))
+      (delete-file old-file)
+      (delete-file new-file))))
+
+(defun agent-shell--format-diff-line-stats (diff)
+  "Return a propertized \"+N -M\" summary for DIFF, or nil.
+
+DIFF is in the form returned by `agent-shell--make-diff-info'.
+The added count is faced with `diff-added' and the removed count
+with `diff-removed'.  Returns nil when DIFF has no added or
+removed lines.
+
+For example, a diff that adds 23 lines and removes 5 returns the
+string \"+23 -5\"."
+  (when-let* ((stats (agent-shell--diff-line-stats diff))
+              (added (map-elt stats :added))
+              (removed (map-elt stats :removed))
+              ((or (> added 0) (> removed 0))))
+    (string-join
+     (delq nil
+           (list (when (> added 0)
+                   (propertize (format "+%d" added) 'font-lock-face 'diff-added))
+                 (when (> removed 0)
+                   (propertize (format "-%d" removed) 'font-lock-face 'diff-removed))))
+     " ")))
+
 (cl-defun agent-shell--make-error-handler (&key state shell-buffer)
   "Create ACP error handler with SHELL-BUFFER STATE."
   (lambda (acp-error raw-message)
@@ -3154,21 +3214,26 @@ Returns propertized labels in :status and :title propertized."
                             ;; Fall back to the first line of the command when
                             ;; description is missing for execute tool calls.
                             (when (equal (map-elt tool-call :kind) "execute")
-                              (seq-first (split-string (or (map-elt tool-call :title) "") "\n"))))))
+                              (seq-first (split-string (or (map-elt tool-call :title) "") "\n")))))
+           ;; Append a "+N -M" diff summary to edit titles.
+           (stats (agent-shell--format-diff-line-stats (map-elt tool-call :diff)))
+           (label (cond ((and title description
+                              (not (equal (string-remove-prefix "`" (string-remove-suffix "`" (string-trim title)))
+                                          (string-remove-prefix "`" (string-remove-suffix "`" (string-trim description))))))
+                         (concat
+                          (propertize title 'font-lock-face 'font-lock-doc-markup-face)
+                          " "
+                          (propertize description 'font-lock-face 'font-lock-doc-face)))
+                        (title
+                         (propertize title 'font-lock-face 'font-lock-doc-markup-face))
+                        (description
+                         (propertize description 'font-lock-face 'font-lock-doc-markup-face)))))
       `((:status . ,(agent-shell--make-status-kind-label
                      :status (map-elt tool-call :status)
                      :kind (map-elt tool-call :kind)))
-        (:title . ,(cond ((and title description
-                               (not (equal (string-remove-prefix "`" (string-remove-suffix "`" (string-trim title)))
-                                           (string-remove-prefix "`" (string-remove-suffix "`" (string-trim description))))))
-                          (concat
-                           (propertize title 'font-lock-face 'font-lock-doc-markup-face)
-                           " "
-                           (propertize description 'font-lock-face 'font-lock-doc-face)))
-                         (title
-                          (propertize title 'font-lock-face 'font-lock-doc-markup-face))
-                         (description
-                          (propertize description 'font-lock-face 'font-lock-doc-markup-face))))))))
+        (:title . ,(if (and label stats)
+                       (concat label " " stats)
+                     (or label stats)))))))
 
 (defun agent-shell--format-plan (entries)
   "Format plan ENTRIES for shell rendering.

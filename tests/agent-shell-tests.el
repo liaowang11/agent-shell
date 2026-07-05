@@ -1016,6 +1016,69 @@ it can be restored when the user returns to edit mode."
           (setq has-diff-face t)))
       (should has-diff-face))))
 
+(ert-deftest agent-shell--diff-line-stats-test ()
+  "Test `agent-shell--diff-line-stats' function."
+  ;; Test nil input
+  (should (equal (agent-shell--diff-line-stats nil) nil))
+
+  ;; Test a replacement of 5 old lines with 23 new lines
+  (let* ((old-text (mapconcat (lambda (n) (format "old line %d" n))
+                              (number-sequence 1 5) "\n"))
+         (new-text (mapconcat (lambda (n) (format "new line %d" n))
+                              (number-sequence 1 23) "\n"))
+         (stats (agent-shell--diff-line-stats `((:old . ,old-text)
+                                                (:new . ,new-text)))))
+    (should (equal (map-elt stats :added) 23))
+    (should (equal (map-elt stats :removed) 5)))
+
+  ;; Test a new file (no old text)
+  (let ((stats (agent-shell--diff-line-stats '((:old . "") (:new . "a\nb\nc")))))
+    (should (equal (map-elt stats :added) 3))
+    (should (equal (map-elt stats :removed) 0)))
+
+  ;; Test a deletion (no new text)
+  (let ((stats (agent-shell--diff-line-stats '((:old . "a\nb\nc\nd") (:new . "")))))
+    (should (equal (map-elt stats :added) 0))
+    (should (equal (map-elt stats :removed) 4)))
+
+  ;; Test a single-line swap
+  (let ((stats (agent-shell--diff-line-stats '((:old . "a\nb\nc") (:new . "a\nB\nc")))))
+    (should (equal (map-elt stats :added) 1))
+    (should (equal (map-elt stats :removed) 1)))
+
+  ;; Test no change
+  (let ((stats (agent-shell--diff-line-stats '((:old . "a\nb") (:new . "a\nb")))))
+    (should (equal (map-elt stats :added) 0))
+    (should (equal (map-elt stats :removed) 0))))
+
+(ert-deftest agent-shell--format-diff-line-stats-test ()
+  "Test `agent-shell--format-diff-line-stats' function."
+  ;; Test nil input
+  (should (equal (agent-shell--format-diff-line-stats nil) nil))
+
+  ;; Test no change returns nil rather than an empty summary
+  (should (equal (agent-shell--format-diff-line-stats
+                  '((:old . "a\nb") (:new . "a\nb")))
+                 nil))
+
+  ;; Test added and removed
+  (should (equal (substring-no-properties
+                  (agent-shell--format-diff-line-stats
+                   '((:old . "a\nb\nc") (:new . "a\nB\nc"))))
+                 "+1 -1"))
+
+  ;; Test additions only (no leading/trailing space)
+  (should (equal (substring-no-properties
+                  (agent-shell--format-diff-line-stats
+                   '((:old . "") (:new . "x\ny\nz"))))
+                 "+3"))
+
+  ;; Test deletions only
+  (should (equal (substring-no-properties
+                  (agent-shell--format-diff-line-stats
+                   '((:old . "x\ny") (:new . ""))))
+                 "-2")))
+
 (ert-deftest agent-shell--format-agent-capabilities-test ()
   "Test `agent-shell--format-agent-capabilities' function."
   ;; Test with multiple capabilities (includes comma)
