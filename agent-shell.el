@@ -1602,10 +1602,19 @@ See also `agent-shell-confirm-interrupt'."
 
 (defun agent-shell--filter-buffer-substring (start end &optional delete)
   "Return visible text between START and END, stripping hidden markup.
-If DELETE is non-nil, delete the text between START and END."
-  (let ((text "")
-        (pos start))
-    (while (< pos end)
+If DELETE is non-nil, delete the text between START and END.
+
+START and END may be given in either order: like the stock
+`buffer-substring', a reversed range (START > END, e.g. a
+right-to-left mouse selection or a kill where mark > point) is
+normalized.  Without this, the loop below would never run and the
+function would return the empty string, silently breaking mouse
+copy depending on selection direction."
+  (let* ((beg (min start end))
+         (fin (max start end))
+         (text "")
+         (pos beg))
+    (while (< pos fin)
       (let ((next (next-overlay-change pos))
             (exclude (seq-find (lambda (ov)
                                  (memq (overlay-get ov 'markdown-overlays-markup-type)
@@ -1613,10 +1622,10 @@ If DELETE is non-nil, delete the text between START and END."
                                                bold italic strikethrough header)))
                                (overlays-at pos))))
         (unless exclude
-          (setq text (concat text (buffer-substring pos (min next end)))))
+          (setq text (concat text (buffer-substring pos (min next fin)))))
         (setq pos (max next (1+ pos)))))
     (when delete
-      (delete-region start end))
+      (delete-region beg fin))
     (remove-text-properties 0 (length text)
                             '(line-prefix nil wrap-prefix nil)
                             text)

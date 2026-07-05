@@ -3488,6 +3488,19 @@ and it must handle that cleanly."
     (let ((result (agent-shell--filter-buffer-substring (point-min) (point-max))))
       (should (equal result "Use foo-bar for that.")))))
 
+(ert-deftest agent-shell-filter-buffer-substring-handles-reversed-range ()
+  "START may be greater than END (e.g. a right-to-left mouse
+selection, or a kill where mark > point).  Like the stock
+`buffer-substring', the result must match the forward range rather
+than the empty string -- otherwise mouse copy silently yields
+nothing depending on selection direction."
+  (with-temp-buffer
+    (insert "hello world")
+    (let ((forward  (agent-shell--filter-buffer-substring (point-min) (point-max)))
+          (reversed (agent-shell--filter-buffer-substring (point-max) (point-min))))
+      (should (equal forward "hello world"))
+      (should (equal reversed forward)))))
+
 (ert-deftest agent-shell-trim-strips-untagged-whitespace ()
   ;; Plain `string-trim'-style behavior when nothing is tagged: outer
   ;; whitespace is removed.
