@@ -5,7 +5,7 @@
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
 ;; Version: 0.57.3
-;; Package-Requires: ((emacs "29.1") (shell-maker "0.93.3") (acp "0.12.2"))
+;; Package-Requires: ((emacs "29.1") (compat "31.0.0.0") (shell-maker "0.93.3") (acp "0.12.2"))
 
 (defconst agent-shell--version "0.57.3")
 
@@ -44,6 +44,12 @@
 (eval-when-compile
   (require 'cl-lib))
 (require 'color)
+;; `compat' backports `with-work-buffer' to Emacs < 31.  Guard the
+;; require inside `eval-and-compile' so the macro is available when
+;; byte-compiling, and surface a clear message when it is missing.
+(eval-and-compile
+  (unless (require 'compat nil 'noerror)
+    (error "Please install the 'compat' package")))
 (require 'dired)
 (require 'diff)
 (require 'json)
@@ -1897,7 +1903,7 @@ the maintainer with the payload below:
 
 "
             agent-name
-            (with-temp-buffer
+            (with-work-buffer
               (insert (json-serialize acp-notification))
               (json-pretty-print (point-min) (point-max))
               (buffer-string)))))
@@ -1920,7 +1926,7 @@ Includes pretty-printed JSON and a `file a feature request' link."
            (lambda ()
              (message "Press RET to open URL"))
            'link)
-          (with-temp-buffer
+          (with-work-buffer
             (insert (json-serialize acp-notification))
             (json-pretty-print (point-min) (point-max))
             (buffer-string))))
@@ -1937,7 +1943,7 @@ pretty-printed JSON inside a json fence."
             ((and (stringp value) (not (string-empty-p value)))))
       (format "```\n%s\n```" value)
     (format "```json\n%s\n```"
-            (with-temp-buffer
+            (with-work-buffer
               (insert (json-encode acp-raw-input))
               (json-pretty-print-buffer)
               (buffer-string)))))
@@ -2797,7 +2803,7 @@ DIFF should be in the form returned by `agent-shell--make-diff-info':
         (progn
           (with-temp-file old-file (insert (map-elt diff :old)))
           (with-temp-file new-file (insert (map-elt diff :new)))
-          (with-temp-buffer
+          (with-work-buffer
             (call-process diff-command nil t nil "-U3" old-file new-file)
             ;; Remove file header lines with timestamps
             (goto-char (point-min))
@@ -2857,7 +2863,7 @@ returns:
         (progn
           (with-temp-file old-file (insert (or (map-elt diff :old) "")))
           (with-temp-file new-file (insert (or (map-elt diff :new) "")))
-          (with-temp-buffer
+          (with-work-buffer
             (call-process diff-command nil t nil "-U0" old-file new-file)
             (goto-char (point-min))
             (let ((added 0) (removed 0))
@@ -2941,7 +2947,7 @@ is word-wrapped to fit — the usable text area is WIDTH - 4 columns
 \(two for the `│' borders and two for the one-column padding on each
 side)."
   (let* ((lines (if width
-                    (with-temp-buffer
+                    (with-work-buffer
                       (insert text)
                       (let ((fill-column (max 1 (- width 4))))
                         (fill-region (point-min) (point-max)))
@@ -2980,7 +2986,7 @@ side)."
            :action (lambda ()
                      (interactive)
                      (agent-shell--view-as-error
-                      (with-temp-buffer
+                      (with-work-buffer
                         (let ((print-circle t))
                           (pp raw-message (current-buffer))
                           (buffer-string))))))))
@@ -6277,7 +6283,7 @@ capability, since the `session/list' request would otherwise fail."
 (defun agent-shell--expand-truncated-regions (prompt)
   "Expand truncated regions in PROMPT marked with `agent-shell-region-id'.
 Each marked span is replaced by its `agent-shell-region-text' value."
-  (with-temp-buffer
+  (with-work-buffer
     (insert prompt)
     (goto-char (point-min))
     (let (match)
