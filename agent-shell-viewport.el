@@ -131,11 +131,12 @@ Returns an alist with insertion details or nil otherwise:
       (agent-shell--display-buffer viewport-buffer)
       (when (and override
                  (with-current-buffer viewport-buffer
-                   ;; viewport buffer empty?
-                   (not (= (buffer-size) 0))))
+                   ;; Only guard an in-progress compose draft.
+                   (and (derived-mode-p 'agent-shell-viewport-edit-mode)
+                        (not (= (buffer-size) 0)))))
         (unless (y-or-n-p "Compose buffer is not empty.  Override?")
           ;; User does not want to override.
-          ;; Treat as regurlar text (typically appended).
+          ;; Treat as regular text (typically appended).
           (setq text (concat text
                              (unless (string-empty-p text)
                                "\n\n")

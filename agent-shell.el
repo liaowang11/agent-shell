@@ -1403,13 +1403,25 @@ Includes shells accessed via viewport buffers, preserving visited order."
                                 :no-create t)
                                "No shell available")))
         ((derived-mode-p 'agent-shell-mode)
-         (when-let* ((viewport-buffer (or (agent-shell-viewport--buffer
-                                           :shell-buffer (current-buffer))
-                                          "Not in a shell viewport buffer")))
-           (with-current-buffer viewport-buffer
-             (when (derived-mode-p 'agent-shell-viewport-view-mode)
-               (agent-shell-viewport-refresh)))
-           (switch-to-buffer viewport-buffer)))
+         (if (and (shell-maker-point-at-last-prompt-p)
+                  (agent-shell--input))
+             ;; Point sits on the live prompt with an unsent draft.  Carry
+             ;; it into the viewport's edit buffer instead of showing a
+             ;; past interaction in view mode.
+             (agent-shell-prompt-compose)
+           (when-let* ((viewport-buffer (or (agent-shell-viewport--buffer
+                                             :shell-buffer (current-buffer))
+                                            "Not in a shell viewport buffer")))
+             ;; On the empty live prompt, `agent-shell-interaction-at-point'
+             ;; resolves to the interaction before the latest.  Move to the
+             ;; last interaction so the viewport shows (and pages relative
+             ;; to) the latest completed one.
+             (when (shell-maker-point-at-last-prompt-p)
+               (agent-shell-goto-last-interaction))
+             (with-current-buffer viewport-buffer
+               (when (derived-mode-p 'agent-shell-viewport-view-mode)
+                 (agent-shell-viewport-refresh)))
+             (switch-to-buffer viewport-buffer))))
         (t
          (user-error "Not in an agent-shell buffer"))))
 
