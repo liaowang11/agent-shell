@@ -90,6 +90,15 @@
 ;; buffer-local vars. Make snapshot permanent-local.
 (put 'agent-shell-viewport--compose-snapshot 'permanent-local t)
 
+(defvar-local agent-shell-viewport--peek-location nil
+  "Alist with :point and :position of the peeked interaction.
+Saved when replying from a peek and restored by
+`agent-shell-viewport-compose-peek-last', so repeated peeks return to the
+same reading position.  :position is the history position, so it is only
+restored while the peeked interaction is the same one.")
+;; Survives mode switches (edit <-> view) which clear buffer-local vars.
+(put 'agent-shell-viewport--peek-location 'permanent-local t)
+
 (defvar-local agent-shell-viewport--ring-index nil
   "Current index into `comint-input-ring' for history navigation.")
 ;; Survives mode switches (edit <-> view) which clear buffer-local vars.
@@ -197,6 +206,7 @@ Returns an alist with insertion details or nil otherwise:
     (user-error "Session not ready... please wait"))
   (setq agent-shell-viewport--compose-snapshot nil)
   (setq agent-shell-viewport--ring-index nil)
+  (setq agent-shell-viewport--peek-location nil)
   (if agent-shell-prefer-viewport-interaction
       (agent-shell-viewport-compose-send-and-wait-for-response)
     (agent-shell-viewport-compose-send-and-kill)))
@@ -482,7 +492,15 @@ Optionally set its PROMPT and RESPONSE."
   (setq agent-shell-viewport--compose-snapshot
         `((:content . ,(buffer-string))
           (:location . ,(point))))
-  (agent-shell-viewport-view-last))
+  (agent-shell-viewport-view-last)
+  ;; Return to the previous peek's reading position, but only when the
+  ;; peeked interaction is unchanged.
+  (when-let* ((location agent-shell-viewport--peek-location)
+              ((equal (map-elt location :position)
+                      (agent-shell-viewport--position :force-refresh t)))
+              (pos (map-elt location :point))
+              ((<= (point-min) pos (point-max))))
+    (goto-char pos)))
 
 (defun agent-shell-viewport-view-last ()
   "Display the last request/response interaction."
@@ -627,6 +645,10 @@ With EXISTING-ONLY, only return existing buffers without creating."
   "Set up the buffer to compose a reply.
 
 QUOTED-TEXT is inserted as a block quote as part of the reply."
+  ;; Remember the reading position so a later peek can return to it.
+  (setq agent-shell-viewport--peek-location
+        `((:point . ,(point))
+          (:position . ,(agent-shell-viewport--position :force-refresh t))))
   (with-current-buffer (agent-shell-viewport--shell-buffer)
     (goto-char (point-max)))
   (let ((snapshot agent-shell-viewport--compose-snapshot))
