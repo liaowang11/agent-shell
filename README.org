@@ -72,6 +72,7 @@ We now have a handful of additional packages to extend the =agent-shell= experie
 - [[https://github.com/eddof13/ob-agent-shell][ob-agent-shell]]: Org Babel backend for executing =agent-shell= source blocks.
 - [[https://github.com/Marx-A00/agent-recall][agent-recall]]: Search, browse, and resume =agent-shell= conversation transcripts.
 - [[https://github.com/lgmoneda/agent-shell-pet][agent-shell-pet]]: Codex-like pets that broadcast agent-shell session states.
+- [[https://github.com/alberti42/agent-shell-math-renderer][agent-shell-math-renderer]]: Render LaTeX math equations as SVGs in =agent-shell=.
 - [[https://github.com/junyi-hou/agent-shell-tramp][agent-shell-tramp]]: Tramp integration for =agent-shell=.
 - [[https://github.com/nohzafk/agent-shell-hud][agent-shell-hud]]: Real-time =agent-shell= status overlay via a floating dashboard.
 - [[https://github.com/timfel/agent-shell-desktop.el][agent-shell-desktop]]: Desktop save mode integration for =agent-shell=. Saves and resumes shells by folder, config, and session id.
