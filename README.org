@@ -116,7 +116,7 @@ For Google's [[https://github.com/google-gemini/gemini-cli][Gemini CLI]], be sur
 
 *** Goose
 
-For Goose CLI, install [[https://block.github.io/goose/docs/getting-started/installation][goose]] and ensure the `goose` executable is in PATH.
+For Goose CLI, install [[https://goose-docs.ai/docs/getting-started/installation][goose]] and ensure the =goose= executable is in PATH.
 
 *** Cursor
 
@@ -432,7 +432,10 @@ For API key authentication:
 
 *** Goose
 
-For OpenAI API key authentication:
+By default, authentication is handled by Goose's built-in configuration.
+This needs no =agent-shell= configuration.
+
+Optionally, pass an OpenAI API key from =agent-shell= instead:
 
 #+begin_src emacs-lisp
 ;; With string
