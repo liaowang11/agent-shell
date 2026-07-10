@@ -773,6 +773,14 @@ For example, the buffer \"see ![logo](logo.png)\" becomes
                                                   (match-end 1))))
                  (url (buffer-substring-no-properties
                        (match-beginning 2) (match-end 2)))
+                 ;; Stash the original `![alt](url)' markup so
+                 ;; `agent-shell-copy-as-markdown' round-trips the image back to
+                 ;; source rather than yielding the bare alt placeholder (mirrors
+                 ;; `--replace-links').  Guarded so a re-render doesn't overwrite
+                 ;; an already-captured source.
+                 (source (unless (get-text-property markup-start
+                                                    'agent-shell-markdown-source)
+                           (agent-shell-markdown-reconstruct markup-start markup-end)))
                  (path (agent-shell-markdown--resolve-image-url
                         url image-cache-directory)))
             (cond
@@ -792,7 +800,10 @@ For example, the buffer \"see ![logo](logo.png)\" becomes
                                      (agent-shell-markdown--make-ret-binding-map
                                       (lambda () (interactive)
                                         (find-file path))))
-                  (put-text-property markup-start end 'mouse-face 'highlight))))
+                  (put-text-property markup-start end 'mouse-face 'highlight)
+                  (when source
+                    (put-text-property markup-start end
+                                       'agent-shell-markdown-source source)))))
              ;; Remote image we couldn't show inline (no cache configured, the
              ;; download failed, or a non-graphical display): render a link
              ;; that opens the url, rather than leaving raw `![alt](url)' text.
@@ -810,7 +821,10 @@ For example, the buffer \"see ![logo](logo.png)\" becomes
                                      (agent-shell-markdown--make-ret-binding-map
                                       (lambda () (interactive)
                                         (agent-shell-markdown--open-link url))))
-                  (put-text-property markup-start end 'mouse-face 'highlight))))))))))))
+                  (put-text-property markup-start end 'mouse-face 'highlight)
+                  (when source
+                    (put-text-property markup-start end
+                                       'agent-shell-markdown-source source)))))))))))))
 
 (cl-defun agent-shell-markdown--replace-image-file-paths (&key avoid-ranges)
   "Render bare image-path lines as displayed images.

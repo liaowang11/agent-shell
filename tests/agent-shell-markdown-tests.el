@@ -267,6 +267,40 @@ streaming **not bold**" nil)))))
                                      'agent-shell-ui-section nil))))
       (delete-file image-file))))
 
+(ert-deftest agent-shell-markdown-image-reconstructs-to-source ()
+  ;; A rendered `![alt](url)' image shows only the alt placeholder, but
+  ;; `agent-shell-copy-as-markdown' must round-trip it back to the original
+  ;; markdown.  The renderer stashes the source on `agent-shell-markdown-source'
+  ;; (like links do) so `agent-shell-markdown-reconstruct' recovers it.
+  (let ((image-file (make-temp-file "agent-shell-test" nil ".svg")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _d) t))
+                  ((symbol-function 'image-supported-file-p) (lambda (_f) t))
+                  ((symbol-function 'create-image)
+                   (lambda (&rest _) '(image :type svg :fake t)))
+                  ((symbol-function 'image-flush) (lambda (&rest _) nil)))
+          (with-temp-buffer
+            (insert (format "see ![svg graphics](%s) end" image-file))
+            (agent-shell-markdown-replace-markup :render-images t)
+            ;; Visible text is the bare placeholder...
+            (should (equal (substring-no-properties (buffer-string))
+                           "see svg graphics end"))
+            ;; ...but reconstruction restores the full markup.
+            (should (equal (agent-shell-markdown-reconstruct (point-min) (point-max))
+                           (format "see ![svg graphics](%s) end" image-file)))))
+      (delete-file image-file))))
+
+(ert-deftest agent-shell-markdown-remote-image-fallback-reconstructs-to-source ()
+  ;; A remote image that falls back to a link (non-graphical display in batch)
+  ;; also round-trips to its original `![alt](url)' markup, not the link label.
+  (with-temp-buffer
+    (insert "x ![](https://example.com/a.png) y")
+    (agent-shell-markdown-replace-markup :render-images t)
+    (should (equal (substring-no-properties (buffer-string))
+                   "x https://example.com/a.png y"))
+    (should (equal (agent-shell-markdown-reconstruct (point-min) (point-max))
+                   "x ![](https://example.com/a.png) y"))))
+
 (ert-deftest agent-shell-markdown-convert-link-in-fenced-block-untouched ()
   ;; The `[b](v)' inside fences stays literal — it isn't re-processed
   ;; as a link.  Body chars carry the `agent-shell-markdown-frozen'
