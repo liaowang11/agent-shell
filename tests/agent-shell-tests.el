@@ -2818,6 +2818,11 @@ and rejects `new-deferred' and other unknown values."
   ;; Test empty alist
   (should (null (agent-shell--extract-tool-parameters '())))
 
+  ;; ACP rawInput may be a scalar, such as a patch string.
+  (should (null (agent-shell--extract-tool-parameters
+                 "*** Begin Patch\n*** Update File: example.el")))
+  (should (null (agent-shell--extract-tool-parameters 42)))
+
   ;; Test with filePath parameter
   (should (equal (agent-shell--extract-tool-parameters
                   '((filePath . "/home/user/file.txt")))
@@ -2859,7 +2864,12 @@ and rejects `new-deferred' and other unknown values."
 
   ;; Test plan is excluded (shown separately)
   (should (null (agent-shell--extract-tool-parameters
-                 '((plan . "Step 1: do something"))))))
+                 '((plan . "Step 1: do something")))))
+
+  ;; Ignore malformed entries without preventing valid parameters from rendering.
+  (should (equal (agent-shell--extract-tool-parameters
+                  '((filePath . "/home/user/file.txt") 42))
+                 "filePath: /home/user/file.txt")))
 
 (ert-deftest agent-shell--make-transcript-tool-call-entry-parameters-test ()
   "Test `agent-shell--make-transcript-tool-call-entry' with parameters."

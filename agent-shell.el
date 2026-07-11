@@ -8936,15 +8936,16 @@ returns:
   \"filePath: /home/user/project/file.el
   offset: 10
   limit: 20\""
-  (when-let* ((raw-input)
+  (when-let* (((listp raw-input))
               (excluded-keys '(command description plan))
               (params (seq-remove
                        (lambda (pair)
-                         (let ((key (car pair))
-                               (value (cdr pair)))
-                           (or (memq key excluded-keys)
-                               (null value)
-                               (and (stringp value) (string-empty-p value)))))
+                         (or (not (consp pair))
+                             (let ((key (car pair))
+                                   (value (cdr pair)))
+                               (or (memq key excluded-keys)
+                                   (null value)
+                                   (and (stringp value) (string-empty-p value))))))
                        raw-input)))
     (mapconcat (lambda (pair)
                  (format "%s: %s"
