@@ -364,7 +364,7 @@ with the rest of the block.
 _COLLAPSED is intentionally unused: visibility for new chars is derived
 from the current visibility of the existing body, not from caller-supplied
 state, because label-less fragments don't follow `state :collapsed'
-(their bodies stay visible regardless of how `:collapsed' was stored)."
+\(their bodies stay visible regardless of how `:collapsed' was stored)."
   (when (and (stringp chunk) (not (string-empty-p chunk)))
     (let* ((body-start (map-elt body-range :start))
            (body-end (map-elt body-range :end))
@@ -1129,7 +1129,7 @@ are skipped — they have no fold indicator to act on."
 INDENT-STRING defaults to two spaces.
 Uses `line-prefix' display property so indentation is visual only.
 
-TEXT's caller-set text properties (eg. `agent-shell-markdown-frozen'
+TEXT's caller-set text properties (for example `agent-shell-markdown-frozen'
 on a pre-rendered diff) are preserved on every char — the previous
 split-and-rejoin reconstructed the inter-line `\\n's as bare strings,
 which broke contiguous property ranges and made the markdown

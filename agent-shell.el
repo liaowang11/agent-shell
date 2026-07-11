@@ -287,7 +287,7 @@ The function accepts `&key render-images highlight-blocks
 image-cache-directory' (use `&allow-other-keys' to tolerate keys a
 renderer ignores) and is expected to render markdown in the
 current buffer.  Callers narrow the buffer to the target span
-(eg. a fragment body or label) before calling, so the function can
+\(for example, a fragment body or label) before calling, so the function can
 scan the whole accessible portion.
 
 Two implementations ship with agent-shell:
@@ -3297,7 +3297,7 @@ inside a git repo and .agent-shell/ is not yet ignored, automatically add it
 to .gitignore.  This gitignore update is a one-time operation: if the entry is
 later removed from .gitignore it will not be re-added."
   (unless (functionp agent-shell-dot-subdir-function)
-    (error "agent-shell-dot-subdir-function must be set to a function"))
+    (error "Set agent-shell-dot-subdir-function to a function"))
   (let ((dir (funcall agent-shell-dot-subdir-function subdir)))
     (unless (and (stringp dir) (not (string-empty-p (string-trim dir))))
       (error "Failed to resolve agent-shell data directory (subdir: %s).  Resulting directory is not a non-empty string (dir: %s)" subdir dir))
@@ -4320,7 +4320,7 @@ STATE should contain :agent-config with :icon-name, :buffer-name, and
 :session with :mode-id and :modes for displaying the current session mode.
 
 POSITION: Optional string rendered before the project on the bottom line
-(e.g. \"1/3\").  Honors text-property face for foreground color.
+\(e.g. \"1/3\").  Honors text-property face for foreground color.
 
 STATUS: Optional string rendered at the end of the bottom line (e.g.
 propertize \"Edit\" with `success' face).  Honors text-property face for
@@ -5189,7 +5189,8 @@ Must provide ON-AUTHENTICATED (lambda ())."
 
 (cl-defun agent-shell--set-session-config-option (&key config-id value on-success on-failure)
   "Set session config option CONFIG-ID to VALUE.
-Call ON-SUCCESS after state is updated from the response."
+Call ON-SUCCESS after state is updated from the response, or ON-FAILURE
+on error."
   (agent-shell--send-request
    :state (agent-shell--state)
    :client (map-elt (agent-shell--state) :client)
@@ -5215,7 +5216,8 @@ Call ON-SUCCESS after state is updated from the response."
                      (message "Failed to change config option: %s" acp-error)))))
 
 (cl-defun agent-shell--config-option-set-model-id (&key model-id on-success on-failure)
-  "Set current model to MODEL-ID."
+  "Set current model to MODEL-ID.
+Call ON-SUCCESS on success, or ON-FAILURE on error."
   (if-let* ((model-option (agent-shell--config-option-by-category (agent-shell--state) "model")))
       (agent-shell--set-session-config-option
        :config-id (map-elt model-option :id)
@@ -5251,7 +5253,8 @@ Call ON-SUCCESS after state is updated from the response."
                        (message "Failed to change model: %s" acp-error))))))
 
 (cl-defun agent-shell--config-option-set-mode-id (&key mode-id on-success on-failure)
-  "Set current session mode to MODE-ID."
+  "Set current session mode to MODE-ID.
+Call ON-SUCCESS on success, or ON-FAILURE on error."
   (if-let* ((mode-option (agent-shell--config-option-by-category (agent-shell--state) "mode")))
       (agent-shell--set-session-config-option
        :config-id (map-elt mode-option :id)
@@ -5286,7 +5289,8 @@ Call ON-SUCCESS after state is updated from the response."
                        (message "Failed to change session mode: %s" acp-error))))))
 
 (cl-defun agent-shell--config-option-set-thought-level-id (&key thought-level-id on-success on-failure)
-  "Set current thought level to THOUGHT-LEVEL-ID."
+  "Set current thought level to THOUGHT-LEVEL-ID.
+Call ON-SUCCESS on success, or ON-FAILURE on error."
   (if-let* ((option (agent-shell--config-option-by-category (agent-shell--state) "thought_level")))
       (agent-shell--set-session-config-option
        :config-id (map-elt option :id)
@@ -6851,6 +6855,10 @@ packages that integrate with agent-shell programmatically.
 
 Resolution order: viewport → current buffer → project buffers → prompt user.
 
+VIEWPORT-BUFFER resolves from that viewport's shell buffer.  NO-ERROR
+returns nil instead of signaling when none is found.  NO-CREATE skips
+creating a buffer.
+
 Example:
   (agent-shell-shell-buffer)
   (agent-shell-shell-buffer :no-error t)"
@@ -7164,7 +7172,7 @@ for details."
 
 Combines the ACP ToolCall \\='title, \\='rawInput-derived command and
 filepath, and the structured \\='content and \\='locations fields
-(when the agent provides them) into a user-facing string.
+\(when the agent provides them) into a user-facing string.
 
 Simple substring deduplication avoids showing the same info
 twice when an agent populates both \\='rawInput and \\='content,
@@ -9098,7 +9106,7 @@ The buffer must be an `agent-shell-mode' buffer.  Narrow from the
 start of the COUNTth-from-last navigatable block to `point-max'."
   (interactive "P")
   (unless (derived-mode-p 'agent-shell-mode)
-    (error "Not in an agent-shell buffer."))
+    (error "Not in an agent-shell buffer"))
   (save-excursion
     (widen)
     (goto-char (point-max))
@@ -9179,7 +9187,7 @@ or select a specific request to remove."
             (selection (cdr (assoc (completing-read "Remove: " choices nil t) choices))))
        (list (unless (eq selection 'remove-all) selection)))))
   (if remove-index
-      (when (y-or-n-p (format "Remove? \"%s\""
+      (when (y-or-n-p (format "Remove \"%s\"?"
                               (nth remove-index
                                    (map-elt agent-shell--state :pending-requests))))
         (let* ((pending (map-elt agent-shell--state :pending-requests))
