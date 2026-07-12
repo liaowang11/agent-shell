@@ -313,6 +313,7 @@ body un-fontified."
                                 '(agent-shell-markdown-watermark nil))))
     (let ((watermark (agent-shell-markdown--watermark-start))
           (external-results)
+          (context)
           (source-blocks)
           (source-ranges)
           (rendered-ranges)
@@ -320,22 +321,22 @@ body un-fontified."
           (avoid-ranges))
       (save-restriction
         (narrow-to-region watermark (point-max))
-        (setq source-blocks (agent-shell-markdown--source-blocks))
-        ;; The avoid ranges need to be of the form (start . end).
-        (setq source-ranges (agent-shell-markdown-sort-ranges
-                             (mapcar (lambda (source-block)
-                                       (cons (map-nested-elt source-block '(:block :start))
-                                             (map-nested-elt source-block '(:block :end))))
-                                     source-blocks)))
+        ;; Build the render context (fenced-block descriptors + inline
+        ;; `code' ranges) once, via the same function any external code
+        ;; renders a static region through, so the two cannot drift.
+        (setq context (agent-shell-markdown-context))
+        (setq source-blocks (map-elt context :source-blocks))
         ;; Inline `code' spans, computed before the renderers run so an
         ;; external renderer can skip verbatim spans the same way it skips
-        ;; fenced blocks.  Nothing is frozen yet, so source blocks are the
-        ;; only avoid-range; the markers survive any buffer edits a
-        ;; renderer makes and are reused as an avoid-range for the built-in
-        ;; passes below.
-        (setq inline-ranges (agent-shell-markdown--make-markers
-                             (agent-shell-markdown--inline-code-ranges
-                              :avoid-ranges source-ranges)))
+        ;; fenced blocks.  The markers survive any buffer edits a renderer
+        ;; makes and are reused as an avoid-range for the built-in passes
+        ;; below.
+        (setq inline-ranges (map-elt context :inline-code-ranges))
+        ;; Re-project the fenced-block descriptors to the plain (start . end)
+        ;; ranges the avoid-range machinery expects.  `agent-shell-markdown-context'
+        ;; is the single source of truth; this is a cheap derivation from
+        ;; its result.
+        (setq source-ranges (agent-shell-markdown--source-block-ranges source-blocks))
         ;; Run external renderers (when any are registered) before the
         ;; styling passes.  They tag their regions
         ;; `agent-shell-markdown-frozen', so the frozen ranges captured
@@ -343,7 +344,7 @@ body un-fontified."
         ;; skip them.
         (when agent-shell-markdown-render-functions
           (setq external-results (agent-shell-markdown--run-render-functions
-                                  source-blocks inline-ranges)))
+                                  context)))
         (setq rendered-ranges (agent-shell-markdown--make-markers
                                (agent-shell-markdown--frozen-ranges)))
         (setq avoid-ranges (agent-shell-markdown-sort-ranges
@@ -409,20 +410,64 @@ body un-fontified."
        :external-candidates (seq-keep (lambda (result) (map-elt result :watermark))
                                       external-results)))))
 
-(defun agent-shell-markdown--run-render-functions (source-blocks inline-code-ranges)
-  "Run `agent-shell-markdown-render-functions' with SOURCE-BLOCKS.
+(defun agent-shell-markdown--source-block-ranges (source-blocks)
+  "Project SOURCE-BLOCKS to sorted (START . END) marker ranges.
 
-Each registered function is called with a single alist context
-holding (:source-blocks . SOURCE-BLOCKS) and
-(:inline-code-ranges . INLINE-CODE-RANGES) and may render and
-freeze regions of the current (narrowed) buffer.  Returns the list
-of non-nil result alists, in hook order.
+Each descriptor in SOURCE-BLOCKS (see
+`agent-shell-markdown--source-blocks') carries a `:block' marker
+range; this returns just those ranges as plain (START . END) conses,
+sorted — the form the avoid-range machinery
+\(`agent-shell-markdown-in-avoid-range-p',
+`agent-shell-markdown-sort-ranges') expects."
+  (agent-shell-markdown-sort-ranges
+   (mapcar (lambda (source-block)
+             (cons (map-nested-elt source-block '(:block :start))
+                   (map-nested-elt source-block '(:block :end))))
+           source-blocks)))
+
+(defun agent-shell-markdown-context ()
+  "Return the render context for the current narrowed region.
+
+Builds the same CONTEXT alist that
+`agent-shell-markdown-replace-markup' hands to the functions in
+`agent-shell-markdown-render-functions', but for whatever region
+the buffer is narrowed to right now:
+
+  ((:source-blocks . SOURCE-BLOCKS)
+   (:inline-code-ranges . INLINE-CODE-RANGES))
+
+SOURCE-BLOCKS are the fenced-block descriptors from
+`agent-shell-markdown--source-blocks'.  INLINE-CODE-RANGES are
+marker ranges covering inline `code' span bodies, computed with the
+fenced blocks as avoid-ranges so backticks inside a fenced block are
+not mistaken for an inline span.  See
+`agent-shell-markdown-render-functions' for the meaning of each key.
+
+`agent-shell-markdown-replace-markup' builds its context through
+this function too, so code that renders a static (non-streamed)
+region — which never passes through the streaming render hook — can
+obtain the identical context and stay in sync with the streaming
+path."
+  (let* ((source-blocks (agent-shell-markdown--source-blocks))
+         (source-ranges (agent-shell-markdown--source-block-ranges source-blocks))
+         (inline-ranges (agent-shell-markdown--make-markers
+                         (agent-shell-markdown--inline-code-ranges
+                          :avoid-ranges source-ranges))))
+    (list (cons :source-blocks source-blocks)
+          (cons :inline-code-ranges inline-ranges))))
+
+(defun agent-shell-markdown--run-render-functions (context)
+  "Run `agent-shell-markdown-render-functions' with CONTEXT.
+
+CONTEXT is the alist from `agent-shell-markdown-context', holding
+\(:source-blocks . SOURCE-BLOCKS) and (:inline-code-ranges .
+INLINE-CODE-RANGES).  Each registered function is called with it
+and may render and freeze regions of the current (narrowed) buffer.
+Returns the list of non-nil result alists, in hook order.
 
 For example, with one renderer returning `((:watermark . 1200))'
 this returns `(((:watermark . 1200)))'."
-  (let ((context (list (cons :source-blocks source-blocks)
-                       (cons :inline-code-ranges inline-code-ranges)))
-        (results '()))
+  (let ((results '()))
     (run-hook-wrapped 'agent-shell-markdown-render-functions
                       (lambda (fn)
                         (when-let* ((result (funcall fn context)))
