@@ -323,7 +323,7 @@ streaming **not bold**" nil)))))
   (with-temp-buffer
     (insert "[x](</path/with spaces (1).png>)")
     (goto-char (point-min))
-    (should (re-search-forward (agent-shell-markdown--link-markup-regexp nil) nil t))
+    (should (re-search-forward (agent-shell-markdown--link-markup-regexp) nil t))
     (should (equal (agent-shell-markdown--link-markup-url)
                    "/path/with spaces (1).png"))))
 
@@ -332,7 +332,7 @@ streaming **not bold**" nil)))))
   (with-temp-buffer
     (insert "[x](https://example.com)")
     (goto-char (point-min))
-    (should (re-search-forward (agent-shell-markdown--link-markup-regexp nil) nil t))
+    (should (re-search-forward (agent-shell-markdown--link-markup-regexp) nil t))
     (should (equal (agent-shell-markdown--link-markup-url) "https://example.com"))))
 
 (ert-deftest agent-shell-markdown--link-markup-regexp-image-empty-alt ()
@@ -340,7 +340,7 @@ streaming **not bold**" nil)))))
   (with-temp-buffer
     (insert "![](<a b.png>)")
     (goto-char (point-min))
-    (should (re-search-forward (agent-shell-markdown--link-markup-regexp t) nil t))
+    (should (re-search-forward (agent-shell-markdown--link-markup-regexp :as-image? t) nil t))
     (should (equal (match-string 1) ""))
     (should (equal (agent-shell-markdown--link-markup-url) "a b.png"))))
 
