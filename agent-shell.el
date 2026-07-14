@@ -598,37 +598,58 @@ Returns an alist with all specified values."
     (:icon-name . ,icon-name)
     (:install-instructions . ,install-instructions)))
 
-(defun agent-shell--make-default-agent-configs ()
-  "Create a list of default agent configs.
+(defun agent-shell--default-agent-config-makers ()
+  "Return the list of default agent config maker functions.
 
-This function aggregates agents from OpenAI, Anthropic, Google,
-Goose, Cursor, CodeBuddy, Auggie, and others."
-  (list (agent-shell-auggie-make-agent-config)
-        (agent-shell-anthropic-make-claude-code-config)
-        (agent-shell-codebuddy-make-agent-config)
-        (agent-shell-cline-make-agent-config)
-        (agent-shell-openai-make-codex-config)
-        (agent-shell-cursor-make-agent-config)
-        (agent-shell-droid-make-agent-config)
-        (agent-shell-github-make-copilot-config)
-        (agent-shell-google-make-gemini-config)
-        (agent-shell-goose-make-agent-config)
-        (agent-shell-hermes-make-agent-config)
-        (agent-shell-kimi-make-config)
-        (agent-shell-kiro-make-config)
-        (agent-shell-mistral-make-config)
-        (agent-shell-omp-make-agent-config)
-        (agent-shell-opencode-make-agent-config)
-        (agent-shell-pi-make-agent-config)
-        (agent-shell-qwen-make-agent-config)))
+Each element is a function that returns a configuration alist when
+called.  Keeping makers (rather than pre-built configurations) means
+configurations are rebuilt on access and stay current across code
+reloads.  See `agent-shell-agent-configs'."
+  (list #'agent-shell-auggie-make-agent-config
+        #'agent-shell-anthropic-make-claude-code-config
+        #'agent-shell-codebuddy-make-agent-config
+        #'agent-shell-cline-make-agent-config
+        #'agent-shell-openai-make-codex-config
+        #'agent-shell-cursor-make-agent-config
+        #'agent-shell-droid-make-agent-config
+        #'agent-shell-github-make-copilot-config
+        #'agent-shell-google-make-gemini-config
+        #'agent-shell-goose-make-agent-config
+        #'agent-shell-hermes-make-agent-config
+        #'agent-shell-kimi-make-config
+        #'agent-shell-kiro-make-config
+        #'agent-shell-mistral-make-config
+        #'agent-shell-omp-make-agent-config
+        #'agent-shell-opencode-make-agent-config
+        #'agent-shell-pi-make-agent-config
+        #'agent-shell-qwen-make-agent-config))
 
 (defcustom agent-shell-agent-configs
-  (agent-shell--make-default-agent-configs)
+  (agent-shell--default-agent-config-makers)
   "The list of known agent configurations.
 
+Each entry is either a function that returns a configuration alist, or a
+configuration alist itself.  Functions are preferred and used by
+default: they are called on every access, so agent definitions stay
+current across code reloads.  Concrete alists are accepted for
+backwards compatibility.
+
 See `agent-shell-*-make-*-config' for details."
-  :type '(repeat (alist :key-type symbol :value-type sexp))
+  :type '(repeat (choice function
+                         (alist :key-type symbol :value-type sexp)))
   :group 'agent-shell)
+
+(defun agent-shell--resolved-agent-configs ()
+  "Return `agent-shell-agent-configs' with maker entries realized.
+
+Each entry is either a configuration alist or a function (a symbol or
+lambda) that returns one.  Functions are called on every access, so
+edits to the underlying makers take effect without rebuilding the list."
+  (mapcar (lambda (entry)
+            (if (functionp entry)
+                (funcall entry)
+              entry))
+          agent-shell-agent-configs))
 
 (defcustom agent-shell-preferred-agent-config nil
   "Default agent to use for all new shells.
@@ -798,7 +819,7 @@ Returns nil if no matching configuration is found."
    ((symbolp designator)
     (seq-find (lambda (config)
                 (eq (map-elt config :identifier) designator))
-              agent-shell-agent-configs))
+              (agent-shell--resolved-agent-configs)))
    ((listp designator) designator)))
 
 (defun agent-shell--preferred-config-and-mode ()
@@ -1371,10 +1392,15 @@ Returns nil if no icon should be displayed."
 
 When `agent-shell-preferred-agent-config' is set, its configuration is
 listed first and offered as the default selection."
-  (let* ((preferred (agent-shell--resolve-preferred-config))
+  (let* ((configs (agent-shell--resolved-agent-configs))
+         (preferred (agent-shell--resolve-preferred-config))
          (configs (if preferred
-                      (cons preferred (remove preferred agent-shell-agent-configs))
-                    agent-shell-agent-configs))
+                      (cons preferred
+                            (seq-remove (lambda (config)
+                                          (eq (map-elt config :identifier)
+                                              (map-elt preferred :identifier)))
+                                        configs))
+                    configs))
          (choices (mapcar
                    (lambda (config)
                      (cons (propertize
