@@ -73,6 +73,7 @@
 (declare-function agent-shell-set-session-mode "agent-shell")
 (declare-function agent-shell-set-session-model "agent-shell")
 (declare-function agent-shell-set-session-thought-level "agent-shell")
+(declare-function agent-shell-set-session-config-option "agent-shell")
 (declare-function agent-shell-ui-backward-block "agent-shell")
 (declare-function agent-shell-ui-forward-block "agent-shell")
 (declare-function agent-shell-ui-mode "agent-shell")
@@ -1031,6 +1032,24 @@ buffer from the snapshot and switch to edit mode."
                           :existing-only t)))
     (with-current-buffer shell-buffer
       (agent-shell-set-session-thought-level
+       (lambda ()
+         (when viewport-buffer
+           (with-current-buffer viewport-buffer
+             (agent-shell-viewport--update-header))))))))
+
+(defun agent-shell-viewport-set-session-config-option ()
+  "Set a session config option."
+  (declare (modes agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
+  (interactive)
+  (agent-shell-viewport--ensure-buffer)
+  (let* ((shell-buffer (or (agent-shell--current-shell)
+                           (user-error "Not in an agent-shell buffer")))
+         (viewport-buffer (agent-shell-viewport--buffer
+                           :shell-buffer shell-buffer
+                           :existing-only t)))
+    (with-current-buffer shell-buffer
+      (agent-shell-set-session-config-option
        (lambda ()
          (when viewport-buffer
            (with-current-buffer viewport-buffer
