@@ -7048,6 +7048,36 @@ new one is stacked on top, adding an extra visible blank line per reply."
             (insert "/compact")
             (should (equal (buffer-string) "/compact"))))))))
 
+(ert-deftest agent-shell-viewport-set-session-config-option-integration-test ()
+  "The config command is bound in both modes and refreshes the viewport."
+  (should (eq (lookup-key agent-shell-viewport-edit-mode-map (kbd "C-c C-s"))
+              #'agent-shell-viewport-set-session-config-option))
+  (should (eq (lookup-key agent-shell-viewport-view-mode-map (kbd "C-c C-s"))
+              #'agent-shell-viewport-set-session-config-option))
+  (let ((shell-buffer (generate-new-buffer " *test-shell*"))
+        (viewport-buffer (generate-new-buffer " *test-shell* [viewport]"))
+        called-buffer refreshed)
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     #'ignore))
+            (agent-shell-viewport-view-mode))
+          (cl-letf (((symbol-function 'agent-shell--current-shell)
+                     (lambda () shell-buffer))
+                    ((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-set-session-config-option)
+                     (lambda (on-success)
+                       (setq called-buffer (current-buffer))
+                       (funcall on-success)))
+                    ((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () (setq refreshed (current-buffer)))))
+            (agent-shell-viewport-set-session-config-option)
+            (should (eq called-buffer shell-buffer))
+            (should (eq refreshed viewport-buffer))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell--prompt-queue-replace-replaces-in-place-test ()
   "Test `agent-shell--prompt-queue-replace' replaces the request at INDEX."
   (with-temp-buffer
