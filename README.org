@@ -1344,6 +1344,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-viewport-reply-more                         | Reply with "more" and send immediately.                                       |
 |                                                       | agent-shell-viewport-reply-yes                          | Reply with "yes" and send immediately.                                        |
 |                                                       | agent-shell-viewport-search-history                     | Search prompt history, select, and insert into compose buffer.                |
+|                                                       | agent-shell-viewport-set-session-config-option          | Set a session config option.                                                  |
 |                                                       | agent-shell-viewport-set-session-mode                   | Set session mode.                                                             |
 |                                                       | agent-shell-viewport-set-session-model                  | Set session model.                                                            |
 |                                                       | agent-shell-viewport-set-session-thought-level          | Set thought level (reasoning effort) for the current session.                 |
