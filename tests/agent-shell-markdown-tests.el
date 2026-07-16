@@ -1313,6 +1313,26 @@ A " nil)
                     (get-text-property pos 'agent-shell-ui-section)))
         (should (eq t (get-text-property pos 'invisible)))))))
 
+(ert-deftest agent-shell-markdown-header-keeps-visible-title-before-hidden-newline ()
+  (with-temp-buffer
+    (insert (propertize "# Title"
+                        'agent-shell-ui-section 'body))
+    (insert (propertize "\n"
+                        'agent-shell-ui-section 'body
+                        'invisible t))
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "Title\n"))
+    (dotimes (i (length "Title"))
+      (let ((pos (+ (point-min) i)))
+        (should (eq 'body
+                    (get-text-property pos 'agent-shell-ui-section)))
+        (should-not (get-text-property pos 'invisible))))
+    (let ((newline-pos (+ (point-min) (length "Title"))))
+      (should (eq 'body
+                  (get-text-property newline-pos 'agent-shell-ui-section)))
+      (should (eq t (get-text-property newline-pos 'invisible))))))
+
 (ert-deftest agent-shell-markdown-watermark-keeps-pending-table-in-scope ()
   ;; When table rows stream in one at a time, the table needs at least
   ;; two consecutive pipe-rows in scope before `--find-tables' will

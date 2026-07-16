@@ -653,7 +653,7 @@ with face `agent-shell-markdown-header-2' on \"My title\"."
             (goto-char markup-start)
             (insert text "\n")
             (when carried
-              (add-text-properties markup-start (point) carried))
+              (add-text-properties (1- (point)) (point) carried))
             (let ((end (+ markup-start (length text))))
               (add-face-text-property
                markup-start end
