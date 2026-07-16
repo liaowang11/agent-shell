@@ -78,6 +78,7 @@
 (declare-function agent-shell-set-session-mode "agent-shell")
 (declare-function agent-shell-set-session-model "agent-shell")
 (declare-function agent-shell-set-session-thought-level "agent-shell")
+(declare-function agent-shell-set-session-config-option "agent-shell")
 (declare-function agent-shell-ui-backward-block "agent-shell")
 (declare-function agent-shell-ui-forward-block "agent-shell")
 (declare-function agent-shell-ui-mode "agent-shell")
@@ -1160,6 +1161,24 @@ Called from the compose page itself, there is no next page to show."
            (with-current-buffer viewport-buffer
              (agent-shell-viewport--update-header))))))))
 
+(defun agent-shell-viewport-set-session-config-option ()
+  "Set a session config option."
+  (declare (modes agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
+  (interactive)
+  (agent-shell-viewport--ensure-buffer)
+  (let* ((shell-buffer (or (agent-shell--current-shell)
+                           (user-error "Not in an agent-shell buffer")))
+         (viewport-buffer (agent-shell-viewport--buffer
+                           :shell-buffer shell-buffer
+                           :existing-only t)))
+    (with-current-buffer shell-buffer
+      (agent-shell-set-session-config-option
+       (lambda ()
+         (when viewport-buffer
+           (with-current-buffer viewport-buffer
+             (agent-shell-viewport--update-header))))))))
+
 (defun agent-shell-viewport-cycle-session-mode ()
   "Cycle through available session modes."
   (declare (modes agent-shell-viewport-view-mode
@@ -1316,6 +1335,7 @@ VIEWPORT-BUFFER is the viewport buffer to check."
     (define-key map (kbd "C-c C-m") #'agent-shell-viewport-set-session-mode)
     (define-key map (kbd "C-c C-v") #'agent-shell-viewport-set-session-model)
     (define-key map (kbd "C-c C-t") #'agent-shell-viewport-set-session-thought-level)
+    (define-key map (kbd "C-c C-s") #'agent-shell-viewport-set-session-config-option)
     (define-key map (kbd "C-c C-o") #'agent-shell-other-buffer)
     (define-key map (kbd "M-p") #'agent-shell-viewport-previous-history)
     (define-key map (kbd "M-n") #'agent-shell-viewport-next-history)
@@ -1358,6 +1378,7 @@ VIEWPORT-BUFFER is the viewport buffer to check."
     (define-key map (kbd "s") #'agent-shell-viewport-set-session-mode)
     (define-key map (kbd "t") #'agent-shell-viewport-set-session-thought-level)
     (define-key map (kbd "o") #'agent-shell-other-buffer)
+    (define-key map (kbd "C-c C-s") #'agent-shell-viewport-set-session-config-option)
     (define-key map (kbd "C-c C-o") #'agent-shell-other-buffer)
     (define-key map (kbd "?") #'agent-shell-viewport-help-menu)
     map)
@@ -1429,6 +1450,8 @@ VIEWPORT-BUFFER is the viewport buffer to check."
                          (:description . "Set mode"))
                         ((:function . agent-shell-viewport-set-session-thought-level)
                          (:description . "Set thought level"))
+                        ((:function . agent-shell-viewport-set-session-config-option)
+                         (:description . "Set option"))
                         ((:function . agent-shell-viewport-cycle-session-mode)
                          (:description . "Cycle mode"))
                         ((:function . agent-shell-viewport-interrupt)
@@ -1495,6 +1518,8 @@ VIEWPORT-BUFFER is the viewport buffer to check."
                          (:description . "Set mode"))
                         ((:function . agent-shell-viewport-set-session-thought-level)
                          (:description . "Set thought level"))
+                        ((:function . agent-shell-viewport-set-session-config-option)
+                         (:description . "Set option"))
                         ((:function . agent-shell-viewport-cycle-session-mode)
                          (:description . "Cycle mode"))
                         ((:function . agent-shell-other-buffer)
