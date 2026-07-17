@@ -2695,6 +2695,57 @@ so the command must not append a second time."
              (lambda () nil)))
     (should-not (agent-shell--prompt-select-session nil))))
 
+(ert-deftest agent-shell--apply-session-choices-test ()
+  "Test `agent-shell--apply-session-choices'."
+  (let ((choices '(("New shell" . :new-shell)
+                   ("New Downloads shell" . :downloads-shell)
+                   ("New temp shell" . :temp-shell))))
+    ;; nil passes choices through unchanged.
+    (let ((agent-shell-session-choices-function nil))
+      (should (equal (agent-shell--apply-session-choices choices) choices)))
+    ;; A filtering function returns the surviving subset.
+    (let ((agent-shell-session-choices-function
+           (lambda (candidates)
+             (seq-remove (lambda (choice) (eq (cdr choice) :temp-shell))
+                         candidates))))
+      (should (equal (agent-shell--apply-session-choices choices)
+                     '(("New shell" . :new-shell)
+                       ("New Downloads shell" . :downloads-shell)))))
+    ;; Relabeling a choice (same token, new label) is allowed.
+    (let ((agent-shell-session-choices-function
+           (lambda (candidates)
+             (mapcar (lambda (choice)
+                       (if (eq (cdr choice) :new-shell)
+                           (cons "Start fresh" :new-shell)
+                         choice))
+                     candidates))))
+      (should (equal (agent-shell--apply-session-choices choices)
+                     '(("Start fresh" . :new-shell)
+                       ("New Downloads shell" . :downloads-shell)
+                       ("New temp shell" . :temp-shell)))))
+    ;; A non-list return signals an error.
+    (let ((agent-shell-session-choices-function (lambda (_candidates) "nope")))
+      (should-error (agent-shell--apply-session-choices choices) :type 'user-error))
+    ;; An empty return signals an error.
+    (let ((agent-shell-session-choices-function (lambda (_candidates) nil)))
+      (should-error (agent-shell--apply-session-choices choices) :type 'user-error))
+    ;; A choice that was not offered signals an error.
+    (let ((agent-shell-session-choices-function (lambda (_candidates) '(("Bogus" . :bogus)))))
+      (should-error (agent-shell--apply-session-choices choices) :type 'user-error))))
+
+(ert-deftest agent-shell--prompt-select-session-new-shell-test ()
+  "Test `agent-shell--prompt-select-session' returns nil for the new-shell choice."
+  (let ((noninteractive nil)
+        (other-buffer (get-buffer-create "*other-agent-shell*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-buffers)
+                   (lambda () (list other-buffer)))
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'completing-read)
+                   (lambda (&rest _) "New shell")))
+          (should-not (agent-shell--prompt-select-session nil)))
+      (kill-buffer other-buffer))))
+
 (ert-deftest agent-shell--validate-session-strategy-test ()
   "Test `agent-shell--validate-session-strategy' accepts supported values
 and rejects `new-deferred' and other unknown values."

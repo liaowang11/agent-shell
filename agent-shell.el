@@ -763,6 +763,65 @@ Available values:
          (set-default sym value))
   :group 'agent-shell)
 
+(defcustom agent-shell-session-choices-function nil
+  "Function to transform the choices offered when starting a shell.
+
+When nil, all choices are offered unchanged.
+
+Otherwise called with the list of candidate choices and must return the
+choices to actually offer.  Each candidate is a cons cell (LABEL . TOKEN)
+where LABEL is the displayed string and TOKEN identifies the choice:
+
+  `:new-shell': Start a new shell.
+  `:downloads-shell': Start a new shell in ~/Downloads.
+  `:temp-shell': Start a new shell in a temporary directory.
+  `:other-shell': Switch to an existing shell buffer.
+
+Resumable session candidates use their session alist as TOKEN.
+
+The function may filter, reorder, or relabel the choices.  Labels are
+display-only, so renaming them is fine, but it must not introduce a
+choice whose TOKEN was not offered.  Returning a non-list, an empty list,
+or a choice with an unknown token signals an error.
+
+For example, to hide the Downloads and temp choices:
+
+  (setq agent-shell-session-choices-function
+        (lambda (choices)
+          (seq-remove (lambda (choice)
+                        (memq (cdr choice) '(:downloads-shell :temp-shell)))
+                      choices)))"
+  :type '(choice (const :tag "Offer all choices" nil)
+                 (function :tag "Transform function"))
+  :group 'agent-shell)
+
+(defun agent-shell--apply-session-choices (choices)
+  "Apply `agent-shell-session-choices-function' to CHOICES.
+
+CHOICES is a list of (LABEL . TOKEN) candidate conses.  Returns the
+transformed list.  Signals a `user-error' when the configured function
+returns something invalid, so a broken configuration is reported against
+the setting rather than failing obscurely downstream.
+
+For example, with the default nil value choices pass through unchanged:
+
+  (agent-shell--apply-session-choices \\='((\"New shell\" . :new-shell)))
+  => \\='((\"New shell\" . :new-shell))"
+  (if agent-shell-session-choices-function
+      (let ((result (funcall agent-shell-session-choices-function choices)))
+        (unless (listp result)
+          (user-error "`agent-shell-session-choices-function' must return a list, got: %S"
+                      result))
+        (unless result
+          (user-error "`agent-shell-session-choices-function' returned no choices"))
+        (let ((tokens (mapcar #'cdr choices)))
+          (dolist (choice result)
+            (unless (member (cdr choice) tokens)
+              (user-error "`agent-shell-session-choices-function' returned a choice with an unknown token: %S"
+                          (cdr choice)))))
+        result)
+    choices))
+
 (defvar agent-shell-idle-timeout 30
   "Seconds before an `idle' event is emitted.
 
@@ -5654,18 +5713,18 @@ Falls back to latest session in batch mode (e.g. tests)."
                                                               acp-sessions))))
                                    columns)))
              ;; TODO: Consolidate choices with `agent-shell--shell-buffer'.
-             (session-choices (append (list (cons new-session-choice nil)
-                                            (cons "New Downloads shell" :downloads-shell)
-                                            (cons "New temp shell" :temp-shell))
-                                      (when other-shells
-                                        (list (cons "Switch to shell buffer" :other-shell)))
-                                      (mapcar (lambda (acp-session)
-                                                (cons (agent-shell--session-choice-label
-                                                       :acp-session acp-session
-                                                       :max-widths max-widths)
-                                                      acp-session))
-                                              acp-sessions)))
-             (candidates (mapcar #'car session-choices))
+             (session-choices (agent-shell--apply-session-choices
+                               (append (list (cons new-session-choice :new-shell)
+                                             (cons "New Downloads shell" :downloads-shell)
+                                             (cons "New temp shell" :temp-shell))
+                                       (when other-shells
+                                         (list (cons "Switch to shell buffer" :other-shell)))
+                                       (mapcar (lambda (acp-session)
+                                                 (cons (agent-shell--session-choice-label
+                                                        :acp-session acp-session
+                                                        :max-widths max-widths)
+                                                       acp-session))
+                                               acp-sessions))))
              ;; Some completion frameworks yielded appended (nil) to each line
              ;; unless this-command was bound.
              ;;
@@ -5675,17 +5734,26 @@ Falls back to latest session in batch mode (e.g. tests)."
              ;; Let's optimize the rocket engine      Feb 12, 21:02 (nil)
              (this-command 'agent-shell))
         (agent-shell--emit-event :event 'session-prompt)
-        (let ((selection (completing-read "Start shell (default: new): "
-                                          (lambda (string pred action)
-                                            (if (eq action 'metadata)
-                                                '(metadata
-                                                  (display-sort-function . identity)
-                                                  (eager-display . t)
-                                                  (eager-update . t))
-                                              (complete-with-action action candidates string pred)))
-                                          nil t nil nil
-                                          new-session-choice)))
+        ;; Default to the first surviving choice, since a transform may have
+        ;; reordered or dropped new-shell.  Sessions get a generic label
+        ;; (their real label is a long column-padded string).
+        (let* ((default-choice (caar session-choices))
+               (selection (completing-read
+                           (format "Start shell (default: %s): "
+                                   (if (keywordp (cdar session-choices))
+                                       default-choice
+                                     "Resume session"))
+                           (lambda (string pred action)
+                             (if (eq action 'metadata)
+                                 '(metadata
+                                   (display-sort-function . identity)
+                                   (eager-display . t)
+                                   (eager-update . t))
+                               (complete-with-action action session-choices string pred)))
+                           nil t nil nil
+                           default-choice)))
           (pcase (map-elt session-choices selection)
+            (:new-shell nil)
             (:other-shell
              (let ((other-shell (agent-shell--read-shell-buffer
                                  :prompt "Switch to shell buffer: "
@@ -6861,26 +6929,26 @@ Returns a buffer object or nil."
         (if (and (eq agent-shell-session-strategy 'new-deferred)
                  (agent-shell-buffers))
             ;; TODO: Consolidate choices with `agent-shell--prompt-select-session'.
-            (let* ((start-new "New shell")
-                   (start-downloads "New Downloads shell")
-                   (start-temp "New temp shell")
-                   (open-existing "Switch to shell buffer")
-                   (choice (completing-read "Start shell (default: new): "
-                                            (list start-new start-downloads start-temp open-existing) nil t)))
-              (cond
-               ((equal choice open-existing)
-                (agent-shell--read-shell-buffer :prompt "Switch to shell buffer: "))
-               ((equal choice start-downloads)
-                (agent-shell-new-downloads-shell :no-display t))
-               ((equal choice start-temp)
-                (agent-shell-new-temp-shell :no-display t))
-               (t
-                (agent-shell--start :config (or (agent-shell--auto-preferred-config)
-                                                (agent-shell-select-config
-                                                 :prompt "Start new agent: ")
-                                                (error "No agent config found"))
-                                    :no-focus t
-                                    :new-session t))))
+            (let* ((choices (agent-shell--apply-session-choices
+                             (list (cons "New shell" :new-shell)
+                                   (cons "New Downloads shell" :downloads-shell)
+                                   (cons "New temp shell" :temp-shell)
+                                   (cons "Switch to shell buffer" :other-shell))))
+                   (selection (completing-read "Start shell (default: new): " choices nil t)))
+              (pcase (map-elt choices selection)
+                (:other-shell
+                 (agent-shell--read-shell-buffer :prompt "Switch to shell buffer: "))
+                (:downloads-shell
+                 (agent-shell-new-downloads-shell :no-display t))
+                (:temp-shell
+                 (agent-shell-new-temp-shell :no-display t))
+                (_
+                 (agent-shell--start :config (or (agent-shell--auto-preferred-config)
+                                                 (agent-shell-select-config
+                                                  :prompt "Start new agent: ")
+                                                 (error "No agent config found"))
+                                     :no-focus t
+                                     :new-session t))))
           (agent-shell--start :config (or (agent-shell--auto-preferred-config)
                                           (agent-shell-select-config
                                            :prompt "Start new agent: ")
