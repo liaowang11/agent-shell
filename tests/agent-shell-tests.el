@@ -4161,5 +4161,24 @@ and the completed/total count lets a non-completed member lift the total only."
                              (label '("completed" "completed" "in_progress"
                                       "pending" "in_progress"))))))
 
+(ert-deftest agent-shell--adapt-notification-test ()
+  "Test `agent-shell--adapt-notification'."
+  (let ((state (agent-shell--make-state
+                :agent-config (agent-shell-make-agent-config :identifier 'test))))
+    (should (equal (agent-shell--adapt-notification
+                    :state state
+                    :acp-notification '((some-key . "some-value")))
+                  '((some-key . "some-value")))))
+  (let* ((adapter (lambda (&key acp-notification)
+                    (cons '(adapted . t) acp-notification)))
+         (state (agent-shell--make-state
+                 :agent-config (agent-shell-make-agent-config
+                                :identifier 'test
+                                :notification-adapter adapter))))
+    (should (equal (agent-shell--adapt-notification
+                    :state state
+                    :acp-notification '((some-key . "some-value")))
+                  '((adapted . t) (some-key . "some-value"))))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here
