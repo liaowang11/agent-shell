@@ -470,7 +470,7 @@ is added automatically."
 
 Long-running agent turns can outlast the system idle-sleep timeout,
 suspending the machine (and the agent) before the turn completes.  When
-non-nil, agent-shell blocks system idle sleep for the duration of each
+non-nil, `agent-shell' blocks system idle sleep for the duration of each
 turn and releases the block once the turn finishes, so the system is
 only kept awake while there is work in progress.  The display is still
 allowed to blank.
@@ -564,6 +564,7 @@ Each element can be:
                                               authenticate-request-maker
                                               default-model-id
                                               default-session-mode-id
+                                              notification-adapter
                                               icon-name
                                               install-instructions)
   "Create an agent configuration alist.
@@ -580,6 +581,7 @@ Keyword arguments:
 - AUTHENTICATE-REQUEST-MAKER: Function to create authentication requests
 - DEFAULT-MODEL-ID: Default model ID (function returning value).
 - DEFAULT-SESSION-MODE-ID: Default session mode ID (function returning value).
+- NOTIFICATION-ADAPTER: Optional function to modify/normalize `notification'
 - ICON-NAME: Name of the icon to use
 - INSTALL-INSTRUCTIONS: Instructions to show when executable is not found
 
@@ -595,6 +597,7 @@ Returns an alist with all specified values."
     (:authenticate-request-maker . ,authenticate-request-maker) ;; function
     (:default-model-id . ,default-model-id)                     ;; function
     (:default-session-mode-id . ,default-session-mode-id)       ;; function
+    (:notification-adapter . ,notification-adapter)            ;; function
     (:icon-name . ,icon-name)
     (:install-instructions . ,install-instructions)))
 
@@ -737,7 +740,7 @@ value and signals a migration error.")
 (defun agent-shell--validate-session-strategy (value)
   "Signal an error if VALUE is not a supported `agent-shell-session-strategy'.
 
-`new-deferred' was removed in agent-shell 0.54.  Use `new' for a fresh
+`new-deferred' was removed in `agent-shell' 0.54.  Use `new' for a fresh
 session without prompting, or `prompt' to choose."
   (unless (memq value '(new latest prompt))
     (user-error
@@ -2063,6 +2066,17 @@ Includes pretty-printed JSON and a `file a feature request' link."
             (insert (json-serialize acp-notification))
             (json-pretty-print (point-min) (point-max))
             (buffer-string))))
+
+(cl-defun agent-shell--adapt-notification (&key state acp-notification)
+  "Return ACP-NOTIFICATION after optional agent-specific adaptation.
+
+When STATE's agent config defines `:notification-adapter', invoke it
+with `:acp-notification' and return the result.  Otherwise return
+original ACP-NOTIFICATION."
+  (if-let* ((adapter (map-nested-elt state '(:agent-config :notification-adapter)))
+            ((functionp adapter)))
+      (funcall adapter :acp-notification acp-notification)
+    acp-notification))
 
 (defun agent-shell--format-tool-call-input (acp-raw-input)
   "Format ACP-RAW-INPUT from a tool call as a fenced code block.
@@ -6403,7 +6417,13 @@ Each entry is normalized via `agent-shell--make-mcp-server'."
   (acp-subscribe-to-notifications
    :client (map-elt state :client)
    :on-notification (lambda (acp-notification)
-                      (agent-shell--on-notification :state state :acp-notification acp-notification)))
+                      (agent-shell--on-notification
+                       :state state
+                       :acp-notification
+                       (agent-shell--adapt-notification
+                        :state state
+                        :acp-notification acp-notification)
+                       )))
   (acp-subscribe-to-requests
    :client (map-elt state :client)
    :on-request (lambda (acp-request)
