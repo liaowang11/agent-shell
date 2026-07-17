@@ -1295,6 +1295,29 @@ A " nil)
     (should (equal (substring-no-properties (buffer-string))
                    "@@ -1,2 +1,2 @@\n # Test Document Title\n-old\n+new\n"))))
 
+(ert-deftest agent-shell-markdown-header-keeps-properties-scoped ()
+  (with-temp-buffer
+    (insert (propertize "# "
+                        'agent-shell-ui-section 'body
+                        'invisible 'markdown-markup))
+    (insert (propertize "Title"
+                        'agent-shell-ui-section 'body))
+    (insert (propertize "\n"
+                        'agent-shell-ui-section 'body
+                        'invisible t))
+    (agent-shell-markdown-replace-markup)
+    (should (equal (substring-no-properties (buffer-string))
+                   "Title\n"))
+    (dotimes (i (length "Title"))
+      (let ((pos (+ (point-min) i)))
+        (should (eq 'body
+                    (get-text-property pos 'agent-shell-ui-section)))
+        (should-not (get-text-property pos 'invisible))))
+    (let ((newline-pos (+ (point-min) (length "Title"))))
+      (should (eq 'body
+                  (get-text-property newline-pos 'agent-shell-ui-section)))
+      (should (eq t (get-text-property newline-pos 'invisible))))))
+
 (ert-deftest agent-shell-markdown-header-preserves-caller-text-properties ()
   ;; The header pass deletes the matched `#…\n' and re-inserts the
   ;; faced title plus a fresh `\n'.  The inserted newline must carry

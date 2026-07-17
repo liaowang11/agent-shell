@@ -641,20 +641,18 @@ with face `agent-shell-markdown-header-2' on \"My title\"."
                                                     'agent-shell-markdown-source)
                            (agent-shell-markdown-reconstruct
                             markup-start (match-end 2))))
-                 ;; The trailing `\\n' we re-insert below would otherwise
-                 ;; punch a hole in the caller's contiguous block range
-                 ;; (eg. `invisible'/`agent-shell-ui-section') and break
-                 ;; toggle/replace operations — same hazard called out in
-                 ;; `--style-source-blocks'.  Carry over the original
-                 ;; newline's caller props.
-                 (carried (agent-shell-markdown--carry-properties
-                           (1- markup-end))))
+                 ;; `text' keeps the title's own properties.  Carry the newline
+                 ;; separately so its trailing-whitespace invisibility does not
+                 ;; hide the title.
+                 (newline-properties
+                  (agent-shell-markdown--carry-properties (1- markup-end))))
             (delete-region markup-start markup-end)
             (goto-char markup-start)
-            (insert text "\n")
-            (when carried
-              (add-text-properties markup-start (point) carried))
-            (let ((end (+ markup-start (length text))))
+            (insert text)
+            (let ((end (point)))
+              (insert "\n")
+              (when newline-properties
+                (add-text-properties end (point) newline-properties))
               (add-face-text-property
                markup-start end
                (intern (format "agent-shell-markdown-header-%d"
