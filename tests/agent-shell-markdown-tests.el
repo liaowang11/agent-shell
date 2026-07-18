@@ -301,6 +301,49 @@ streaming **not bold**" nil)))))
     (should (equal (agent-shell-markdown-reconstruct (point-min) (point-max))
                    "x ![](https://example.com/a.png) y"))))
 
+(ert-deftest agent-shell-markdown-convert-link-angle-brackets ()
+  ;; CommonMark angle-bracketed destination `[t](<url>)' renders like the
+  ;; bare form, with both the brackets and the angle brackets stripped.
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "see [docs](<https://example.com>) please"))
+                 '(("see " nil)
+                   ("docs" (agent-shell-markdown-link))
+                   (" please" nil)))))
+
+(ert-deftest agent-shell-markdown-convert-image-angle-brackets-remote-falls-back ()
+  ;; A remote image whose destination is angle-bracketed still resolves to
+  ;; the http url (brackets stripped), so the non-inline fallback is a link.
+  (should (equal (agent-shell-markdown--deconstruct
+                  (agent-shell-markdown-convert "![docs](<https://example.com/a.png>)"))
+                 '(("docs" (agent-shell-markdown-link))))))
+
+(ert-deftest agent-shell-markdown--link-markup-url-angle-allows-spaces ()
+  ;; The whole point of the angle-bracket form: the url may contain spaces
+  ;; (and parentheses), which the bare `(...)' form cannot represent.
+  (with-temp-buffer
+    (insert "[x](</path/with spaces (1).png>)")
+    (goto-char (point-min))
+    (should (re-search-forward (agent-shell-markdown--link-markup-regexp) nil t))
+    (should (equal (agent-shell-markdown--link-markup-url)
+                   "/path/with spaces (1).png"))))
+
+(ert-deftest agent-shell-markdown--link-markup-url-bare-form ()
+  ;; The bare destination is still captured (from group 3) unchanged.
+  (with-temp-buffer
+    (insert "[x](https://example.com)")
+    (goto-char (point-min))
+    (should (re-search-forward (agent-shell-markdown--link-markup-regexp) nil t))
+    (should (equal (agent-shell-markdown--link-markup-url) "https://example.com"))))
+
+(ert-deftest agent-shell-markdown--link-markup-regexp-image-empty-alt ()
+  ;; Image alt may be empty; the angle-bracketed url is still captured.
+  (with-temp-buffer
+    (insert "![](<a b.png>)")
+    (goto-char (point-min))
+    (should (re-search-forward (agent-shell-markdown--link-markup-regexp :as-image? t) nil t))
+    (should (equal (match-string 1) ""))
+    (should (equal (agent-shell-markdown--link-markup-url) "a b.png"))))
+
 (ert-deftest agent-shell-markdown-convert-link-in-fenced-block-untouched ()
   ;; The `[b](v)' inside fences stays literal — it isn't re-processed
   ;; as a link.  Body chars carry the `agent-shell-markdown-frozen'

@@ -25,6 +25,7 @@ With agent-shell, you can interact with any ACP-driven agent like:
 - [[https://github.com/agentclientprotocol/codex-acp][Codex]] (OpenAI)
 - [[https://github.com/google-gemini/gemini-cli][Gemini CLI]] (Google)
 - [[https://goose-docs.ai/docs/getting-started/installation][Goose]]
+- [[https://docs.x.ai/docs/overview][Grok Build]] (xAI)
 - [[https://cursor.com/docs/cli][Cursor]]
 - [[https://www.kimi.com/code][Kimi Code CLI]]
 - [[https://www.codebuddy.ai][CodeBuddy]]
@@ -134,6 +135,25 @@ For Google's [[https://github.com/google-gemini/gemini-cli][Gemini CLI]], be sur
 *** Goose
 
 For Goose CLI, install [[https://goose-docs.ai/docs/getting-started/installation][goose]] and ensure the =goose= executable is in PATH.
+
+*** Grok Build (xAI)
+
+For [[https://docs.x.ai/docs/overview][Grok Build]], install the Grok CLI so =grok= is on =PATH= (the installer typically puts it at =~/.grok/bin=). Authenticate once via the CLI login flow (credentials live in =~/.grok/auth.json=).
+
+Grok Build speaks ACP over stdio:
+
+#+begin_src bash
+grok agent stdio
+#+end_src
+
+Optional flags (set via =agent-shell-xai-acp-command=):
+
+#+begin_src bash
+grok agent -m grok-build stdio
+grok agent --always-approve stdio
+#+end_src
+
+See also the [[https://zed.dev/acp/agent/grok-build][Zed ACP registry listing]] for Grok Build.
 
 *** Cursor
 
@@ -615,7 +635,7 @@ Huge thanks for /gdindi/ for finding and and describing this in https://github.c
 
 *** Customizing Available Agents
 
-By default, =agent-shell= includes configurations for all supported agents (Claude Agent, Gemini CLI, Codex, Goose, Cursor, CodeBuddy, Qwen Code, and Auggie). You can customize which agents are available through the =agent-shell-agent-configs= variable.
+By default, =agent-shell= includes configurations for all supported agents (Claude Agent, Gemini CLI, Codex, Goose, Grok Build, Cursor, CodeBuddy, Qwen Code, and Auggie). You can customize which agents are available through the =agent-shell-agent-configs= variable.
 
 ** Usage
 
@@ -635,6 +655,7 @@ Start a specific agent shell session directly:
 - =M-x agent-shell-openai-start-codex= - Start a Codex agent session
 - =M-x agent-shell-google-start-gemini= - Start a Gemini agent session
 - =M-x agent-shell-goose-start-agent= - Start a Goose agent session
+- =M-x agent-shell-xai-start-grok= - Start a Grok Build (xAI) agent session
 - =M-x agent-shell-cursor-start-agent= - Start a Cursor agent session
 - =M-x agent-shell-kiro-start-agent= - Start a Kiro CLI agent session
 - =M-x agent-shell-mistral-start-vibe= - Start a Mistral Vibe agent session
@@ -648,6 +669,12 @@ You can set a default agent to use for all new shells started via =agent-shell= 
 
 #+begin_src emacs-lisp
 (setq agent-shell-preferred-agent-config (agent-shell-anthropic-make-claude-code-config))
+#+end_src
+
+Or by identifier (e.g. Grok Build):
+
+#+begin_src emacs-lisp
+(setq agent-shell-preferred-agent-config 'grok-build)
 #+end_src
 
 *** Configuring MCP servers
@@ -935,6 +962,10 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-ui-mode-hook                      | Hook run after entering or leaving ‘agent-shell-ui-mode’.                       |
 | agent-shell-user-message-expand-by-default    | Whether user message sections should be expanded by default.                    |
 | agent-shell-write-inhibit-minor-modes         | List of minor mode commands to inhibit during ‘fs/write_text_file’ edits.       |
+| agent-shell-xai-acp-command                   | Command and parameters for the Grok Build (xAI) ACP client.                     |
+| agent-shell-xai-default-model-id              | Default Grok Build model ID.                                                    |
+| agent-shell-xai-default-session-mode-id       | Default Grok Build session mode ID.                                             |
+| agent-shell-xai-environment                   | Environment variables for the Grok Build ACP client.                            |
 
 * Commands
 #+BEGIN_SRC emacs-lisp :results table :colnames '("Binding" "Command" "Description") :exports results

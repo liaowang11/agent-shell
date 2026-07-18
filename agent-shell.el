@@ -28,8 +28,8 @@
 ;; interact with any agent powered by ACP (Agent Client Protocol).
 ;;
 ;; `agent-shell' currently provides access to Claude Code, Cursor,
-;; CodeBuddy, Gemini CLI, Goose, Codex, OpenCode, Qwen, and Auggie
-;; amongst other agents.
+;; CodeBuddy, Gemini CLI, Goose, Grok Build (xAI), Codex, OpenCode,
+;; Qwen, and Auggie amongst other agents.
 ;;
 ;; This package depends on the `acp' package to provide the ACP layer
 ;; as per https://agentclientprotocol.com spec.
@@ -86,6 +86,7 @@
 (require 'agent-shell-worktree)
 (require 'agent-shell-ui)
 (require 'agent-shell-viewport)
+(require 'agent-shell-xai)
 (require 'image)
 (require 'markdown-overlays)
 (require 'shell-maker)
@@ -627,7 +628,8 @@ reloads.  See `agent-shell-agent-configs'."
         #'agent-shell-omp-make-agent-config
         #'agent-shell-opencode-make-agent-config
         #'agent-shell-pi-make-agent-config
-        #'agent-shell-qwen-make-agent-config))
+        #'agent-shell-qwen-make-agent-config
+        #'agent-shell-xai-make-grok-config))
 
 (defcustom agent-shell-agent-configs
   (agent-shell--default-agent-config-makers)
@@ -682,6 +684,7 @@ behavior explicitly."
                  (const :tag "Droid" droid)
                  (const :tag "Gemini CLI" gemini-cli)
                  (const :tag "Goose" goose)
+                 (const :tag "Grok Build" grok-build)
                  (const :tag "Hermes" hermes)
                  (const :tag "Kimi" kimi)
                  (const :tag "Kiro" kiro)
