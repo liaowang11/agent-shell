@@ -568,6 +568,7 @@ Each element can be:
                                               default-model-id
                                               default-session-mode-id
                                               session-meta
+                                              mcp-servers
                                               notification-adapter
                                               icon-name
                                               install-instructions)
@@ -586,7 +587,11 @@ Keyword arguments:
 - DEFAULT-MODEL-ID: Default model ID (function returning value).
 - DEFAULT-SESSION-MODE-ID: Default session mode ID (function returning value).
 - SESSION-META: Optional alist of agent-specific metadata sent as `_meta'
-  with the `session/new' request.
+  with session-creating requests (`session/new', `session/load',
+  `session/resume', and `session/fork').
+- MCP-SERVERS: Optional list of MCP servers for this agent, taking
+  precedence over the global `agent-shell-mcp-servers'.  Same shape as
+  that variable.
 - NOTIFICATION-ADAPTER: Optional function to modify/normalize `notification'
 - ICON-NAME: Name of the icon to use
 - INSTALL-INSTRUCTIONS: Instructions to show when executable is not found
@@ -604,6 +609,7 @@ Returns an alist with all specified values."
     (:default-model-id . ,default-model-id)                     ;; function
     (:default-session-mode-id . ,default-session-mode-id)       ;; function
     (:session-meta . ,session-meta)
+    (:mcp-servers . ,mcp-servers)
     (:notification-adapter . ,notification-adapter)            ;; function
     (:icon-name . ,icon-name)
     (:install-instructions . ,install-instructions)))
@@ -6621,13 +6627,16 @@ Example:
 (defun agent-shell--mcp-servers ()
   "Return normalized MCP servers configuration for JSON serialization.
 
-Each entry is normalized via `agent-shell--make-mcp-server'."
-  (when agent-shell-mcp-servers
+The agent config's `:mcp-servers' take precedence over the global
+`agent-shell-mcp-servers'.  Each entry is normalized via
+`agent-shell--make-mcp-server'."
+  (when-let* ((servers (or (map-nested-elt agent-shell--state '(:agent-config :mcp-servers))
+                           agent-shell-mcp-servers)))
     (apply #'vector
            (mapcar (lambda (server)
                      (agent-shell--make-mcp-server
                       :overrides (agent-shell--eval-dynamic-values server)))
-                   agent-shell-mcp-servers))))
+                   servers))))
 
 (cl-defun agent-shell--subscribe-to-client-events (&key state)
   "Subscribe SHELL and STATE to ACP events."

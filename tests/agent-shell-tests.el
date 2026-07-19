@@ -1859,6 +1859,33 @@ driven by a single helper on both paths."
                      (url . "https://example.com/mcp")
                      (headers . []))]))))
 
+(ert-deftest agent-shell-mcp-servers-per-agent-test ()
+  "Per-agent `:mcp-servers' take precedence over `agent-shell-mcp-servers'."
+  (let ((agent-shell-mcp-servers
+         '(((name . "global") (type . "http") (url . "https://global/mcp")))))
+    ;; The agent config's servers win when present.
+    (let ((agent-shell--state
+           (agent-shell--make-state
+            :agent-config (agent-shell-make-agent-config
+                           :identifier 'test
+                           :mcp-servers '(((name . "per-agent")
+                                           (type . "http")
+                                           (url . "https://per-agent/mcp")))))))
+      (should (equal (agent-shell--mcp-servers)
+                     [((name . "per-agent")
+                       (type . "http")
+                       (url . "https://per-agent/mcp")
+                       (headers . []))])))
+    ;; Falls back to the global variable when the config has no override.
+    (let ((agent-shell--state
+           (agent-shell--make-state
+            :agent-config (agent-shell-make-agent-config :identifier 'test))))
+      (should (equal (agent-shell--mcp-servers)
+                     [((name . "global")
+                       (type . "http")
+                       (url . "https://global/mcp")
+                       (headers . []))])))))
+
 (ert-deftest agent-shell--completion-bounds-test ()
   "Test `agent-shell--completion-bounds' function."
   (let ((path-chars "[:alnum:]/_.-"))
