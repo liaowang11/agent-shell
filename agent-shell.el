@@ -2899,12 +2899,24 @@ around this call to reflect whether the update arrived out of turn."
                                      (format "[%s]" (or (map-nested-elt acp-notification '(params update content type))
                                                         "unknown")))))
                (when new-prompt-p
+                 ;; A replayed prompt follows the previous turn's agent
+                 ;; message, whose `agent_message_chunk' body ends
+                 ;; without a trailing newline.  Separate it so the
+                 ;; `## User' header lands on its own line instead of
+                 ;; gluing onto the agent's last words.
+                 (agent-shell--separate-transcript-after-agent-message
+                  :last-entry-type (map-elt state :last-entry-type)
+                  :file-path agent-shell--transcript-file)
                  (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
                  (agent-shell--append-transcript
                   :text (format "## User (%s)\n\n" (format-time-string "%F %T"))
                   :file-path agent-shell--transcript-file))
+               ;; Write the prompt raw, matching the live submit path
+               ;; (see the "## User" write at turn start), so a restored
+               ;; transcript renders identically to a live one rather
+               ;; than wrapping the prompt in a `> ' blockquote.
                (agent-shell--append-transcript
-                :text (format "> %s\n"
+                :text (format "%s\n\n"
                               (agent-shell--indent-markdown-headers content-text))
                 :file-path agent-shell--transcript-file)
                (agent-shell--update-text

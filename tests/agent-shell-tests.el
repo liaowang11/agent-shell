@@ -2461,6 +2461,58 @@ driven by a single helper on both paths."
                        size-before))))
       (delete-file file))))
 
+(ert-deftest agent-shell--restore-user-message-not-glued-to-agent-message-test ()
+  "A replayed user prompt during restore is not glued to the prior agent message.
+
+Restoring a session (`session/load') replays user submissions as
+`user_message_chunk' notifications.  The branch that writes the
+`## User' header did not separate it from the preceding agent
+message, whose `agent_message_chunk' body ends without a trailing
+newline, so the header glued onto the agent's last words:
+
+    ...retrievable handle?## User (2026-07-20 00:03:04)
+
+The replay path must emit the same blank-line separator the live
+turn-end path does, and write the prompt raw (matching the live
+submit path) rather than wrapping it in a `> ' blockquote."
+  (let ((file (make-temp-file "agent-shell-transcript"))
+        (agent-shell--transcript-file nil)
+        (state (list (cons :active-requests '(((:method . "session/load"))))
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-activity-time nil)
+                     (cons :chunked-group-count 1)
+                     (cons :pending-restore nil)
+                     (cons :agent-config '((:shell-prompt . "> "))))))
+    (setq agent-shell--transcript-file file)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--ensure-transcript-file)
+                   (lambda () file))
+                  ((symbol-function 'agent-shell--update-text) #'ignore))
+          ;; Content left by a replayed agent_message_chunk: a header
+          ;; plus body with NO trailing newline.
+          (write-region (format "## Agent (%s)\n\nretrievable handle?"
+                                (format-time-string "%F %T"))
+                        nil file)
+          (agent-shell--on-notification
+           :state state
+           :acp-notification '((method . "session/update")
+                               (params
+                                (update
+                                 (sessionUpdate . "user_message_chunk")
+                                 (content (type . "text") (text . "next question"))))))
+          (with-temp-buffer
+            (insert-file-contents file)
+            ;; The `## User' header must not glue onto the agent body.
+            (should-not (string-search "retrievable handle?## User"
+                                       (buffer-string)))
+            (should (string-search "retrievable handle?\n\n## User"
+                                   (buffer-string)))
+            ;; The prompt is written raw like the live path, not as a
+            ;; `> ' blockquote.
+            (should-not (string-search "> next question" (buffer-string)))
+            (should (string-search "\n\nnext question\n\n" (buffer-string)))))
+      (delete-file file))))
+
 (ert-deftest agent-shell-mcp-servers-test ()
   "Test `agent-shell-mcp-servers' function normalization."
   ;; Test with nil
