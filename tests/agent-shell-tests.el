@@ -984,6 +984,49 @@ compose buffer keeps its draft in place and stays in edit mode."
           ;; No snapshot is needed since nothing was wiped.
           (should-not agent-shell-viewport--compose-snapshot))))))
 
+(ert-deftest agent-shell-viewport-compose-send-and-dismiss-test ()
+  "Composed prompts are queued, cleared, and dismissed or kept.
+
+`agent-shell-viewport--compose-queue' hands the draft to
+`agent-shell-queue-request' and clears the compose buffer;
+`agent-shell-viewport-compose-send-and-dismiss' additionally dismisses
+the window.  An empty draft signals an error."
+  (let ((agent-shell-header-style 'graphical)
+        queued dismissed)
+    (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'agent-shell-queue-request)
+               (lambda (prompt) (setq queued prompt)))
+              ((symbol-function 'agent-shell-viewport--dismiss)
+               (lambda (&rest _) (setq dismissed t)))
+              ((symbol-function 'agent-shell-viewport--position)
+               (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell-viewport--update-header)
+               (lambda (&rest _) nil)))
+      ;; Sends, clears the draft, and dismisses the window.
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (insert "my prompt")
+        (agent-shell-viewport-compose-send-and-dismiss)
+        (should (equal queued "my prompt"))
+        (should (string-empty-p (string-trim (buffer-string))))
+        (should dismissed))
+      ;; Keep composing: sends and clears, but does not dismiss.
+      (setq queued nil dismissed nil)
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (insert "another prompt")
+        (agent-shell-viewport--compose-queue)
+        (should (equal queued "another prompt"))
+        (should (string-empty-p (string-trim (buffer-string))))
+        (should-not dismissed))
+      ;; An empty draft is rejected.
+      (setq queued nil)
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (should-error (agent-shell-viewport-compose-send-and-dismiss))
+        (should-not queued)))))
+
 (ert-deftest agent-shell--format-diff-as-text-test ()
   "Test `agent-shell--format-diff-as-text' function."
   ;; Test nil input

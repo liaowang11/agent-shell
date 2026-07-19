@@ -416,6 +416,16 @@ will be created."
   :type 'boolean
   :group 'agent-shell)
 
+(defcustom agent-shell-viewport-dismiss-on-send nil
+  "Non-nil dismisses the viewport compose window after sending.
+
+Enables a fire-and-forget workflow: `agent-shell-viewport-compose-send'
+queues the composed prompt (or submits it when the shell is idle) and
+then dismisses the compose window, restoring the previous window layout.
+Prompts are sent without switching to watch the response."
+  :type 'boolean
+  :group 'agent-shell)
+
 (defcustom agent-shell-embed-file-size-limit 102400
   "Maximum file size in bytes for embedding with ContentBlock::Resource.
 Files larger than this will use ContentBlock::ResourceLink instead.

@@ -80,6 +80,7 @@
 
 (defvar agent-shell-header-style)
 (defvar agent-shell-prefer-viewport-interaction)
+(defvar agent-shell-viewport-dismiss-on-send)
 (defvar agent-shell-preferred-agent-config)
 (defvar agent-shell-session-strategy)
 (defvar agent-shell--state)
@@ -195,10 +196,14 @@ Returns an alist with insertion details or nil otherwise:
         (:start . ,insert-start)
         (:end . ,insert-end)))))
 
-(defun agent-shell-viewport-compose-send ()
-  "Send the viewport composed prompt to the agent shell."
+(defun agent-shell-viewport-compose-send (&optional keep-composing)
+  "Send the viewport composed prompt to the agent shell.
+
+With prefix argument KEEP-COMPOSING, queue or send the prompt and keep the
+compose buffer open in edit mode so another prompt can be composed and
+queued right away, regardless of `agent-shell-viewport-dismiss-on-send'."
   (declare (modes agent-shell-viewport-edit-mode))
-  (interactive)
+  (interactive "P")
   (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
     (user-error "Not in a shell viewport buffer"))
   (when (and (not (eq agent-shell-session-strategy 'new-deferred))
@@ -208,9 +213,15 @@ Returns an alist with insertion details or nil otherwise:
   (setq agent-shell-viewport--compose-snapshot nil)
   (setq agent-shell-viewport--ring-index nil)
   (setq agent-shell-viewport--peek-location nil)
-  (if agent-shell-prefer-viewport-interaction
-      (agent-shell-viewport-compose-send-and-wait-for-response)
-    (agent-shell-viewport-compose-send-and-kill)))
+  (cond
+   (keep-composing
+    (agent-shell-viewport--compose-queue))
+   (agent-shell-viewport-dismiss-on-send
+    (agent-shell-viewport-compose-send-and-dismiss))
+   (agent-shell-prefer-viewport-interaction
+    (agent-shell-viewport-compose-send-and-wait-for-response))
+   (t
+    (agent-shell-viewport-compose-send-and-kill))))
 
 (defun agent-shell-viewport-compose-send-and-kill ()
   "Send the viewport composed prompt to the agent shell and kill compose buffer."
@@ -229,6 +240,42 @@ Returns an alist with insertion details or nil otherwise:
          :submit t)))
     (kill-buffer viewport-buffer)
     (pop-to-buffer shell-buffer)))
+
+(defun agent-shell-viewport--compose-queue ()
+  "Queue or submit the composed prompt, then clear the compose buffer.
+
+The prompt is queued when the shell is busy and submitted otherwise, so
+prompts can be fired in a row.  Signals a `user-error' when the draft is
+empty.  Leaves the compose buffer open in edit mode, cleared."
+  (let ((shell-buffer (agent-shell-viewport--shell-buffer))
+        (prompt (string-trim (buffer-string))))
+    (when (string-empty-p prompt)
+      (user-error "Nothing to send"))
+    (with-current-buffer shell-buffer
+      (agent-shell-queue-request prompt))
+    (agent-shell-viewport--initialize)))
+
+(defun agent-shell-viewport-compose-send-and-dismiss ()
+  "Queue or send the composed prompt, then dismiss the compose window.
+
+The compose window is dismissed, restoring the previous window layout."
+  (declare (modes agent-shell-viewport-edit-mode))
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
+    (user-error "Not in a shell viewport buffer"))
+  (let ((viewport-buffer (current-buffer)))
+    (agent-shell-viewport--compose-queue)
+    (agent-shell-viewport--dismiss viewport-buffer)))
+
+(defun agent-shell-viewport--dismiss (viewport-buffer)
+  "Dismiss VIEWPORT-BUFFER's window, restoring the previous layout.
+
+Uses `quit-restore-window' so the window returns to what it displayed
+before the compose buffer, matching `agent-shell-toggle'.  Falls back to
+burying VIEWPORT-BUFFER when it is not displayed in a window."
+  (if-let* ((window (get-buffer-window viewport-buffer)))
+      (quit-restore-window window 'bury)
+    (bury-buffer viewport-buffer)))
 
 (defun agent-shell-viewport-compose-send-and-wait-for-response ()
   "Send the viewport composed prompt and display response in viewport."
@@ -388,6 +435,12 @@ Optionally set its PROMPT and RESPONSE."
   (let ((viewport-buffer (current-buffer))
         (shell-buffer (agent-shell-viewport--shell-buffer)))
     (cond
+     ((and agent-shell-viewport-dismiss-on-send
+           (derived-mode-p 'agent-shell-viewport-edit-mode))
+      (when (or (string-empty-p (string-trim (buffer-string)))
+                (y-or-n-p "Discard composed prompt? "))
+        (agent-shell-viewport--initialize)
+        (agent-shell-viewport--dismiss viewport-buffer)))
      ;; View mode
      ((derived-mode-p 'agent-shell-viewport-view-mode)
       (bury-buffer))
