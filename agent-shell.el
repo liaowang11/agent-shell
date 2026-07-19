@@ -4173,7 +4173,11 @@ variable (see makunbound)"))
   (when-let* (((map-elt state :buffer))
               (viewport-buffer (agent-shell-viewport--buffer
                                 :shell-buffer (map-elt state :buffer)
-                                :existing-only t)))
+                                :existing-only t))
+              ;; Fragment deletion only makes sense when viewport is
+              ;; displaying conversation, never while it's an active compose buffer.
+              ((with-current-buffer viewport-buffer
+                 (derived-mode-p 'agent-shell-viewport-view-mode))))
     (with-current-buffer viewport-buffer
       (agent-shell-ui-delete-fragment :namespace-id (map-elt state :request-count) :block-id block-id :no-undo t)))
   (with-current-buffer (map-elt state :buffer)
