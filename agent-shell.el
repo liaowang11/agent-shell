@@ -2352,7 +2352,7 @@ See `agent-shell-activity-group-header-label-function'."
       (propertize "Thinking" 'font-lock-face 'agent-shell-section-heading)))))
 
 (defvar agent-shell-activity-group-header-label-function
-  #'agent-shell-activity-group-count-label
+  #'agent-shell-activity-group-descriptive-label
   "Function that renders a tool-call group's collapsible header label.
 
 Called with an alist containing:
