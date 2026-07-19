@@ -5,7 +5,7 @@
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
 ;; Version: 0.61.2
-;; Package-Requires: ((emacs "29.1") (shell-maker "0.93.5") (acp "0.12.2"))
+;; Package-Requires: ((emacs "29.1") (shell-maker "0.93.5") (acp "0.13.1"))
 
 (defconst agent-shell--version "0.61.2")
 
@@ -567,6 +567,7 @@ Each element can be:
                                               authenticate-request-maker
                                               default-model-id
                                               default-session-mode-id
+                                              session-meta
                                               notification-adapter
                                               icon-name
                                               install-instructions)
@@ -584,6 +585,8 @@ Keyword arguments:
 - AUTHENTICATE-REQUEST-MAKER: Function to create authentication requests
 - DEFAULT-MODEL-ID: Default model ID (function returning value).
 - DEFAULT-SESSION-MODE-ID: Default session mode ID (function returning value).
+- SESSION-META: Optional alist of agent-specific metadata sent as `_meta'
+  with the `session/new' request.
 - NOTIFICATION-ADAPTER: Optional function to modify/normalize `notification'
 - ICON-NAME: Name of the icon to use
 - INSTALL-INSTRUCTIONS: Instructions to show when executable is not found
@@ -600,6 +603,7 @@ Returns an alist with all specified values."
     (:authenticate-request-maker . ,authenticate-request-maker) ;; function
     (:default-model-id . ,default-model-id)                     ;; function
     (:default-session-mode-id . ,default-session-mode-id)       ;; function
+    (:session-meta . ,session-meta)
     (:notification-adapter . ,notification-adapter)            ;; function
     (:icon-name . ,icon-name)
     (:install-instructions . ,install-instructions)))
@@ -3952,8 +3956,8 @@ FORK-SESSION-ID forks an existing session by its id string.
 OUTGOING-REQUEST-DECORATOR is passed through to `acp-make-client'."
   (unless (version<= "0.91.2" shell-maker-version)
     (error "Please update shell-maker to version 0.91.2 or newer"))
-  (unless (version<= "0.12.2" acp-package-version)
-    (error "Please update acp.el to version 0.12.2 or newer"))
+  (unless (version<= "0.13.1" acp-package-version)
+    (error "Please update acp.el to version 0.13.1 or newer"))
   (when (boundp 'agent-shell--transcript-file-path-function)
     (user-error "'agent-shell--transcript-file-path-function is retired.
 
@@ -6136,7 +6140,8 @@ overwrites an existing fragment with equivalent content."
    :client (map-elt (agent-shell--state) :client)
    :request (acp-make-session-new-request
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
-             :mcp-servers (agent-shell--mcp-servers))
+             :mcp-servers (agent-shell--mcp-servers)
+             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
    :buffer (current-buffer)
    :on-success (lambda (acp-response)
                  (map-put! agent-shell--state
@@ -6364,11 +6369,13 @@ SESSION-TITLE is an optional display title for the resumed session."
                     (acp-make-session-load-request
                      :session-id session-id
                      :cwd cwd
-                     :mcp-servers mcp-servers)
+                     :mcp-servers mcp-servers
+                     :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
                   (acp-make-session-resume-request
                    :session-id session-id
                    :cwd cwd
-                   :mcp-servers mcp-servers)))
+                   :mcp-servers mcp-servers
+                   :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))))
      :buffer (current-buffer)
      :on-success (lambda (acp-load-response)
                    (agent-shell--set-session-from-response
@@ -6416,7 +6423,8 @@ SESSION-TITLE is an optional display title for the resumed session."
    :request (acp-make-session-fork-request
              :session-id session-id
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
-             :mcp-servers (agent-shell--mcp-servers))
+             :mcp-servers (agent-shell--mcp-servers)
+             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
    :buffer (current-buffer)
    :on-success (lambda (acp-fork-response)
                  (let ((new-session-id (map-elt acp-fork-response 'sessionId)))
@@ -6507,11 +6515,13 @@ SESSION-TITLE is an optional display title for the resumed session."
                                                    (acp-make-session-load-request
                                                     :session-id acp-session-id
                                                     :cwd cwd
-                                                    :mcp-servers mcp-servers)
+                                                    :mcp-servers mcp-servers
+                                                    :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
                                                  (acp-make-session-resume-request
                                                   :session-id acp-session-id
                                                   :cwd cwd
-                                                  :mcp-servers mcp-servers)))
+                                                  :mcp-servers mcp-servers
+                                                  :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))))
                                     :buffer (current-buffer)
                                     :on-success (lambda (acp-load-response)
                                                   (agent-shell--set-session-from-response

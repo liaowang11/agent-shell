@@ -124,5 +124,32 @@
     (let ((agent-shell-anthropic-default-model-id (lambda () nil)))
       (should (null (funcall default-model-id-fn))))))
 
+(ert-deftest agent-shell-anthropic-claude-code-session-meta-test ()
+  "Test that the Claude config requests summarized thinking via session meta."
+  (let* ((config (agent-shell-anthropic-make-claude-code-config))
+         (meta (map-elt config :session-meta))
+         (thinking (map-nested-elt meta '(claudeCode options thinking))))
+    ;; Recent Claude models default thinking display to "omitted"; the config
+    ;; opts back into visible thinking.
+    (should (string= (map-elt thinking 'type) "adaptive"))
+    (should (string= (map-elt thinking 'display) "summarized"))
+    ;; The meta must survive into every session-creating request as `_meta'.
+    (should (equal (map-nested-elt (acp-make-session-new-request
+                                    :cwd "/tmp" :meta meta)
+                                   '(:params _meta))
+                   meta))
+    (should (equal (map-nested-elt (acp-make-session-resume-request
+                                    :session-id "s1" :cwd "/tmp" :meta meta)
+                                   '(:params _meta))
+                   meta))
+    (should (equal (map-nested-elt (acp-make-session-fork-request
+                                    :session-id "s1" :cwd "/tmp" :meta meta)
+                                   '(:params _meta))
+                   meta))
+    (should (equal (map-nested-elt (acp-make-session-load-request
+                                    :session-id "s1" :cwd "/tmp" :meta meta)
+                                   '(:params _meta))
+                   meta))))
+
 (provide 'agent-shell-anthropic-tests)
 ;;; agent-shell-anthropic-tests.el ends here
