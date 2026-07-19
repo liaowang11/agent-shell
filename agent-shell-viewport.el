@@ -127,11 +127,6 @@ Returns an alist with insertion details or nil otherwise:
     (error "Not yet supported"))
   (when (and append override)
     (error "Use :append or :override but not both"))
-  (when shell-buffer
-    ;; Momentarily set buffer to same window, so it's recent in stack.
-    (let ((current (current-buffer)))
-      (pop-to-buffer-same-window shell-buffer)
-      (pop-to-buffer-same-window current)))
   (when-let* ((shell-buffer (or shell-buffer (agent-shell--shell-buffer)))
               (viewport-buffer (agent-shell-viewport--buffer :shell-buffer shell-buffer))
               (text (or append (agent-shell--context :shell-buffer shell-buffer) "")))
@@ -268,14 +263,14 @@ The compose window is dismissed, restoring the previous window layout."
     (agent-shell-viewport--dismiss viewport-buffer)))
 
 (defun agent-shell-viewport--dismiss (viewport-buffer)
-  "Dismiss VIEWPORT-BUFFER's window, restoring the previous layout.
+  "Hide VIEWPORT-BUFFER's window, restoring the previous layout.
 
 Uses `quit-restore-window' so the window returns to what it displayed
-before the compose buffer, matching `agent-shell-toggle'.  Falls back to
-burying VIEWPORT-BUFFER when it is not displayed in a window."
-  (if-let* ((window (get-buffer-window viewport-buffer)))
-      (quit-restore-window window 'bury)
-    (bury-buffer viewport-buffer)))
+before the compose buffer, matching `agent-shell-toggle'.  VIEWPORT-BUFFER
+is not buried, so it stays recent and `agent-shell-buffers' keeps
+resolving to its shell on the next invocation."
+  (when-let* ((window (get-buffer-window viewport-buffer)))
+    (quit-restore-window window)))
 
 (defun agent-shell-viewport-compose-send-and-wait-for-response ()
   "Send the viewport composed prompt and display response in viewport."
