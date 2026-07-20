@@ -2818,6 +2818,22 @@ so the command must not append a second time."
           (should-not (agent-shell--prompt-select-session nil)))
       (kill-buffer other-buffer))))
 
+(ert-deftest agent-shell--prompt-select-session-single-choice-test ()
+  "Test `agent-shell--prompt-select-session' skips the prompt for a lone choice."
+  (let ((noninteractive nil)
+        (other-buffer (get-buffer-create "*other-agent-shell*"))
+        (agent-shell-session-choices-function
+         (lambda (choices)
+           (seq-filter (lambda (choice) (eq (cdr choice) :new-shell)) choices))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-buffers)
+                   (lambda () (list other-buffer)))
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'completing-read)
+                   (lambda (&rest _) (error "Should not have prompted"))))
+          (should-not (agent-shell--prompt-select-session nil)))
+      (kill-buffer other-buffer))))
+
 (ert-deftest agent-shell--validate-session-strategy-test ()
   "Test `agent-shell--validate-session-strategy' accepts supported values
 and rejects `new-deferred' and other unknown values."

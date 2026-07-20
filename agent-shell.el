@@ -6088,20 +6088,23 @@ Falls back to latest session in batch mode (e.g. tests)."
         ;; reordered or dropped new-shell.  Sessions get a generic label
         ;; (their real label is a long column-padded string).
         (let* ((default-choice (caar session-choices))
-               (selection (completing-read
-                           (format "Start shell (default: %s): "
-                                   (if (keywordp (cdar session-choices))
-                                       default-choice
-                                     "Resume session"))
-                           (lambda (string pred action)
-                             (if (eq action 'metadata)
-                                 '(metadata
-                                   (display-sort-function . identity)
-                                   (eager-display . t)
-                                   (eager-update . t))
-                               (complete-with-action action session-choices string pred)))
-                           nil t nil nil
-                           default-choice)))
+               (selection (if (length= session-choices 1)
+                              ;; Only one choice available; follow it without prompting.
+                              default-choice
+                            (completing-read
+                             (format "Start shell (default: %s): "
+                                     (if (keywordp (cdar session-choices))
+                                         default-choice
+                                       "Resume session"))
+                             (lambda (string pred action)
+                               (if (eq action 'metadata)
+                                   '(metadata
+                                     (display-sort-function . identity)
+                                     (eager-display . t)
+                                     (eager-update . t))
+                                 (complete-with-action action session-choices string pred)))
+                             nil t nil nil
+                             default-choice))))
           (pcase (map-elt session-choices selection)
             (:new-shell nil)
             (:other-shell
@@ -7292,7 +7295,10 @@ Returns a buffer object or nil."
                                    (cons "New Downloads shell" :downloads-shell)
                                    (cons "New temp shell" :temp-shell)
                                    (cons "Switch to shell buffer" :other-shell))))
-                   (selection (completing-read "Start shell (default: new): " choices nil t)))
+                   (selection (if (length= choices 1)
+                                  ;; Only one choice available; follow it without prompting.
+                                  (caar choices)
+                                (completing-read "Start shell (default: new): " choices nil t))))
               (pcase (map-elt choices selection)
                 (:other-shell
                  (agent-shell--read-shell-buffer :prompt "Switch to shell buffer: "))
