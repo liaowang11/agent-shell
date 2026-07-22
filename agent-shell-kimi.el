@@ -81,6 +81,7 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    :shell-prompt "Kimi> "
    :shell-prompt-regexp "Kimi> "
    :welcome-function #'agent-shell-kimi--welcome-message
+   :icon-name "kimi.png"
    :client-maker (lambda (buffer)
                    (agent-shell-kimi-make-client :buffer buffer))
    :default-model-id (lambda () (if (functionp agent-shell-kimi-default-model-id)

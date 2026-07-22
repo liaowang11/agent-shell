@@ -124,6 +124,7 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    :shell-prompt "OpenCode> "
    :shell-prompt-regexp "OpenCode> "
    :welcome-function #'agent-shell-opencode--welcome-message
+   :icon-name "opencode.png"
    :client-maker (lambda (buffer)
                    (agent-shell-opencode-make-client :buffer buffer))
    :default-model-id (lambda () agent-shell-opencode-default-model-id)
