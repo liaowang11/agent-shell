@@ -4956,6 +4956,24 @@ frame metrics, ...) is not rebuilt on every beat.")
               ((not (string-empty-p session-id))))
     (propertize session-id 'font-lock-face 'agent-shell-session-id)))
 
+(defun agent-shell--session-title-indicator (state)
+  "Return a propertized, single-line session title from STATE.
+Truncate titles longer than 50 characters.
+
+  (agent-shell--session-title-indicator
+   \\='((:session . ((:title . \" Fix\\n headers \")))))
+  ;; => \"Fix headers\""
+  (when-let* ((title (map-nested-elt state '(:session :title)))
+              ((stringp title))
+              (normalized-title
+               (string-trim
+                (replace-regexp-in-string "[[:space:]]+" " " title)))
+              ((not (string-empty-p normalized-title))))
+    (propertize (if (> (length normalized-title) 50)
+                    (concat (substring normalized-title 0 47) "...")
+                  normalized-title)
+                'font-lock-face 'agent-shell-session-title)))
+
 (defun agent-shell--face-foreground (face)
   "Return the foreground color for FACE, walking `:inherit' chains.
 FACE may be a face name symbol, an anonymous face plist (e.g. \\='(:foreground
@@ -5003,6 +5021,7 @@ STATUS, KEY-HINTS and MENU-KEYS are as documented in
     (:mode-id . ,(map-nested-elt state '(:session :mode-id)))
     (:mode-name . ,(agent-shell-get-mode-name state))
     (:project-name . ,(agent-shell--project-name))
+    (:session-title . ,(agent-shell--session-title-indicator state))
     (:session-id . ,(agent-shell--session-id-indicator))
     (:frame-width . ,(frame-pixel-width))
     (:font-height . ,(frame-char-height))
@@ -5093,7 +5112,7 @@ keeps entries fresh."
                                            'face 'agent-shell-key-binding)
                                " "
                                (map-elt help-hint :description))))
-         (text-header (format " %s%s%s%s%s ➤ %s%s%s%s%s"
+         (text-header (format " %s%s%s%s%s ➤ %s%s%s%s%s%s"
                               (cond
                                ((and (map-elt header-model :position)
                                      (map-elt header-model :status))
@@ -5148,6 +5167,9 @@ keeps entries fresh."
                                                                          map)))
                                 "")
                               (propertize (map-elt header-model :project-name) 'font-lock-face 'agent-shell-session-directory)
+                              (if (map-elt header-model :session-title)
+                                  (concat " ➤ " (map-elt header-model :session-title))
+                                "")
                               (if (map-elt header-model :session-id)
                                   (concat " ➤ " (map-elt header-model :session-id))
                                 "")
@@ -7345,6 +7367,14 @@ Does nothing if TITLE is empty or matches the current value."
              (not (string-empty-p title))
              (not (equal (map-nested-elt agent-shell--state '(:session :title)) title)))
     (map-put! (map-elt agent-shell--state :session) :title title)
+    (when (derived-mode-p 'agent-shell-mode)
+      (agent-shell--update-header-and-mode-line))
+    (when-let* ((viewport-buffer
+                 (agent-shell-viewport--buffer
+                  :shell-buffer (current-buffer)
+                  :existing-only t)))
+      (with-current-buffer viewport-buffer
+        (agent-shell-viewport--update-header)))
     (agent-shell--emit-event :event 'session-title-changed
                              :data (list (cons :title title)))))
 

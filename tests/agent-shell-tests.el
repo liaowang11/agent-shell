@@ -4047,6 +4047,25 @@ and rejects `new-deferred' and other unknown values."
       (let ((agent-shell-show-session-id t))
         (should-not (agent-shell--session-id-indicator))))))
 
+(ert-deftest agent-shell--session-title-indicator-test ()
+  "Test session titles are normalized, truncated, and faced for headers."
+  (let ((state (list
+                (cons :session
+                      (list
+                       (cons :title
+                             " Investigate\n text   viewport header "))))))
+    (let ((indicator (agent-shell--session-title-indicator state)))
+      (should (equal (substring-no-properties indicator)
+                     "Investigate text viewport header"))
+      (should (eq (get-text-property 0 'font-lock-face indicator)
+                  'agent-shell-session-title)))
+    (map-put! (map-elt state :session) :title (make-string 51 ?x))
+    (should (equal (substring-no-properties
+                    (agent-shell--session-title-indicator state))
+                   (concat (make-string 47 ?x) "...")))
+    (map-put! (map-elt state :session) :title nil)
+    (should-not (agent-shell--session-title-indicator state))))
+
 (ert-deftest agent-shell-copy-session-id-test ()
   "Test `agent-shell-copy-session-id' copies ID to kill ring."
   (with-temp-buffer
@@ -4099,6 +4118,47 @@ and rejects `new-deferred' and other unknown values."
         (let ((model (agent-shell--make-header-model agent-shell--state)))
           (should (assq :session-id model))
           (should-not (map-elt model :session-id)))))))
+
+(ert-deftest agent-shell--make-header-text-includes-session-title-test ()
+  "Test `agent-shell--make-header' text mode includes the session title."
+  (with-temp-buffer
+    (setq-local agent-shell--state
+                (list
+                 (cons :agent-config
+                       (list
+                        (cons :buffer-name "Claude Code")
+                        (cons :icon-name nil)))
+                 (cons :session
+                       (list
+                        (cons :id "test-session-id")
+                        (cons :title "Investigate text viewport header")
+                        (cons :model-id nil)
+                        (cons :models nil)
+                        (cons :mode-id nil)
+                        (cons :modes nil)))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--project-name)
+               (lambda () "project"))
+              ((symbol-function 'agent-shell--context-usage-indicator)
+               (lambda () nil))
+              ((symbol-function 'agent-shell--busy-indicator-frame)
+               (lambda () nil)))
+      (let ((agent-shell-header-style 'text)
+            (agent-shell-show-session-id t))
+        (should
+         (string-match-p
+          "project ➤ Investigate text viewport header ➤ test-session-id"
+          (substring-no-properties
+           (agent-shell--make-header agent-shell--state)))))
+      (map-put! (map-elt agent-shell--state :session) :title nil)
+      (let ((agent-shell-header-style 'text)
+            (agent-shell-show-session-id nil))
+        (should-not
+         (string-match-p
+          "Untitled"
+          (substring-no-properties
+           (agent-shell--make-header agent-shell--state))))))))
 
 (ert-deftest agent-shell--make-header-text-includes-session-id-test ()
   "Test `agent-shell--make-header' text mode includes session ID."
@@ -5388,6 +5448,61 @@ with \"Method not found\"."
                    (setq sent-method (map-elt (plist-get args :request) :method)))))
         (agent-shell--refresh-session-title)
         (should (equal sent-method "session/list"))))))
+
+(ert-deftest agent-shell--set-session-title-refreshes-viewport-header-test ()
+  "Changing the session title should immediately refresh an open viewport."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell title shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell title shell* [viewport]"))
+        (agent-shell-header-style 'text)
+        (agent-shell-show-session-id nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq major-mode 'agent-shell-mode)
+            (setq-local agent-shell--state
+                        (list
+                         (cons :agent-config
+                               (list
+                                (cons :buffer-name "Claude Code")
+                                (cons :icon-name nil)))
+                         (cons :buffer shell-buffer)
+                         (cons :event-subscriptions nil)
+                         (cons :session
+                               (list
+                                (cons :id "test-session-id")
+                                (cons :title nil)
+                                (cons :model-id nil)
+                                (cons :models nil)
+                                (cons :mode-id nil)
+                                (cons :modes nil))))))
+          (with-current-buffer viewport-buffer
+            (setq major-mode 'agent-shell-viewport-view-mode))
+          (cl-letf (((symbol-function 'agent-shell--project-name)
+                     (lambda () "project"))
+                    ((symbol-function 'agent-shell--context-usage-indicator)
+                     (lambda () nil))
+                    ((symbol-function 'agent-shell--busy-indicator-frame)
+                     (lambda () nil))
+                    ((symbol-function 'agent-shell--update-header-and-mode-line)
+                     (lambda (&rest _)))
+                    ((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 1) (:total . 1))))
+                    ((symbol-function 'agent-shell-viewport--busy-p)
+                     (lambda (&rest _) nil)))
+            (with-current-buffer shell-buffer
+              (agent-shell--set-session-title "Investigate text viewport header"))
+            (with-current-buffer viewport-buffer
+              (should
+               (string-match-p
+                "Investigate text viewport header"
+                (substring-no-properties header-line-format))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
 
 (ert-deftest agent-shell-viewport--initialize-omits-leading-newline-test ()
   "`agent-shell-viewport--initialize' must not prepend a layout newline.
