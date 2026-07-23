@@ -243,6 +243,11 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 (agent-shell-ui--insert-read-only (agent-shell-ui--required-newlines 2))
                 (setq block-start (point))
                 (agent-shell-ui--insert-fragment model qualified-id effective-expanded navigation)
+                ;; The group's trailing separator (the header's `\n\n', inserted
+                ;; once) now sits right after this last member; fold it into
+                ;; this member's padding so it is not stranded outside every
+                ;; block's range.
+                (skip-chars-forward "\n")
                 (setq padding-end (point)))
                ;; New block.
                (t

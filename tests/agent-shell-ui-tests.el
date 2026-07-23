@@ -382,6 +382,27 @@ and only the header-creating call reports it."
       ;; A second member into the same group creates no header, reports none.
       (should-not (map-elt second :group-header)))))
 
+(ert-deftest agent-shell-ui-group-member-padding-abuts-following-block-test ()
+  "A grouped member's padding reaches the following top-level block's padding.
+The group's trailing separator (the header's `\\n\\n') is pushed below the
+member, belonging to neither the header block nor the member.  The member
+must fold it into its padding so the reported ranges tile with no gap;
+otherwise that separator is left outside every block's range (and a
+caller stamping ranges leaves it unmarked, stranding navigation there)."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (let* ((member (agent-shell-ui-update-fragment
+                    (agent-shell-ui-make-fragment-model
+                     :namespace-id "0" :block-id "th" :label-left "Thinking"
+                     :body "pondering" :group-id "grp" :group-label "Activity")
+                    :create-new t :expanded t))
+           (top (agent-shell-ui-update-fragment
+                 (agent-shell-ui-make-fragment-model
+                  :namespace-id "0" :block-id "msg" :body "Answer")
+                 :create-new t)))
+      (should (= (map-nested-elt member '(:padding :end))
+                 (map-nested-elt top '(:padding :start)))))))
+
 (ert-deftest agent-shell-ui-group-collapse-hides-members-and-restores-state-test ()
   "Collapsing a group hides every member; expanding restores per-member folds."
   (with-temp-buffer
