@@ -351,6 +351,37 @@ straight into the next block's leading spaces."
     (should (equal '("ns-t1" "ns-t2")
                    (agent-shell-ui-tests--group-child-ids "ns-grp")))))
 
+(ert-deftest agent-shell-ui-group-reports-created-header-range-test ()
+  "Creating a group header reports its range; a later member reports none.
+The header is inserted on its own, outside any member's block/padding, so
+`agent-shell-ui-update-fragment' must hand its extent back to the caller
+via `:group-header' (callers mark output over that span so navigation
+does not stop mid-header).  The span covers the header and its padding,
+and only the header-creating call reports it."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (let* ((first (agent-shell-ui-update-fragment
+                   (agent-shell-ui-make-fragment-model
+                    :namespace-id "ns" :block-id "t1" :group-id "grp"
+                    :group-label "Tools" :label-left "run" :label-right "t1")
+                   :navigation 'always))
+           (second (agent-shell-ui-update-fragment
+                    (agent-shell-ui-make-fragment-model
+                     :namespace-id "ns" :block-id "t2" :group-id "grp"
+                     :group-label "Tools" :label-left "run" :label-right "t2")
+                    :navigation 'always))
+           (header (agent-shell-ui--group-header-range "ns-grp"))
+           (gh-start (map-nested-elt first '(:group-header :start)))
+           (gh-end (map-nested-elt first '(:group-header :end))))
+      ;; First member (which materialized the header) reports its range.
+      (should gh-start)
+      (should gh-end)
+      ;; Span encloses the header block itself.
+      (should (<= gh-start (map-elt header :start)))
+      (should (>= gh-end (map-elt header :end)))
+      ;; A second member into the same group creates no header, reports none.
+      (should-not (map-elt second :group-header)))))
+
 (ert-deftest agent-shell-ui-group-collapse-hides-members-and-restores-state-test ()
   "Collapsing a group hides every member; expanding restores per-member folds."
   (with-temp-buffer

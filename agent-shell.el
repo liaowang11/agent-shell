@@ -4473,10 +4473,15 @@ with GROUP-EXPANDED as the group's initial fold state."
            (let ((inhibit-read-only t))
              ;; comint relies on field property to
              ;; derive `comint-next-prompt'.
-             ;; Marking as field to avoid false positives in
+             ;; Marking as field output to avoid false positives in
              ;; `agent-shell-next-item' and `agent-shell-previous-item'.
              (add-text-properties (or padding-start block-start)
                                   (or padding-end block-end) '(field output))
+             ;; Same for group header (mark as field output).
+             (when (map-elt range :group-header)
+               (add-text-properties (map-nested-elt range '(:group-header :start))
+                                    (map-nested-elt range '(:group-header :end))
+                                    '(field output)))
              ;; Apply markdown to body.  `inhibit-read-only' must
              ;; wrap the render call too — chars in the body carry
              ;; `read-only t' from `agent-shell-ui--insert-fragment',
