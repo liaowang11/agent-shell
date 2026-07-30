@@ -114,6 +114,85 @@ point location.  For example, INPUT \"- foo|\" places point after
             #'agent-shell-list-edit-newline)
            "prose\n|")))
 
+(ert-deftest agent-shell-list-edit-open-below-continues-bullet ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "- f|oo"
+            #'agent-shell-list-edit-open-below)
+           "- foo\n- |")))
+
+(ert-deftest agent-shell-list-edit-open-below-preserves-indent-and-marker ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "  + f|oo"
+            #'agent-shell-list-edit-open-below)
+           "  + foo\n  + |")))
+
+(ert-deftest agent-shell-list-edit-open-below-increments-numbered ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "1. o|ne"
+            #'agent-shell-list-edit-open-below)
+           "1. one\n2. |")))
+
+(ert-deftest agent-shell-list-edit-open-below-empty-bullet-breaks-out ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "- foo\n- |"
+            #'agent-shell-list-edit-open-below)
+           "- foo\n\n|")))
+
+(ert-deftest agent-shell-list-edit-open-below-plain-line-opens-below ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "pro|se"
+            #'agent-shell-list-edit-open-below)
+           "prose\n|")))
+
+(ert-deftest agent-shell-list-edit-open-above-continues-bullet ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "- f|oo"
+            #'agent-shell-list-edit-open-above)
+           "- |\n- foo")))
+
+(ert-deftest agent-shell-list-edit-open-above-preserves-indent-and-marker ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "  + f|oo"
+            #'agent-shell-list-edit-open-above)
+           "  + |\n  + foo")))
+
+(ert-deftest agent-shell-list-edit-open-above-bumps-original-number ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "1. o|ne"
+            #'agent-shell-list-edit-open-above)
+           "1. |\n2. one")))
+
+(ert-deftest agent-shell-list-edit-open-above-empty-bullet-strips-marker ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "- foo\n- |"
+            #'agent-shell-list-edit-open-above)
+           "- foo\n|")))
+
+(ert-deftest agent-shell-list-edit-open-above-plain-line-opens-above ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "pro|se"
+            #'agent-shell-list-edit-open-above)
+           "|\nprose")))
+
+(ert-deftest agent-shell-list-edit-mode-remaps-evil-open-commands ()
+  "The minor mode integrates with Evil without requiring Evil at load time."
+  (should
+   (eq (lookup-key agent-shell-list-edit-mode-map [remap evil-open-below])
+       #'agent-shell-list-edit-open-below))
+  (should
+   (eq (lookup-key agent-shell-list-edit-mode-map [remap evil-open-above])
+       #'agent-shell-list-edit-open-above)))
+
 (ert-deftest agent-shell-list-edit-indent-line-indents-bullet ()
   (should (equal
            (agent-shell-list-edit-tests--run
