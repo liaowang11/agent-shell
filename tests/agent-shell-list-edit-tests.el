@@ -114,6 +114,120 @@ point location.  For example, INPUT \"- foo|\" places point after
             #'agent-shell-list-edit-newline)
            "prose\n|")))
 
+(ert-deftest agent-shell-list-edit-open-below-continues-bullet ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "- f|oo"
+            #'agent-shell-list-edit-open-below)
+           "- foo\n- |")))
+
+(ert-deftest agent-shell-list-edit-open-below-preserves-indent-and-marker ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "  + f|oo"
+            #'agent-shell-list-edit-open-below)
+           "  + foo\n  + |")))
+
+(ert-deftest agent-shell-list-edit-open-below-increments-numbered ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "1. o|ne"
+            #'agent-shell-list-edit-open-below)
+           "1. one\n2. |")))
+
+(ert-deftest agent-shell-list-edit-open-below-empty-bullet-breaks-out ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "- foo\n- |"
+            #'agent-shell-list-edit-open-below)
+           "- foo\n\n|")))
+
+(ert-deftest agent-shell-list-edit-open-below-plain-line-opens-below ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "pro|se"
+            #'agent-shell-list-edit-open-below)
+           "prose\n|")))
+
+(ert-deftest agent-shell-list-edit-open-above-continues-bullet ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "- f|oo"
+            #'agent-shell-list-edit-open-above)
+           "- |\n- foo")))
+
+(ert-deftest agent-shell-list-edit-open-above-preserves-indent-and-marker ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "  + f|oo"
+            #'agent-shell-list-edit-open-above)
+           "  + |\n  + foo")))
+
+(ert-deftest agent-shell-list-edit-open-above-bumps-original-number ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "1. o|ne"
+            #'agent-shell-list-edit-open-above)
+           "1. |\n2. one")))
+
+(ert-deftest agent-shell-list-edit-open-above-empty-bullet-strips-marker ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "- foo\n- |"
+            #'agent-shell-list-edit-open-above)
+           "- foo\n|")))
+
+(ert-deftest agent-shell-list-edit-open-above-plain-line-opens-above ()
+  (should (equal
+           (agent-shell-list-edit-tests--run
+            "pro|se"
+            #'agent-shell-list-edit-open-above)
+           "|\nprose")))
+
+(ert-deftest agent-shell-list-edit-mode-remaps-evil-open-commands ()
+  "The minor mode integrates with Evil without requiring Evil at load time."
+  (should
+   (eq (lookup-key agent-shell-list-edit-mode-map [remap evil-open-below])
+       #'agent-shell-list-edit-evil-open-below))
+  (should
+   (eq (lookup-key agent-shell-list-edit-mode-map [remap evil-open-above])
+       #'agent-shell-list-edit-evil-open-above)))
+
+(defun agent-shell-list-edit-tests--evil-keys (input keys)
+  "Type KEYS from Evil's normal state into INPUT, \"|\" marking point.
+
+Return the buffer string with \"|\" at point, and the Evil state left."
+  (with-temp-buffer
+    (switch-to-buffer (current-buffer))
+    (text-mode)
+    (evil-local-mode 1)
+    (agent-shell-list-edit-mode 1)
+    (insert input)
+    (goto-char (point-min))
+    (search-forward "|")
+    (delete-char -1)
+    (evil-normal-state)
+    (execute-kbd-macro (kbd keys))
+    (let ((state evil-state))
+      (insert "|")
+      (list (buffer-string) state))))
+
+(ert-deftest agent-shell-list-edit-evil-open-enters-insert-state ()
+  "Evil's `o' and `O' still open a line in insert state, list item or not."
+  (skip-unless (require 'evil nil t))
+  (should (equal (agent-shell-list-edit-tests--evil-keys "- fo|o" "o")
+                 '("- foo\n- |" insert)))
+  (should (equal (agent-shell-list-edit-tests--evil-keys "- fo|o" "O")
+                 '("- |\n- foo" insert)))
+  (should (equal (agent-shell-list-edit-tests--evil-keys "pro|se" "o")
+                 '("prose\n|" insert)))
+  ;; A count still repeats the opened line off a list item.
+  (should (equal (agent-shell-list-edit-tests--evil-keys "pro|se" "2oX <escape>")
+                 '("prose\nX\n|X" normal)))
+  ;; And `.' repeats on one.
+  (should (equal (car (agent-shell-list-edit-tests--evil-keys "- a|" "ob <escape>."))
+                 "- a\n- b\n- |b")))
+
 (ert-deftest agent-shell-list-edit-indent-line-indents-bullet ()
   (should (equal
            (agent-shell-list-edit-tests--run
