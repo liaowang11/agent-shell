@@ -84,6 +84,18 @@ And \"1. step\" returns:
         (:marker . ,(match-string-no-properties 2))
         (:content . ,(match-string-no-properties 3)))))))
 
+(defun agent-shell-list-edit--insert-next-marker (item)
+  "Insert the list marker following ITEM."
+  (insert (map-elt item :indent))
+  (pcase (map-elt item :type)
+    ('bullet
+     (insert (map-elt item :marker)))
+    ('numbered
+     (insert (number-to-string
+              (1+ (string-to-number (map-elt item :marker))))
+             ".")))
+  (insert " "))
+
 (defun agent-shell-list-edit-newline ()
   "Insert a newline, continuing the current list item if applicable.
 
@@ -98,17 +110,57 @@ break out of the list."
       (newline))
      (item
       (newline)
-      (pcase (map-elt item :type)
-        ('bullet
-         (insert (map-elt item :indent)
-                 (map-elt item :marker)
-                 " "))
-        ('numbered
-         (insert (map-elt item :indent)
-                 (number-to-string
-                  (1+ (string-to-number (map-elt item :marker))))
-                 ". "))))
+      (agent-shell-list-edit--insert-next-marker item))
      (t (newline)))))
+
+(defun agent-shell-list-edit-open-below ()
+  "Open a line below, continuing the current list item if applicable.
+
+On an empty list item, remove the whole prefix (indent + marker) and
+open a plain line below."
+  (interactive)
+  (let ((item (agent-shell-list-edit--at-item)))
+    (end-of-line)
+    (cond
+     ((and item (string-empty-p (string-trim (map-elt item :content))))
+      (delete-region (line-beginning-position) (point))
+      (newline))
+     (item
+      (newline)
+      (agent-shell-list-edit--insert-next-marker item))
+     (t (newline)))))
+
+(defun agent-shell-list-edit-open-above ()
+  "Open a line above, continuing the current list item if applicable.
+
+The new line reuses the current item's indent and marker, so the
+current numbered item is renumbered (N becomes N+1).  On an empty
+list item, remove the whole prefix (indent + marker) and stay on the
+line."
+  (interactive)
+  (beginning-of-line)
+  (let ((item (agent-shell-list-edit--at-item)))
+    (cond
+     ((and item (string-empty-p (string-trim (map-elt item :content))))
+      (delete-region (point) (line-end-position)))
+     (item
+      (insert (map-elt item :indent)
+              (if (eq (map-elt item :type) 'numbered)
+                  (concat (map-elt item :marker) ".")
+                (map-elt item :marker))
+              " \n")
+      (backward-char)
+      (when (eq (map-elt item :type) 'numbered)
+        (save-excursion
+          (forward-line)
+          (beginning-of-line)
+          (when (looking-at agent-shell-list-edit--numbered-re)
+            (replace-match
+             (number-to-string (1+ (string-to-number (match-string 2))))
+             nil nil nil 2)))))
+     (t
+      (newline)
+      (forward-line -1)))))
 
 (defun agent-shell-list-edit-indent-line ()
   "Indent the current list item.
@@ -140,6 +192,10 @@ the line.  When point is not on an indented list item, does nothing."
     (define-key map (kbd "RET") #'agent-shell-list-edit-newline)
     (define-key map (kbd "TAB") #'agent-shell-list-edit-indent-line)
     (define-key map (kbd "<backtab>") #'agent-shell-list-edit-dedent-line)
+    (define-key map [remap evil-open-below]
+                #'agent-shell-list-edit-open-below)
+    (define-key map [remap evil-open-above]
+                #'agent-shell-list-edit-open-above)
     map)
   "Keymap for `agent-shell-list-edit-mode'.")
 
@@ -149,7 +205,8 @@ the line.  When point is not on an indented list item, does nothing."
 Continues bullet (\"- \", \"* \", \"+ \") and numbered (\"1. \") items
 on RET.  Pressing RET on an empty list item removes the marker and
 breaks out of the list.  TAB and \\`<backtab>' indent and de-indent
-the current item."
+the current item.  Evil's open-below and open-above commands are
+remapped to their list-aware counterparts."
   :lighter " ListEdit"
   :keymap agent-shell-list-edit-mode-map)
 
