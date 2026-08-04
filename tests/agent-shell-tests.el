@@ -3043,6 +3043,268 @@ code block content
   (should (equal (agent-shell--indent-markdown-headers "### Tool Call [completed]: grep")
                  "##### Tool Call [completed]: grep")))
 
+(ert-deftest agent-shell--set-transcript-title-in-text-test ()
+  "Test `agent-shell--set-transcript-title-in-text'."
+  (let ((header (concat "# Agent Shell Transcript\n"
+                        "\n"
+                        "**Agent:** Claude\n"
+                        "**Started:** 2026-08-04 10:43:15\n"
+                        "**Working Directory:** /tmp/project/\n"
+                        "**Session ID:** abc-123\n"
+                        "\n"
+                        "---\n"
+                        "\n"
+                        "## User (2026-08-04 10:43:15)\n"
+                        "\n"
+                        "Hello\n")))
+    ;; A missing title is inserted as the last header field, above the
+    ;; blank line and separator.
+    (should (equal (agent-shell--set-transcript-title-in-text
+                    header "Understand session list display")
+                   (concat "# Agent Shell Transcript\n"
+                           "\n"
+                           "**Agent:** Claude\n"
+                           "**Started:** 2026-08-04 10:43:15\n"
+                           "**Working Directory:** /tmp/project/\n"
+                           "**Session ID:** abc-123\n"
+                           "**Title:** Understand session list display\n"
+                           "\n"
+                           "---\n"
+                           "\n"
+                           "## User (2026-08-04 10:43:15)\n"
+                           "\n"
+                           "Hello\n")))
+    ;; An existing title is replaced, since agents rename a session after
+    ;; the first turn and users rename it later.
+    (should (equal (agent-shell--set-transcript-title-in-text
+                    (agent-shell--set-transcript-title-in-text header "Seeded")
+                    "Generated summary")
+                   (agent-shell--set-transcript-title-in-text
+                    header "Generated summary")))
+    ;; Only the first line of a title is used: a title seeded from a
+    ;; prompt can span lines, and a header field cannot.
+    (should (equal (agent-shell--set-transcript-title-in-text
+                    header "  First line  \nsecond line")
+                   (agent-shell--set-transcript-title-in-text
+                    header "First line")))
+    ;; A blank title leaves the text alone.
+    (should (equal (agent-shell--set-transcript-title-in-text header "")
+                   header))
+    (should (equal (agent-shell--set-transcript-title-in-text header "  \n ")
+                   header))
+    (should (equal (agent-shell--set-transcript-title-in-text header nil)
+                   header)))
+  ;; The body quotes transcript headers verbatim -- agents echo file
+  ;; contents and past transcripts.  Those lines must never be rewritten,
+  ;; and must never be mistaken for the header's own field.
+  (let ((quoting-body (concat "# Agent Shell Transcript\n"
+                              "\n"
+                              "**Agent:** Claude\n"
+                              "**Started:** 2026-08-04 10:43:15\n"
+                              "\n"
+                              "---\n"
+                              "\n"
+                              "## User (2026-08-04 10:43:15)\n"
+                              "\n"
+                              "Here is the file:\n"
+                              "\n"
+                              "**Title:** quoted from somewhere else\n"
+                              "\n"
+                              "## Agent (2026-08-04 10:44:00)\n"
+                              "\n"
+                              "**Title:** another quote\n")))
+    ;; Inserting puts the field in the header and leaves both quotes as is.
+    (should (equal (agent-shell--set-transcript-title-in-text
+                    quoting-body "Real title")
+                   (concat "# Agent Shell Transcript\n"
+                           "\n"
+                           "**Agent:** Claude\n"
+                           "**Started:** 2026-08-04 10:43:15\n"
+                           "**Title:** Real title\n"
+                           "\n"
+                           "---\n"
+                           "\n"
+                           "## User (2026-08-04 10:43:15)\n"
+                           "\n"
+                           "Here is the file:\n"
+                           "\n"
+                           "**Title:** quoted from somewhere else\n"
+                           "\n"
+                           "## Agent (2026-08-04 10:44:00)\n"
+                           "\n"
+                           "**Title:** another quote\n")))
+    ;; Replacing rewrites the header field only.
+    (should (equal (agent-shell--set-transcript-title-in-text
+                    (agent-shell--set-transcript-title-in-text
+                     quoting-body "Real title")
+                    "Renamed")
+                   (agent-shell--set-transcript-title-in-text
+                    quoting-body "Renamed"))))
+  ;; Without a separator the header ends at the first speaker heading, so
+  ;; the field still lands above the conversation.
+  (should (equal (agent-shell--set-transcript-title-in-text
+                  (concat "# Agent Shell Transcript\n"
+                          "\n"
+                          "**Agent:** Claude\n"
+                          "\n"
+                          "## User (2026-08-04 10:43:15)\n"
+                          "\n"
+                          "**Title:** quoted\n")
+                  "Real title")
+                 (concat "# Agent Shell Transcript\n"
+                         "\n"
+                         "**Agent:** Claude\n"
+                         "**Title:** Real title\n"
+                         "\n"
+                         "## User (2026-08-04 10:43:15)\n"
+                         "\n"
+                         "**Title:** quoted\n")))
+  ;; A transcript that is nothing but a conversation still gets a field,
+  ;; on its own line, without gluing onto the first heading.
+  (should (equal (agent-shell--set-transcript-title-in-text
+                  "## User (2026-08-04 10:43:15)\n\nHello\n"
+                  "Real title")
+                 (concat "**Title:** Real title\n"
+                         "## User (2026-08-04 10:43:15)\n"
+                         "\n"
+                         "Hello\n"))))
+
+(ert-deftest agent-shell--update-transcript-title-test ()
+  "Test `agent-shell--update-transcript-title'."
+  (let ((file (make-temp-file "agent-shell-transcript"))
+        (agent-shell--transcript-file nil))
+    (unwind-protect
+        (progn
+          (write-region (concat "# Agent Shell Transcript\n"
+                                "\n"
+                                "**Agent:** Claude\n"
+                                "\n"
+                                "---\n"
+                                "\n"
+                                "## User (2026-08-04 10:43:15)\n"
+                                "\n"
+                                "**Title:** quoted\n")
+                        nil file nil 'no-message)
+          (setq agent-shell--transcript-file file)
+          (agent-shell--update-transcript-title "Real title")
+          (with-temp-buffer
+            (insert-file-contents file)
+            (should (equal (buffer-string)
+                           (concat "# Agent Shell Transcript\n"
+                                   "\n"
+                                   "**Agent:** Claude\n"
+                                   "**Title:** Real title\n"
+                                   "\n"
+                                   "---\n"
+                                   "\n"
+                                   "## User (2026-08-04 10:43:15)\n"
+                                   "\n"
+                                   "**Title:** quoted\n"))))
+          ;; A later rename replaces the field.
+          (agent-shell--update-transcript-title "Renamed")
+          (with-temp-buffer
+            (insert-file-contents file)
+            (should (string-match-p "^\\*\\*Title:\\*\\* Renamed$" (buffer-string)))
+            (should-not (string-match-p "Real title" (buffer-string)))))
+      (delete-file file)))
+  ;; The first title is seeded before the first prompt creates the file,
+  ;; so a missing file is not an error and writes nothing.
+  (let* ((missing (expand-file-name "agent-shell-no-such-transcript.md"
+                                    temporary-file-directory))
+         (agent-shell--transcript-file missing))
+    (when (file-exists-p missing)
+      (delete-file missing))
+    (agent-shell--update-transcript-title "Real title")
+    (should-not (file-exists-p missing)))
+  ;; Transcripts can be disabled altogether.
+  (let ((agent-shell--transcript-file nil))
+    (should-not (agent-shell--update-transcript-title "Real title"))))
+
+(ert-deftest agent-shell--update-transcript-title-keeps-bytes-test ()
+  "Writing a title preserves a transcript's bytes.
+
+Tool output puts null bytes into transcripts, and Emacs reads a file
+containing one with `no-conversion', leaving raw bytes in the buffer.
+Writing such a buffer back without saying which coding system to use
+asks the user to pick one, which fails outright in batch and would
+re-encode the file in a session.  Both the existing bytes and a
+non-ASCII title have to survive the round trip."
+  (let* ((file (make-temp-file "agent-shell-transcript"))
+         (agent-shell--transcript-file file)
+         (body (concat "盒子 ──\n"
+                       "before" (string 0) "after\n"))
+         (literal-bytes
+          (lambda ()
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (insert-file-contents-literally file)
+              (buffer-string)))))
+    (unwind-protect
+        (let (original)
+          (let ((coding-system-for-write 'utf-8-unix))
+            (with-temp-buffer
+              (insert "# Agent Shell Transcript\n"
+                      "\n"
+                      "**Agent:** Claude\n"
+                      "\n"
+                      "---\n"
+                      "\n"
+                      "## User (2026-08-04 10:43:15)\n"
+                      "\n"
+                      body)
+              (write-region nil nil file nil 'no-message)))
+          (setq original (funcall literal-bytes))
+          (agent-shell--update-transcript-title "中文标题 with ASCII")
+          (let ((after (funcall literal-bytes)))
+            ;; The title was written, encoded as the transcript's own utf-8.
+            (should (string-match-p
+                     (regexp-quote
+                      (encode-coding-string "**Title:** 中文标题 with ASCII"
+                                            'utf-8))
+                     after))
+            ;; Every original byte after the header is still there, null
+            ;; byte included.
+            (should (string-match-p
+                     (regexp-quote (encode-coding-string body 'utf-8))
+                     after))
+            (should (> (length after) (length original)))))
+      (delete-file file))))
+
+(ert-deftest agent-shell--set-session-title-writes-transcript-test ()
+  "`agent-shell--set-session-title' keeps the transcript header current."
+  (let ((file (make-temp-file "agent-shell-transcript"))
+        (agent-shell--transcript-file nil)
+        (agent-shell--state (list (cons :session (list (cons :title nil)))
+                                  (cons :buffer (current-buffer)))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell-viewport--buffer)
+                   (lambda (&rest _) nil)))
+          (write-region (concat "# Agent Shell Transcript\n"
+                                "\n"
+                                "**Agent:** Claude\n"
+                                "\n"
+                                "---\n"
+                                "\n"
+                                "## User (2026-08-04 10:43:15)\n")
+                        nil file nil 'no-message)
+          (setq agent-shell--transcript-file file)
+          ;; The prompt-seeded title lands in the header.
+          (agent-shell--set-session-title "Seeded from the first prompt")
+          (with-temp-buffer
+            (insert-file-contents file)
+            (should (string-match-p "^\\*\\*Title:\\*\\* Seeded from the first prompt$"
+                                    (buffer-string))))
+          ;; The agent's generated title replaces it.
+          (agent-shell--set-session-title "Generated summary")
+          (with-temp-buffer
+            (insert-file-contents file)
+            (should (string-match-p "^\\*\\*Title:\\*\\* Generated summary$"
+                                    (buffer-string)))
+            (should-not (string-match-p "Seeded from the first prompt"
+                                        (buffer-string)))))
+      (delete-file file))))
+
 (ert-deftest agent-shell--separate-transcript-after-agent-message-test ()
   "Ensure a turn ending mid-agent-message leaves a blank-line separator.
 
