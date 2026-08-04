@@ -8200,6 +8200,7 @@ Does nothing if TITLE is empty or matches the current value."
              (not (string-empty-p title))
              (not (equal (map-nested-elt agent-shell--state '(:session :title)) title)))
     (map-put! (map-elt agent-shell--state :session) :title title)
+    (agent-shell--update-transcript-title title)
     (when (derived-mode-p 'agent-shell-mode)
       (agent-shell--update-header-and-mode-line))
     (when-let* ((viewport-buffer
@@ -10649,10 +10650,91 @@ Returns the file path, or nil if disabled."
                        ""))
              nil filepath nil 'no-message)
             (message "Created %s"
-                     (agent-shell--shorten-paths filepath t)))
+                     (agent-shell--shorten-paths filepath t))
+            ;; The title is seeded from the first prompt before this file
+            ;; exists, so write whatever the session already has.
+            (agent-shell--update-transcript-title
+             (map-nested-elt agent-shell--state '(:session :title))))
         (error
          (message "Failed to initialize transcript: %S" err))))
     filepath))
+
+(defun agent-shell--set-transcript-title-in-text (text title)
+  "Return TEXT with the transcript header's `**Title:**' field set to TITLE.
+
+Replaces the field when the header already has one, otherwise inserts
+it as the header's last field.  Only the header is searched: the body
+quotes transcript headers verbatim whenever an agent echoes a file or
+an older transcript, and those lines must be left alone.  The header
+ends at the `---' separator, or at the first speaker heading when a
+transcript has no separator.
+
+TITLE is reduced to its first line, since a title seeded from a prompt
+can span lines while a header field cannot.  TEXT is returned unchanged
+when TITLE is blank.
+
+For example:
+
+  (agent-shell--set-transcript-title-in-text
+   \"**Agent:** Claude\\n\\n---\\n\" \"Fix the reader\")
+    => \"**Agent:** Claude\\n**Title:** Fix the reader\\n\\n---\\n\""
+  (setq title (string-trim (car (split-string (or title "") "\n"))))
+  (if (string-empty-p title)
+      text
+    (with-temp-buffer
+      (insert text)
+      (let ((header-end (save-excursion
+                          (goto-char (point-min))
+                          (cond
+                           ((re-search-forward "^---[ \t]*$" nil t)
+                            (match-beginning 0))
+                           ((progn
+                              (goto-char (point-min))
+                              (re-search-forward "^## " nil t))
+                            (match-beginning 0))
+                           (t (point-max))))))
+        (goto-char (point-min))
+        (if (re-search-forward "^\\*\\*Title:\\*\\*.*$" header-end t)
+            (replace-match (format "**Title:** %s" title) t t)
+          (goto-char header-end)
+          (skip-chars-backward " \t\n")
+          (if (bolp)
+              (insert (format "**Title:** %s\n" title))
+            (insert (format "\n**Title:** %s" title)))))
+      (buffer-string))))
+
+(defun agent-shell--update-transcript-title (title)
+  "Write TITLE into the transcript header of the current buffer's file.
+
+Does nothing when transcripts are disabled, when TITLE is blank, or
+when the transcript file does not exist yet.  Rewrites the whole file,
+which is why it is only called when a title actually changes: agents
+supply one generated title per session and users rename by hand.
+
+The file is written back with the coding system it was read with.  Tool
+output puts null bytes into transcripts, and Emacs reads such a file
+with `no-conversion', so the buffer holds raw bytes; writing without
+naming that coding system again would ask the user to choose one and
+re-encode the file."
+  (when-let* ((filepath agent-shell--transcript-file)
+              ((stringp title))
+              ((not (string-empty-p (string-trim title))))
+              ((file-exists-p filepath)))
+    (condition-case err
+        (with-temp-buffer
+          (insert-file-contents filepath)
+          (let* ((coding (or last-coding-system-used
+                             buffer-file-coding-system))
+                 (text (buffer-string))
+                 (updated (agent-shell--set-transcript-title-in-text
+                           text title)))
+            (unless (equal text updated)
+              (erase-buffer)
+              (insert updated)
+              (let ((coding-system-for-write coding))
+                (write-region nil nil filepath nil 'no-message)))))
+      (error
+       (message "Failed to write transcript title: %S" err)))))
 
 (defun agent-shell--indent-markdown-headers (text)
   "Indent markdown headers in TEXT by 2 levels for transcript hierarchy.
