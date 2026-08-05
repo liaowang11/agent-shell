@@ -709,6 +709,11 @@ page."
           (goto-char point)
           (setf (map-elt agent-shell-viewport--page-cursor :point) point))))))
 
+(defun agent-shell-viewport--interaction-response (interaction)
+  "Return INTERACTION's renderable response, including any after-turn tail."
+  (concat (or (map-elt interaction :response) "")
+          (or (map-elt interaction :after-turn) "")))
+
 (defun agent-shell-viewport-view-last ()
   "Display the last request/response interaction."
   (declare (modes agent-shell-viewport-view-mode
@@ -728,7 +733,7 @@ page."
     (agent-shell-viewport-view-mode)
     (agent-shell-viewport--initialize
      :prompt (map-elt current :prompt)
-     :response (map-elt current :response))
+     :response (agent-shell-viewport--interaction-response current))
     (goto-char (point-min))
     current))
 
@@ -742,7 +747,7 @@ page."
               (current (agent-shell-interaction-at-point)))
     (agent-shell-viewport--initialize
      :prompt (map-elt current :prompt)
-     :response (map-elt current :response))
+     :response (agent-shell-viewport--interaction-response current))
     (goto-char (point-min))
     current))
 
