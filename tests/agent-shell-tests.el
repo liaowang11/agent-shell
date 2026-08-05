@@ -4328,6 +4328,30 @@ other unknown ones."
       (let ((agent-shell-show-session-id t))
         (should-not (agent-shell--session-id-indicator))))))
 
+(ert-deftest agent-shell--session-title-indicator-test ()
+  "Test session titles are normalized, truncated, and faced for headers."
+  (let ((state (list
+                (cons :session
+                      (list
+                       (cons :title
+                             " Investigate\n text   viewport header "))))))
+    (let ((indicator (agent-shell--session-title-indicator state)))
+      (should (equal (substring-no-properties indicator)
+                     "Investigate text viewport header"))
+      (should (eq (get-text-property 0 'font-lock-face indicator)
+                  'agent-shell-session-title)))
+    (map-put! (map-elt state :session) :title (make-string 51 ?x))
+    (should (equal (substring-no-properties
+                    (agent-shell--session-title-indicator state))
+                   (concat (make-string 47 ?x) "...")))
+    (map-put! (map-elt state :session) :title (make-string 30 ?界))
+    (let ((wide-title (substring-no-properties
+                       (agent-shell--session-title-indicator state))))
+      (should (<= (string-width wide-title) 50))
+      (should (string-suffix-p "..." wide-title)))
+    (map-put! (map-elt state :session) :title nil)
+    (should-not (agent-shell--session-title-indicator state))))
+
 (ert-deftest agent-shell-copy-session-id-test ()
   "Test `agent-shell-copy-session-id' copies ID to kill ring."
   (with-temp-buffer
@@ -4380,6 +4404,90 @@ other unknown ones."
         (let ((model (agent-shell--make-header-model agent-shell--state)))
           (should (assq :session-id model))
           (should-not (map-elt model :session-id)))))))
+
+(ert-deftest agent-shell--make-header-text-includes-session-title-test ()
+  "Test `agent-shell--make-header' text mode includes the session title."
+  (with-temp-buffer
+    (setq-local agent-shell--state
+                (list
+                 (cons :agent-config
+                       (list
+                        (cons :buffer-name "Claude Code")
+                        (cons :icon-name nil)))
+                 (cons :session
+                       (list
+                        (cons :id "test-session-id")
+                        (cons :title "Investigate text viewport header")
+                        (cons :model-id nil)
+                        (cons :models nil)
+                        (cons :mode-id nil)
+                        (cons :modes nil)))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--project-name)
+               (lambda () "project"))
+              ((symbol-function 'agent-shell--context-usage-indicator)
+               (lambda () nil))
+              ((symbol-function 'agent-shell--busy-indicator-frame)
+               (lambda () nil)))
+      (let ((agent-shell-header-style 'text)
+            (agent-shell-show-session-id t))
+        (should
+         (string-match-p
+          "project ➤ test-session-id ➤ Investigate text viewport header"
+          (substring-no-properties
+           (agent-shell--make-header agent-shell--state)))))
+      (map-put! (map-elt agent-shell--state :session) :title nil)
+      (let ((agent-shell-header-style 'text)
+            (agent-shell-show-session-id nil))
+        (should-not
+         (string-match-p
+          "Untitled"
+          (substring-no-properties
+           (agent-shell--make-header agent-shell--state))))))))
+
+(ert-deftest agent-shell--text-header-orders-segments-test ()
+  "Test text header segment order, model grouping and dropped Help hint."
+  (cl-letf (((symbol-function 'agent-shell--mode-line-model-menu)
+             (lambda () (make-sparse-keymap)))
+            ((symbol-function 'agent-shell--mode-line-thought-level-menu)
+             (lambda () (make-sparse-keymap)))
+            ((symbol-function 'agent-shell--mode-line-mode-menu)
+             (lambda () (make-sparse-keymap))))
+    (should
+     (equal
+      (substring-no-properties
+       (agent-shell--text-header
+        '((:position . "1/3")
+          (:status . "Edit")
+          (:buffer-name . "Claude Code")
+          (:model-name . "Sonnet 5")
+          (:thought-level-name . "think")
+          (:context-indicator . "42k/200k (21%)")
+          (:mode-name . "Accept Edits")
+          (:project-name . "project")
+          (:session-id . "test-session-id")
+          (:session-title . "Investigate text viewport header")
+          (:busy-indicator-frame . " ░")
+          (:key-hints . (((:key . "?")
+                          (:description . "Help")))))))
+      (concat " 1/3 Edit ➤ Claude Code ➤ Sonnet 5 · think · 42k/200k (21%)"
+              " ➤ Accept Edits ➤ project ➤ test-session-id"
+              " ➤ Investigate text viewport header ░")))))
+
+(ert-deftest agent-shell--text-header-omits-absent-segments-test ()
+  "Test the text header drops separators for segments it has no value for."
+  (should (equal (substring-no-properties
+                  (agent-shell--text-header
+                   '((:buffer-name . "Claude Code")
+                     (:project-name . "project"))))
+                 " Claude Code ➤ project"))
+  (should (equal (substring-no-properties
+                  (agent-shell--text-header
+                   '((:buffer-name . "Claude Code")
+                     (:context-indicator . "42k/200k (21%)")
+                     (:project-name . "project"))))
+                 " Claude Code ➤ 42k/200k (21%) ➤ project")))
 
 (ert-deftest agent-shell--make-header-text-includes-session-id-test ()
   "Test `agent-shell--make-header' text mode includes session ID."
@@ -4820,6 +4928,60 @@ other unknown ones."
                              '(:prompt "older prompt"
                                :response "older response")))
               (should updated-header))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-refresh-renders-after-turn-tail-test ()
+  "Viewport refresh should preserve out-of-turn content from the interaction model."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (shell-buffer (generate-new-buffer " *agent-shell shell*")))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-view-mode))
+          (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell-interaction-at-point)
+                     (lambda () '((:prompt . "Prompt\n\n")
+                                  (:response . "Response")
+                                  (:after-turn . "\n\nAfter turn"))))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-refresh)
+            (should (equal (buffer-string)
+                           (concat "Prompt\n\nResponse\n\nAfter turn")))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-view-last-renders-after-turn-tail-test ()
+  "`agent-shell-viewport-view-last' should preserve out-of-turn content too."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (goto-last-called nil))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-view-mode))
+          (cl-letf (((symbol-function 'agent-shell-goto-last-interaction)
+                     (lambda () (setq goto-last-called t)))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell-interaction-at-point)
+                     (lambda () '((:prompt . "Prompt\n\n")
+                                  (:response . "Response")
+                                  (:after-turn . "\n\nAfter turn"))))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-view-last)
+            (should goto-last-called)
+            (should (equal (buffer-string)
+                           (concat "Prompt\n\nResponse\n\nAfter turn")))))
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
 
@@ -5859,6 +6021,165 @@ with \"Method not found\"."
                    (setq sent-method (map-elt (plist-get args :request) :method)))))
         (agent-shell--refresh-session-title)
         (should (equal sent-method "session/list"))))))
+
+(ert-deftest agent-shell--set-session-title-refreshes-viewport-header-test ()
+  "Changing the session title should immediately refresh an open viewport."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell title shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell title shell* [viewport]"))
+        (agent-shell-header-style 'text)
+        (agent-shell-show-session-id nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq major-mode 'agent-shell-mode)
+            (setq-local agent-shell--state
+                        (list
+                         (cons :agent-config
+                               (list
+                                (cons :buffer-name "Claude Code")
+                                (cons :icon-name nil)))
+                         (cons :buffer shell-buffer)
+                         (cons :event-subscriptions nil)
+                         (cons :session
+                               (list
+                                (cons :id "test-session-id")
+                                (cons :title nil)
+                                (cons :model-id nil)
+                                (cons :models nil)
+                                (cons :mode-id nil)
+                                (cons :modes nil))))))
+          (with-current-buffer viewport-buffer
+            (setq major-mode 'agent-shell-viewport-view-mode))
+          (cl-letf (((symbol-function 'agent-shell--project-name)
+                     (lambda () "project"))
+                    ((symbol-function 'agent-shell--context-usage-indicator)
+                     (lambda () nil))
+                    ((symbol-function 'agent-shell--busy-indicator-frame)
+                     (lambda () nil))
+                    ((symbol-function 'agent-shell--update-header-and-mode-line)
+                     (lambda (&rest _)))
+                    ((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _)
+                       '((:current . 1) (:total . 1))))
+                    ((symbol-function 'agent-shell-viewport--busy-p)
+                     (lambda (&rest _) nil)))
+            (with-current-buffer shell-buffer
+              (agent-shell--set-session-title "Investigate text viewport header"))
+            (with-current-buffer viewport-buffer
+              (should
+               (string-match-p
+                "Investigate text viewport header"
+                (substring-no-properties header-line-format))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport--initialize-omits-leading-newline-test ()
+  "`agent-shell-viewport--initialize' must not prepend a layout newline.
+
+Submission trims surrounding whitespace, but layout still must not alter
+editable prompt text.  Completion, editing, and command handling should see
+leading-sensitive input such as `/compact' at `point-min'."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (agent-shell-viewport-edit-mode)
+          (agent-shell-viewport--initialize)
+          (insert "/compact")
+          (should (equal (buffer-string) "/compact")))))))
+
+(ert-deftest agent-shell-viewport--initialize-text-header-adds-display-only-spacer-test ()
+  "Text headers should get a display-only spacer, not real buffer text."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (agent-shell-viewport-edit-mode)
+          (agent-shell-viewport--initialize)
+          (let ((spacers (seq-filter (lambda (ov)
+                                       (equal (overlay-get ov 'before-string) "\n"))
+                                     (overlays-in (point-min) (point-min)))))
+            (should (= (length spacers) 1)))
+          (insert "/compact")
+          (should (equal (buffer-string) "/compact")))))))
+
+(ert-deftest agent-shell-viewport--initialize-text-header-spacer-survives-reinit-and-editing-test ()
+  "Text-header spacer should stay unique and not block editing at point-min."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (agent-shell-viewport-edit-mode)
+          (agent-shell-viewport--initialize)
+          (agent-shell-viewport--initialize)
+          (let ((spacers (seq-filter (lambda (ov)
+                                       (equal (overlay-get ov 'before-string) "\n"))
+                                     (overlays-in (point-min) (point-min)))))
+            (should (= (length spacers) 1)))
+          (insert "/compact")
+          (goto-char (point-min))
+          (insert "hello ")
+          (should (equal (buffer-string) "hello /compact"))
+          (let ((spacers (seq-filter (lambda (ov)
+                                       (equal (overlay-get ov 'before-string) "\n"))
+                                     (overlays-in (point-min) (point-min)))))
+            (should (= (length spacers) 1))))))))
+
+(ert-deftest agent-shell-viewport--initialize-text-header-spacer-survives-mode-switch-test ()
+  "Text-header spacer must stay unique across a reply's view->edit switch.
+
+`agent-shell-viewport-reply' switches the viewport buffer from view to
+edit mode, and that mode switch clears buffer-local vars.  Unless the
+spacer overlay reference survives, the previous overlay is orphaned and a
+new one is stacked on top, adding an extra visible blank line per reply."
+  (let ((agent-shell-header-style 'text)
+        (agent-shell-file-completion-enabled nil))
+    (with-temp-buffer
+      (let ((viewport-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--shell-buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (cl-flet ((count-spacers ()
+                      (length (seq-filter
+                               (lambda (ov)
+                                 (equal (overlay-get ov 'before-string) "\n"))
+                               (overlays-in (point-min) (point-min))))))
+            (agent-shell-viewport-edit-mode)
+            (agent-shell-viewport--initialize)
+            (should (= (count-spacers) 1))
+            ;; Simulate submit (-> view) then reply (-> edit) twice.
+            (dotimes (_ 2)
+              (agent-shell-viewport-view-mode)
+              (agent-shell-viewport-edit-mode)
+              (agent-shell-viewport--initialize)
+              (should (= (count-spacers) 1)))
+            (insert "/compact")
+            (should (equal (buffer-string) "/compact"))))))))
 
 (ert-deftest agent-shell--prompt-queue-replace-replaces-in-place-test ()
   "Test `agent-shell--prompt-queue-replace' replaces the request at INDEX."
