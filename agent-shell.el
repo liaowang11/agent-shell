@@ -1324,6 +1324,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :stream-render-pending nil)
         (cons :stream-render-timer nil)
         (cons :sleep-token nil)
+        (cons :out-of-turn-timer nil)
         (cons :active-requests nil)
         (cons :pending-prompts nil)
         (cons :usage (list (cons :total-tokens 0)
@@ -2997,6 +2998,74 @@ sent separately."
   "Return non-nil if STATE has in-flight requests awaiting responses."
   (map-elt state :active-requests))
 
+(defvar agent-shell--render-above-prompt nil
+  "When non-nil, render fragments above the active prompt.
+Bound by `agent-shell--on-notification' while dispatching a
+`session/update' that arrived out of turn (after `end_turn') so
+`agent-shell--update-fragment' lands its content above the fresh
+prompt instead of inside the user's input region.")
+
+(defun agent-shell--session-bound-notification-p (acp-notification)
+  "Return non-nil if ACP-NOTIFICATION reports session request progress.
+
+These typically arrive while an agent request is in
+flight (`session/prompt', `session/load', or `session/push'), but
+may also arrive out of turn (e.g. background tasks streaming after
+`end_turn'); see `agent-shell--on-notification'."
+  (and (equal (map-elt acp-notification 'method) "session/update")
+       (member (map-nested-elt acp-notification '(params update sessionUpdate))
+               '("tool_call" "tool_call_update"
+                 "agent_thought_chunk" "agent_message_chunk"
+                 "user_message_chunk" "plan"))))
+
+(defvar agent-shell--out-of-turn-idle-seconds 2.0
+  "Quiet period, in seconds, before the out-of-turn activity indicator clears.
+Out-of-turn updates arrive after `end_turn' with no request in flight and carry
+no turn-completion signal, so the indicator is debounced off after this much
+silence rather than stopped on a terminal event.")
+
+(defun agent-shell--clear-out-of-turn-activity (state)
+  "Stop STATE's out-of-turn busy indicator unless a real turn is in flight.
+Runs on the debounce timer armed by `agent-shell--note-out-of-turn-activity'.
+A prompt submitted during the debounce window restarts the heartbeat and drops
+the timer, so the in-flight guard keeps that live turn's indicator running.
+
+The burst arrived after the turn's end already rendered its held-back
+markup, so a message ending in a list item (or table row, image, ...)
+would stay raw.  The quiet period is the burst's only end signal, so
+render that markup now, in the shell and its viewport."
+  (map-put! state :out-of-turn-timer nil)
+  (unless (agent-shell--active-requests-p state)
+    (agent-shell-heartbeat-stop :heartbeat (map-elt state :heartbeat))
+    (when-let* ((shell-buffer (map-elt state :buffer))
+                ((buffer-live-p shell-buffer)))
+      (with-current-buffer shell-buffer
+        (agent-shell--render-deferred-markup))
+      (when-let* ((viewport-buffer (agent-shell-viewport--buffer
+                                    :shell-buffer shell-buffer
+                                    :existing-only t)))
+        (with-current-buffer viewport-buffer
+          (when (derived-mode-p 'agent-shell-viewport-view-mode)
+            (agent-shell--render-deferred-markup)))))))
+
+(defun agent-shell--note-out-of-turn-activity (state)
+  "Raise STATE's busy indicator for an out-of-turn update and debounce it off.
+Background tasks (e.g. subagents) stream `session/update' notifications after
+`end_turn', when the normal heartbeat has already stopped.  Restart the
+heartbeat so the activity stays visible, and (re)arm a timer to clear it after
+`agent-shell--out-of-turn-idle-seconds' of silence; each further update pushes
+the timer back.  The timer runs with the busy indicator off too, since the
+quiet period is also when the burst's held-back markup renders."
+  (when-let* ((heartbeat (map-elt state :heartbeat)))
+    (when agent-shell-show-busy-indicator
+      (agent-shell-heartbeat-start :heartbeat heartbeat))
+    (when-let* ((timer (map-elt state :out-of-turn-timer))
+                ((timerp timer)))
+      (cancel-timer timer))
+    (map-put! state :out-of-turn-timer
+              (run-at-time agent-shell--out-of-turn-idle-seconds nil
+                           #'agent-shell--clear-out-of-turn-activity state))))
+
 (defun agent-shell--make-out-of-session-turn-notification-body (state acp-notification)
   "Build a fragment body for ACP-NOTIFICATION arriving out of turn using STATE."
   (let ((agent-name (or (map-nested-elt state '(:agent-config :mode-line-name))
@@ -3469,8 +3538,7 @@ No-op while that function has nothing to summarize (an empty group)."
     (agent-shell--update-fragment
      :state state
      :block-id group-id
-     :label-left label
-     :above-last-prompt (not (agent-shell--active-requests-p state)))))
+     :label-left label)))
 
 (cl-defun agent-shell--sync-activity-group-fold (&key state group-id namespace-id)
   "Leave GROUP-ID the only expanded activity group in STATE.
@@ -3519,14 +3587,33 @@ Clears STATE's `:expanded-activity-group'."
      :group-label agent-shell--activity-group-label
      :group-expanded (agent-shell--activity-group-initial-expanded-p)
      :body (agent-shell--tool-call-body tool-call)
-     :expanded agent-shell-tool-use-expand-by-default
-     :above-last-prompt (not (agent-shell--active-requests-p state)))
+     :expanded agent-shell-tool-use-expand-by-default)
     (agent-shell--refresh-activity-group-header state group-id)
     (agent-shell--sync-activity-group-fold :state state :group-id group-id)))
 
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
   (map-put! state :last-activity-time (current-time))
+  ;; A turn-bound update arriving with no request in flight is an
+  ;; out-of-turn update: Claude has background tasks (e.g. subagents)
+  ;; that stream content after `end_turn'.  Bind
+  ;; `agent-shell--render-above-prompt' so the content lands above the
+  ;; fresh prompt instead of inside the user's input region; the
+  ;; `agent_message_chunk' branch also labels it.  Session-level
+  ;; updates (usage_update, session_info_update, etc.) are legitimate
+  ;; any time and unaffected.
+  (let ((agent-shell--render-above-prompt
+         (and (not (agent-shell--active-requests-p state))
+              (agent-shell--session-bound-notification-p acp-notification))))
+    (when agent-shell--render-above-prompt
+      (agent-shell--note-out-of-turn-activity state))
+    (agent-shell--dispatch-notification :state state :acp-notification acp-notification)))
+
+(cl-defun agent-shell--dispatch-notification (&key state acp-notification)
+  "Render ACP-NOTIFICATION into STATE's shell buffer.
+
+`agent-shell--on-notification' binds `agent-shell--render-above-prompt'
+around this call to reflect whether the update arrived out of turn."
   (cond ((equal (map-elt acp-notification 'method) "session/update")
          ;; Replayed user_message_chunks aren't followed by
          ;; shell-maker's end-of-prompt marker (no real
@@ -3597,10 +3684,7 @@ Clears STATE's `:expanded-activity-group'."
               :block-id (format "%s-agent_message_chunk"
                                 (or message-id (map-elt state :chunked-group-count)))
               :body content
-              :create-new new-message
-              ;; Out of turn (no prompt request in flight) lands the
-              ;; message above the fresh prompt rather than after it.
-              :above-last-prompt (not (agent-shell--active-requests-p state)))
+              :create-new new-message)
              (map-put! state :last-agent-message-id message-id))
            (map-put! state :last-entry-type "agent_message_chunk"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
@@ -3661,8 +3745,7 @@ Clears STATE's `:expanded-activity-group'."
                 :block-id (concat tool-call-id "-plan")
                 :label-left (propertize "Proposed plan" 'font-lock-face 'agent-shell-section-heading)
                 :body (agent-shell--format-plan (map-nested-elt acp-notification '(params update rawInput plan)))
-                :expanded t
-                :above-last-prompt (not (agent-shell--active-requests-p state)))))
+                :expanded t)))
            (map-put! state :last-entry-type "tool_call"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_thought_chunk")
            (let ((new-thought-p (not (equal (map-elt state :last-entry-type)
@@ -3803,8 +3886,7 @@ Clears STATE's `:expanded-activity-group'."
             :block-id "plan"
             :label-left (propertize "Plan" 'font-lock-face 'agent-shell-section-heading)
             :body (agent-shell--format-plan (map-nested-elt acp-notification '(params update entries)))
-            :expanded t
-            :above-last-prompt (not (agent-shell--active-requests-p state)))
+            :expanded t)
            (map-put! state :last-entry-type "plan"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call_update")
            (let* ((tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
@@ -4817,6 +4899,10 @@ For example, shut down ACP client."
     (map-put! (agent-shell--state) :set-config-options nil)
     ;; TODO: Use `map-put!' after 2026-12-07 (see `agent-shell--handle').
     (setf (map-elt agent-shell--state :init-finished) nil))
+  (when-let* ((timer (map-elt (agent-shell--state) :out-of-turn-timer))
+              ((timerp timer)))
+    (cancel-timer timer)
+    (map-put! (agent-shell--state) :out-of-turn-timer nil))
   (agent-shell-heartbeat-stop
    :heartbeat (map-elt (agent-shell--state) :heartbeat)))
 
@@ -5697,17 +5783,23 @@ CHUNK is an alist like:
    (:block-id . \"1-agent_message_chunk\")
    (:body . \"Hello world\")
    (:create-new . t)
-   (:above-last-prompt . nil))"
-  (agent-shell--update-fragment
-   :state state
-   :namespace-id (map-elt chunk :namespace-id)
-   :block-id (map-elt chunk :block-id)
-   :body (map-elt chunk :body)
-   :append t
-   :create-new (map-elt chunk :create-new)
-   :navigation 'never
-   :render-body-images t
-   :above-last-prompt (map-elt chunk :above-last-prompt)))
+   (:above-last-prompt . nil)
+   (:render-above-prompt . nil))
+
+Renders with the prompt placement the chunk arrived under, so an
+out-of-turn message lands above the prompt even when the render runs
+later from the timer."
+  (let ((agent-shell--render-above-prompt (map-elt chunk :render-above-prompt)))
+    (agent-shell--update-fragment
+     :state state
+     :namespace-id (map-elt chunk :namespace-id)
+     :block-id (map-elt chunk :block-id)
+     :body (map-elt chunk :body)
+     :append t
+     :create-new (map-elt chunk :create-new)
+     :navigation 'never
+     :render-body-images t
+     :above-last-prompt (map-elt chunk :above-last-prompt))))
 
 (defun agent-shell--flush-stream-render (state)
   "Render STATE's pending streamed text, if any."
@@ -5724,12 +5816,17 @@ CHUNK is an alist like:
 NAMESPACE-ID, CREATE-NEW, and ABOVE-LAST-PROMPT follow
 `agent-shell--update-fragment'.  Chunks for the same fragment are
 batched while `agent-shell--stream-render-interval' is non-nil.  A
-different fragment or CREATE-NEW flushes the previous batch first."
+different fragment or CREATE-NEW flushes the previous batch first.
+
+A batch keeps the prompt placement (`agent-shell--render-above-prompt')
+its chunks arrived under, for `agent-shell--render-streamed-chunk' to
+restore."
   (let ((chunk (list (cons :namespace-id namespace-id)
                      (cons :block-id block-id)
                      (cons :body body)
                      (cons :create-new create-new)
-                     (cons :above-last-prompt above-last-prompt)))
+                     (cons :above-last-prompt above-last-prompt)
+                     (cons :render-above-prompt agent-shell--render-above-prompt)))
         (pending (map-elt state :stream-render-pending)))
     (cond
      ((not agent-shell--stream-render-interval)
@@ -5870,11 +5967,15 @@ with GROUP-EXPANDED as the group's initial fold state."
            (saved-mark (mark t))
            (saved-mark-active mark-active)
            (saved-window-start (and window (window-start window)))
-           ;; Land the content above the active prompt.  Falls back to the
+           ;; Land the content above the active prompt, either because the
+           ;; caller asked (typical for notifications arriving after
+           ;; `end_turn') or via the dynamically bound
+           ;; `agent-shell--render-above-prompt'.  Falls back to the
            ;; normal in-line path when no live prompt sits at the buffer
            ;; end, which only happens with the persistent prompt off: with
            ;; it on, `agent-shell--live-prompt-start' signals instead.
-           (late-prompt-start (and above-last-prompt
+           (late-prompt-start (and (or above-last-prompt
+                                       agent-shell--render-above-prompt)
                                    (agent-shell--live-prompt-start))))
       (agent-shell--with-buffer-narrowed-to late-prompt-start
         (shell-maker-with-auto-scroll-edit
@@ -5897,7 +5998,17 @@ with GROUP-EXPANDED as the group's initial fold state."
                    (padding-start (map-nested-elt range '(:padding :start)))
                    (padding-end (map-nested-elt range '(:padding :end)))
                    (block-start (map-nested-elt range '(:block :start)))
-                   (block-end (map-nested-elt range '(:block :end))))
+                   (block-end (map-nested-elt range '(:block :end)))
+                   ;; Markdown can change section lengths after `range' is
+                   ;; returned.  Track the positions used after rendering.
+                   (tracked-ranges
+                    (when (or late-prompt-start agent-shell-section-functions)
+                      (seq-keep (lambda (part)
+                                  (when-let* ((start (map-nested-elt range (list part :start)))
+                                              (end (map-nested-elt range (list part :end))))
+                                    (list part (copy-marker start) (copy-marker end t))))
+                                '(:padding :group-header :block :body
+                                  :label-left :label-right)))))
          (save-restriction
            ;; TODO: Move this to shell-maker?
            (let ((inhibit-read-only t))
@@ -5940,7 +6051,22 @@ with GROUP-EXPANDED as the group's initial fold state."
                (agent-shell--render-markdown :render-images nil
                                              :external-renderers nil
                                              :complete t)
-               (widen))))
+               (widen))
+             ;; Record every fragment rendered above the live prompt.
+             ;; Unlike fragment ids, this covers late tool calls and plans
+             ;; that retain their normal request namespace.
+             (dolist (tracked tracked-ranges)
+               (let ((part (car tracked))
+                     (start (marker-position (cadr tracked)))
+                     (end (marker-position (caddr tracked))))
+                 (when (and late-prompt-start
+                            (memq part '(:padding :group-header :block))
+                            (< start end))
+                   (add-text-properties start end '(agent-shell-after-turn t)))
+                 (map-put! range part (list (cons :start start) (cons :end end)))))))
+         (dolist (tracked tracked-ranges)
+           (set-marker (cadr tracked) nil)
+           (set-marker (caddr tracked) nil))
          (run-hook-with-args 'agent-shell-section-functions range))))
       ;; Late-arrival inserts run under a narrow that ends at
       ;; `comint-last-prompt'.  The auto-scroll branch of
@@ -9452,6 +9578,13 @@ reads the buffer's prompt capabilities."
       (agent-shell-heartbeat-start
        :heartbeat (map-elt agent-shell--state :heartbeat)))
 
+    ;; A real turn is starting; drop any out-of-turn debounce so it can't
+    ;; stop this turn's indicator mid-flight.
+    (when-let* ((timer (map-elt agent-shell--state :out-of-turn-timer))
+                ((timerp timer)))
+      (cancel-timer timer)
+      (map-put! agent-shell--state :out-of-turn-timer nil))
+
     (agent-shell--cancel-idle-timer)
     (agent-shell--emit-event :event 'input-submitted
                              :data (list (cons :prompt (substring-no-properties expanded-prompt))))
@@ -9723,15 +9856,74 @@ characters into the response returns:
         ((and prompt-start (>= (point) prompt-start))
          `((:region . :prompt) (:offset . ,(- (point) prompt-start))))))
 
+(defun agent-shell--after-turn-char-p (pos)
+  "Return non-nil when POS was rendered above the live prompt."
+  (get-text-property pos 'agent-shell-after-turn))
+
+(defun agent-shell--after-turn-tail-before-live-prompt ()
+  "Return visible after-turn content immediately before the live prompt.
+
+Late `session/update' traffic is rendered above the active prompt, so viewport
+reconstruction needs to recover that tail from the shell transcript before it
+re-initializes the latest interaction.  Preserve the leading spacing that
+separates the tail from the main response, but trim prompt-adjacent trailing
+whitespace because the viewport has no live prompt beneath it."
+  (when-let* ((prompt-start (and comint-last-prompt
+                                 (marker-position (car comint-last-prompt))))
+              ((> prompt-start (point-min))))
+    (let ((pos (1- prompt-start)))
+      ;; Skip the prompt-adjacent spacing first; keep it if we confirm an
+      ;; out-of-turn fragment sits immediately above.
+      (while (and (>= pos (point-min))
+                  (memq (char-after pos) '(?\s ?\t ?\n ?\r)))
+        (setq pos (1- pos)))
+      (when (and (>= pos (point-min))
+                 (agent-shell--after-turn-char-p pos))
+        (while (and (>= pos (point-min))
+                    (or (agent-shell--after-turn-char-p pos)
+                        (memq (char-after pos) '(?\s ?\t ?\n ?\r))))
+          (setq pos (1- pos)))
+        (let ((text (string-trim-right
+                     (buffer-substring (1+ pos) prompt-start))))
+          (unless (string-empty-p (string-trim text))
+            text))))))
+
 (defun agent-shell-interaction-at-point ()
   "Return the interaction at point in the shell buffer.
-Result is of the form ((:prompt . PROMPT) (:response . RESPONSE))."
+
+In the form:
+
+  ((:prompt . PROMPT)
+   (:response . RESPONSE)
+   (:after-turn . AFTER-TURN))."
   (when-let* ((shell-buffer (agent-shell--shell-buffer))
-              (result (with-current-buffer shell-buffer
-                        (or (shell-maker--command-and-response-at-point :trimmed nil)
-                            (shell-maker-next-command-and-response t :trimmed nil)))))
-    `((:prompt . ,(car result))
-      (:response . ,(cdr result)))))
+              (interaction (with-current-buffer shell-buffer
+                             (let* ((on-live-prompt (and comint-last-input-start
+                                                         (>= (point) comint-last-input-start)))
+                                    (result (or (shell-maker--command-and-response-at-point :trimmed nil)
+                                                ;; Nothing is under point on the live prompt, and
+                                                ;; `shell-maker-next-command-and-response' going
+                                                ;; backwards from there skips the last response
+                                                ;; when it equals the last output, landing one
+                                                ;; interaction early.
+                                                (if on-live-prompt
+                                                    (car (last (shell-maker--extract-history
+                                                                (shell-maker-prompt-regexp shell-maker--config)
+                                                                :trimmed nil)))
+                                                  (shell-maker-next-command-and-response t :trimmed nil))))
+                                    (latest-p (and result on-live-prompt))
+                                    (after-turn (and latest-p
+                                                     (agent-shell--after-turn-tail-before-live-prompt))))
+                               (when result
+                                 (let ((response (cdr result)))
+                                   `((:prompt . ,(car result))
+                                     (:response . ,response)
+                                     ,@(unless (and after-turn
+                                                    response
+                                                    (string-suffix-p after-turn
+                                                                     (string-trim-right response)))
+                                         `((:after-turn . ,after-turn))))))))))
+    interaction))
 
 (defun agent-shell--current-shell ()
   "Current shell for viewport or shell buffer."
@@ -11313,7 +11505,10 @@ Prefers config option data when available."
     (agent-shell--config-option-value-name option current)))
 
 (defun agent-shell--busy-indicator-frame ()
-  "Return busy frame string or nil if not busy."
+  "Return busy frame string or nil if not busy.
+An out-of-turn burst (streaming after `end_turn', tracked by a live
+`:out-of-turn-timer') is prefixed with `↩' so it reads as after-turn activity
+rather than a fresh turn."
   (when-let* ((agent-shell-show-busy-indicator)
               ((eq 'busy (map-nested-elt (agent-shell--state) '(:heartbeat :status))))
               (frames (pcase (if (functionp agent-shell-busy-indicator-frames)
@@ -11328,7 +11523,10 @@ Prefers config option data when available."
                         ((and (or (pred listp) (pred vectorp)) frames) frames)
                         (_ '("▁" "▂" "▃" "▄" "▅" "▆" "▇" "█" "▇" "▆" "▅" "▄" "▃" "▂"))))
               (value (map-nested-elt (agent-shell--state) '(:heartbeat :value))))
-    (concat " " (seq-elt frames (mod value (length frames))))))
+    (concat " "
+            (when (map-elt (agent-shell--state) :out-of-turn-timer)
+              (propertize "↩ " 'font-lock-face 'font-lock-doc-markup-face))
+            (seq-elt frames (mod value (length frames))))))
 
 (defun agent-shell--make-heartbeat-handler (shell-buffer)
   "Return a heartbeat handler drawing SHELL-BUFFER's busy indicators.
