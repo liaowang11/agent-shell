@@ -3626,6 +3626,12 @@ around this call to reflect whether the update arrived out of turn."
                     (equal (map-elt state :last-entry-type) "user_message_chunk")
                     (not (equal (map-nested-elt acp-notification '(params update sessionUpdate))
                                 "user_message_chunk")))
+           ;; User prompts may be replayed in multiple chunks.  Keep chunk
+           ;; text contiguous and add the live-path trailing separator only
+           ;; when the prompt is complete.
+           (agent-shell--append-transcript
+            :text "\n\n"
+            :file-path agent-shell--transcript-file)
            (with-current-buffer (map-elt state :buffer)
              ;; The marker appends at `point-max', which with a prompt held
              ;; at the buffer end is below it.  Narrow so it closes the
@@ -3836,13 +3842,24 @@ around this call to reflect whether the update arrived out of turn."
                                      (format "[%s]" (or (map-nested-elt acp-notification '(params update content type))
                                                         "unknown")))))
                (when new-prompt-p
+                 ;; A replayed prompt follows the previous turn's agent
+                 ;; message, whose `agent_message_chunk' body ends
+                 ;; without a trailing newline.  Separate it so the
+                 ;; `## User' header lands on its own line instead of
+                 ;; gluing onto the agent's last words.
+                 (agent-shell--separate-transcript-after-agent-message
+                  :last-entry-type (map-elt state :last-entry-type)
+                  :file-path agent-shell--transcript-file)
                  (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
                  (agent-shell--append-transcript
                   :text (format "## User (%s)\n\n" (format-time-string "%F %T"))
                   :file-path agent-shell--transcript-file))
+               ;; Write the prompt raw, matching the live submit path
+               ;; (see the "## User" write at turn start), so a restored
+               ;; transcript renders identically to a live one rather
+               ;; than wrapping the prompt in a `> ' blockquote.
                (agent-shell--append-transcript
-                :text (format "> %s\n"
-                              (agent-shell--indent-markdown-headers content-text))
+                :text (agent-shell--indent-markdown-headers content-text)
                 :file-path agent-shell--transcript-file)
                (agent-shell--update-text
                 :state state
@@ -8635,8 +8652,13 @@ pending-restore state once replay completes."
             (unwind-protect
                 ;; A replay renders history the user never typed, so keep all of
                 ;; it out of undo history (see `agent-shell--reset-undo-history').
+                ;; It is also history the transcript already holds: the shell
+                ;; that ran those turns wrote them to its own file, and this
+                ;; shell's file starts at the restore.  Writing them here gave
+                ;; every restore a second copy stamped with the restore time.
                 (let ((buffer-undo-list t)
                       (shell-maker-inhibit-auto-scroll t)
+                      (agent-shell--transcript-file nil)
                       (prompt-start (and comint-last-prompt
                                          (marker-position (car comint-last-prompt))
                                          (agent-shell--live-input-prompt-p comint-last-prompt)
@@ -8687,6 +8709,14 @@ pending-restore state once replay completes."
                     (when (equal (map-elt state :last-entry-type) "user_message_chunk")
                       (agent-shell--with-buffer-narrowed-to (agent-shell--live-prompt-start)
                         (shell-maker-insert-end-of-prompt-marker)
+                        ;; The prompt is written raw, so it ends without a
+                        ;; newline.  The notification dispatch appends this
+                        ;; separator when a following notification closes the
+                        ;; prompt; here there is none, so append it now or the
+                        ;; next section header glues onto the restored prompt.
+                        (agent-shell--append-transcript
+                         :text "\n\n"
+                         :file-path agent-shell--transcript-file)
                         (let ((inhibit-read-only t))
                           (goto-char (point-max))
                           (insert (propertize "\n\n"
