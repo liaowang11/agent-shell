@@ -4036,6 +4036,87 @@ driven by a single helper on both paths."
       (when (file-exists-p root)
         (delete-directory root t)))))
 
+(ert-deftest agent-shell--restore-user-message-chunks-form-one-transcript-entry-test ()
+  "Replayed user chunks form one prompt, separated from adjacent agent messages.
+
+Restoring a session (`session/load') replays user submissions as
+`user_message_chunk' notifications.  The branch that writes the
+`## User' header did not separate it from the preceding agent
+message, whose `agent_message_chunk' body ends without a trailing
+newline, so the header glued onto the agent's last words:
+
+    ...retrievable handle?## User (2026-07-20 00:03:04)
+
+The replay path must emit the same blank-line separators the live
+path does, write the prompt raw rather than as a `> ' blockquote,
+and avoid inserting paragraph breaks between chunks of one prompt."
+  (let ((agent-shell--stream-render-interval nil)
+        (file (make-temp-file "agent-shell-transcript"))
+        (agent-shell--transcript-file nil)
+        ;; Replayed into a plain buffer, which holds no live prompt to
+        ;; render above: what is under test is the transcript the replay
+        ;; writes, not where in a shell it lands.
+        (agent-shell-persistent-prompt-enabled nil)
+        (state (list (cons :buffer (current-buffer))
+                     (cons :active-requests '(((:method . "session/load"))))
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :last-agent-message-id nil)
+                     (cons :last-activity-time nil)
+                     (cons :chunked-group-count 1)
+                     (cons :pending-restore nil)
+                     (cons :agent-config '((:shell-prompt . "> "))))))
+    (setq agent-shell--transcript-file file)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell--ensure-transcript-file)
+                   (lambda () file))
+                  ((symbol-function 'agent-shell--update-text) #'ignore)
+                  ((symbol-function 'agent-shell--update-fragment) #'ignore)
+                  ((symbol-function 'shell-maker-insert-end-of-prompt-marker)
+                   #'ignore))
+          ;; Content left by a replayed agent_message_chunk: a header
+          ;; plus body with NO trailing newline.
+          (write-region (format "## Agent (%s)\n\nretrievable handle?"
+                                (format-time-string "%F %T"))
+                        nil file)
+          (agent-shell--on-notification
+           :state state
+           :acp-notification '((method . "session/update")
+                               (params
+                                (update
+                                 (sessionUpdate . "user_message_chunk")
+                                 (content (type . "text") (text . "next "))))))
+          (agent-shell--on-notification
+           :state state
+           :acp-notification '((method . "session/update")
+                               (params
+                                (update
+                                 (sessionUpdate . "user_message_chunk")
+                                 (content (type . "text") (text . "question"))))))
+          ;; The next notification closes the replayed user prompt.
+          (agent-shell--on-notification
+           :state state
+           :acp-notification '((method . "session/update")
+                               (params
+                                (update
+                                 (sessionUpdate . "agent_message_chunk")
+                                 (content (type . "text") (text . "answer"))))))
+          (with-temp-buffer
+            (insert-file-contents file)
+            ;; The `## User' header must not glue onto the agent body.
+            (should-not (string-search "retrievable handle?## User"
+                                       (buffer-string)))
+            (should (string-search "retrievable handle?\n\n## User"
+                                   (buffer-string)))
+            ;; The prompt is written raw like the live path, not as a
+            ;; `> ' blockquote.
+            (should-not (string-search "> next question" (buffer-string)))
+            (should-not (string-search "next \n\nquestion" (buffer-string)))
+            (should (string-search
+                     "\n\nnext question\n\n\n## Agent"
+                     (buffer-string)))))
+      (delete-file file))))
+
 (ert-deftest agent-shell-mcp-servers-test ()
   "Test `agent-shell-mcp-servers' function normalization."
   ;; Test with nil
@@ -7915,7 +7996,8 @@ agent activity; consecutive user chunks stay in the same turn."
       (agent-shell--append-restore-notification state notif))
     (should (= 1 (length (agent-shell-tests--pending-restore-prompt-turns state))))))
 
-(cl-defun agent-shell-tests--render-pending-restore (&key last-entry-type typed-input undo kill-input)
+(cl-defun agent-shell-tests--render-pending-restore
+    (&key last-entry-type typed-input undo kill-input transcript-file)
   "Restore a single replayed turn ending in LAST-ENTRY-TYPE.
 
 Drives `agent-shell--render-pending-restore' as a `session/load' whose
@@ -7929,6 +8011,9 @@ completes.  UNDO undoes once after the replay settles.  KILL-INPUT
 runs `comint-kill-input' once it settles, which clears whatever comint
 considers unsent input and leaves the rest of the buffer alone.
 
+With TRANSCRIPT-FILE, the shell writes its transcript there, so a caller
+can assert on what the close path appended.
+
 Returns the resulting buffer string, with the live prompt trailing."
   (let* ((buffer (generate-new-buffer " *agent-shell-restore-test*"))
          (fake-process (start-process "fake-agent" buffer "cat")))
@@ -7938,6 +8023,7 @@ Returns the resulting buffer string, with the live prompt trailing."
           (comint-mode)
           (setq-local comint-prompt-regexp "^Claude> ")
           (buffer-enable-undo)
+          (setq-local agent-shell--transcript-file transcript-file)
           (let ((state (list (cons :buffer (current-buffer))
                              (cons :active-requests nil)
                              (cons :last-entry-type nil)
@@ -7951,6 +8037,11 @@ Returns the resulting buffer string, with the live prompt trailing."
                       ;; Emitting reads shell state, which this bare
                       ;; comint buffer has no business carrying.
                       ((symbol-function 'agent-shell--emit-event) #'ignore)
+                      ;; Creating the transcript requires a real
+                      ;; `agent-shell-mode' buffer; the caller's file
+                      ;; already exists.
+                      ((symbol-function 'agent-shell--ensure-transcript-file)
+                       (lambda () transcript-file))
                       ((symbol-function 'agent-shell--effective-restore-verbosity)
                        (lambda (_state) 'last))
                       ((symbol-function 'agent-shell--replay-turn)
@@ -7959,6 +8050,10 @@ Returns the resulting buffer string, with the live prompt trailing."
                          (let ((inhibit-read-only t))
                            (goto-char (point-max))
                            (insert "Claude> replayed"))
+                         ;; The real dispatch writes each replayed entry
+                         ;; to the transcript as it renders it.
+                         (agent-shell--append-transcript
+                          :text "replayed" :file-path agent-shell--transcript-file)
                          (map-put! state :last-entry-type last-entry-type))))
               ;; A live prompt awaiting input, emitted the way shell-maker
               ;; emits it before the load completes, so `comint-last-prompt'
@@ -8045,6 +8140,24 @@ message."
                   :typed-input "hi there"
                   :kill-input t)
                  "Claude> replayedClaude> ")))
+
+(ert-deftest agent-shell--render-pending-restore-leaves-transcript-alone-test ()
+  "Test a restore writes nothing to the transcript.
+A restored shell starts a new transcript file, and the turns it replays
+are already in the file of the shell that ran them.  Writing them again
+gave every restore a copy of the replayed turns, stamped with the time
+of the restore."
+  (let ((file (make-temp-file "agent-shell-transcript"))
+        (before "## User (2026-08-05 10:00:00)\n\nearlier prompt\n\n"))
+    (unwind-protect
+        (progn
+          (write-region before nil file)
+          (agent-shell-tests--render-pending-restore
+           :last-entry-type "user_message_chunk" :transcript-file file)
+          (with-temp-buffer
+            (insert-file-contents file)
+            (should (equal (buffer-string) before))))
+      (delete-file file))))
 
 (ert-deftest agent-shell--use-session-load-p-modes ()
   "Test `agent-shell--use-session-load-p' across verbosity/protocol combinations."
