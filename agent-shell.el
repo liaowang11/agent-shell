@@ -5701,6 +5701,23 @@ frame metrics, ...) is not rebuilt on every beat.")
               ((not (string-empty-p session-id))))
     (propertize session-id 'font-lock-face 'agent-shell-session-id)))
 
+(defun agent-shell--session-title-indicator (state)
+  "Return a propertized, single-line session title from STATE.
+Truncate titles wider than 50 display columns.
+
+  (agent-shell--session-title-indicator
+   \\='((:session . ((:title . \" Fix\\n headers \")))))
+  ;; => \"Fix headers\""
+  (when-let* ((title (map-nested-elt state '(:session :title)))
+              ((stringp title))
+              (normalized-title
+               (string-trim
+                (replace-regexp-in-string "[[:space:]]+" " " title)))
+              ((not (string-empty-p normalized-title))))
+    (propertize (truncate-string-to-width
+                 normalized-title 50 nil nil "...")
+                'font-lock-face 'agent-shell-session-title)))
+
 (defun agent-shell--face-foreground (face)
   "Return the foreground color for FACE, walking `:inherit' chains.
 FACE may be a face name symbol, an anonymous face plist (e.g. \\='(:foreground
@@ -5824,6 +5841,7 @@ defaulting to the frame width."
     (:mode-id . ,(map-nested-elt state '(:session :mode-id)))
     (:mode-name . ,(agent-shell-get-mode-name state))
     (:project-name . ,(agent-shell--project-name))
+    (:session-title . ,(agent-shell--session-title-indicator state))
     (:session-id . ,(agent-shell--session-id-indicator))
     (:width . ,(or width (frame-pixel-width)))
     (:font-height . ,(frame-char-height))
@@ -5952,92 +5970,90 @@ keeps entries fresh."
             (map-put! agent-shell--header-cache cache-key header)
             header)))))
 
+(defun agent-shell--header-menu-chunk (label face help binding menu)
+  "Return LABEL propertized with FACE as a clickable header chunk.
+
+HELP is the help-echo text, followed by BINDING's key description when
+non-nil.  MENU is the keymap bound to `mouse-1'."
+  (propertize label
+              'font-lock-face face
+              'help-echo (concat help (when binding
+                                        (propertize binding 'face 'agent-shell-key-binding)))
+              'mouse-face 'mode-line-highlight
+              'local-map (let ((map (make-sparse-keymap)))
+                           (define-key map [header-line down-mouse-1] #'ignore)
+                           (define-key map [header-line mouse-1] menu)
+                           map)))
+
+(defun agent-shell--header-join (parts separator)
+  "Join non-nil PARTS with SEPARATOR, or nil when no part is present.
+
+  (agent-shell--header-join \\='(\"Sonnet 5\" nil \"29k/200k (15%)\") \" · \")
+  ;; => \"Sonnet 5 · 29k/200k (15%)\""
+  (when-let* ((present (delq nil parts)))
+    (string-join present separator)))
+
+(defun agent-shell--text-header (header-model)
+  "Render HEADER-MODEL as a one-line text header.
+
+Text headers are cut off at the window's right edge, so segments run from
+the most to the least telling: position and status, agent, model, session
+mode, project, session ID and finally the session title.  Reasoning
+effort and context usage ride along with the model name, since all three
+describe how the agent is thinking.  The busy indicator trails
+everything, as it animates and must not shift the segments before it.
+
+  (agent-shell--text-header
+   \\='((:position . \"1/3\") (:status . \"Edit\")
+     (:buffer-name . \"Claude Code\") (:model-name . \"Sonnet 5\")
+     (:thought-level-name . \"think\") (:project-name . \"agent-shell\")
+     (:session-title . \"Fix headers\")))
+  ;; => \" 1/3 Edit ➤ Claude Code ➤ Sonnet 5 · think ➤ agent-shell ➤ Fix headers\""
+  (concat " "
+          (agent-shell--header-join
+           (list
+            (agent-shell--header-join (list (map-elt header-model :position)
+                                            (map-elt header-model :status))
+                                      " ")
+            (when (map-elt header-model :buffer-name)
+              (propertize (map-elt header-model :buffer-name)
+                          'font-lock-face 'agent-shell-buffer-name))
+            (agent-shell--header-join
+             (list (when (map-elt header-model :model-name)
+                     (agent-shell--header-menu-chunk
+                      (map-elt header-model :model-name)
+                      'agent-shell-model
+                      "Open LLM model menu "
+                      (map-nested-elt header-model '(:menu-keys :model))
+                      (agent-shell--mode-line-model-menu)))
+                   (when (map-elt header-model :thought-level-name)
+                     (agent-shell--header-menu-chunk
+                      (map-elt header-model :thought-level-name)
+                      'agent-shell-thought-level
+                      "Open thought level menu "
+                      (map-nested-elt header-model '(:menu-keys :thought-level))
+                      (agent-shell--mode-line-thought-level-menu)))
+                   (map-elt header-model :context-indicator))
+             " · ")
+            (when (map-elt header-model :mode-name)
+              (agent-shell--header-menu-chunk
+               (map-elt header-model :mode-name)
+               'agent-shell-session-mode
+               "Open session mode menu "
+               (map-nested-elt header-model '(:menu-keys :mode))
+               (agent-shell--mode-line-mode-menu)))
+            (when (map-elt header-model :project-name)
+              (propertize (map-elt header-model :project-name)
+                          'font-lock-face 'agent-shell-session-directory))
+            (map-elt header-model :session-id)
+            (map-elt header-model :session-title))
+           " ➤ ")
+          (map-elt header-model :busy-indicator-frame)))
+
 (defun agent-shell--render-header-model-uncached (header-model)
   "Render HEADER-MODEL to a header string without caching."
-  (let* ((key-hints (map-elt header-model :key-hints))
-         (menu-keys (map-elt header-model :menu-keys))
-         (model-binding (map-elt menu-keys :model))
-         (mode-binding (map-elt menu-keys :mode))
-         (thought-level-binding (map-elt menu-keys :thought-level))
-         (help-hint (seq-find (lambda (b)
-                                (equal (map-elt b :description) "Help"))
-                              key-hints))
-         (help-chunk (when help-hint
-                       (concat (propertize (map-elt help-hint :key)
-                                           'face 'agent-shell-key-binding)
-                               " "
-                               (map-elt help-hint :description))))
-         (text-header (format " %s%s%s%s%s ➤ %s%s%s%s%s"
-                              (cond
-                               ((and (map-elt header-model :position)
-                                     (map-elt header-model :status))
-                                (concat (map-elt header-model :position) " "
-                                        (map-elt header-model :status)
-                                        (when help-chunk (concat " " help-chunk))
-                                        " ➤ "))
-                               ((map-elt header-model :position)
-                                (concat (map-elt header-model :position)
-                                        (when help-chunk (concat " " help-chunk))
-                                        " ➤ "))
-                               (t ""))
-                              (propertize (map-elt header-model :buffer-name)
-                                          'font-lock-face 'agent-shell-buffer-name)
-                              (if (map-elt header-model :model-name)
-                                  (concat " ➤ " (propertize (map-elt header-model :model-name)
-                                                            'font-lock-face 'agent-shell-model
-                                                            'help-echo (concat "Open LLM model menu "
-                                                                               (when model-binding
-                                                                                 (propertize model-binding 'face 'agent-shell-key-binding)))
-                                                            'mouse-face 'mode-line-highlight
-                                                            'local-map (let ((map (make-sparse-keymap)))
-                                                                         (define-key map [header-line down-mouse-1] #'ignore)
-                                                                         (define-key map [header-line mouse-1]
-                                                                                     (agent-shell--mode-line-model-menu))
-                                                                         map)))
-                                "")
-                              (if (map-elt header-model :thought-level-name)
-                                  (concat " ➤ " (propertize (map-elt header-model :thought-level-name)
-                                                            'font-lock-face 'agent-shell-thought-level
-                                                            'help-echo (concat "Open thought level menu "
-                                                                               (when thought-level-binding
-                                                                                 (propertize thought-level-binding 'face 'agent-shell-key-binding)))
-                                                            'mouse-face 'mode-line-highlight
-                                                            'local-map (let ((map (make-sparse-keymap)))
-                                                                         (define-key map [header-line down-mouse-1] #'ignore)
-                                                                         (define-key map [header-line mouse-1]
-                                                                                     (agent-shell--mode-line-thought-level-menu))
-                                                                         map)))
-                                "")
-                              (if (map-elt header-model :mode-name)
-                                  (concat " ➤ " (propertize (map-elt header-model :mode-name)
-                                                            'font-lock-face 'agent-shell-session-mode
-                                                            'help-echo (concat "Open session mode menu "
-                                                                               (when mode-binding
-                                                                                 (propertize mode-binding 'face 'agent-shell-key-binding)))
-                                                            'mouse-face 'mode-line-highlight
-                                                            'local-map (let ((map (make-sparse-keymap)))
-                                                                         (define-key map [header-line down-mouse-1] #'ignore)
-                                                                         (define-key map [header-line mouse-1]
-                                                                                     (agent-shell--mode-line-mode-menu))
-                                                                         map)))
-                                "")
-                              (propertize (map-elt header-model :project-name) 'font-lock-face 'agent-shell-session-directory)
-                              (if (map-elt header-model :session-id)
-                                  (concat " ➤ " (map-elt header-model :session-id))
-                                "")
-                              (if (map-elt header-model :context-indicator)
-                                  (concat (if (> (length (map-elt header-model :context-indicator)) 1)
-                                              " ➤ "
-                                            " ")
-                                          (map-elt header-model :context-indicator))
-                                "")
-                              (if (and (map-elt header-model :status)
-                                       (not (map-elt header-model :position)))
-                                  (concat " ➤ " (map-elt header-model :status))
-                                "")
-                              (if (map-elt header-model :busy-indicator-frame)
-                                  (map-elt header-model :busy-indicator-frame)
-                                ""))))
+  (let ((key-hints (map-elt header-model :key-hints))
+        (text-header (agent-shell--text-header header-model)))
     (pcase agent-shell-header-style
       ((or 'none (pred null)) nil)
       ('text text-header)
@@ -8591,6 +8607,14 @@ Does nothing if TITLE is empty or matches the current value."
              (not (string-empty-p title))
              (not (equal (map-nested-elt agent-shell--state '(:session :title)) title)))
     (map-put! (map-elt agent-shell--state :session) :title title)
+    (when (derived-mode-p 'agent-shell-mode)
+      (agent-shell--update-header-and-mode-line))
+    (when-let* ((viewport-buffer
+                 (agent-shell-viewport--buffer
+                  :shell-buffer (current-buffer)
+                  :existing-only t)))
+      (with-current-buffer viewport-buffer
+        (agent-shell-viewport--update-header)))
     (agent-shell--emit-event :event 'session-title-changed
                              :data (list (cons :title title)))))
 
