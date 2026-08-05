@@ -43,9 +43,12 @@
 (declare-function agent-shell-steering-supported-p "agent-shell")
 (declare-function agent-shell-experimental--send-steering "agent-shell-experimental")
 (declare-function agent-shell-completion--setup-minibuffer "agent-shell-completion")
+(declare-function agent-shell--display-buffer "agent-shell")
+(declare-function agent-shell-viewport--prefill-edit "agent-shell-viewport")
 (declare-function shell-maker-busy "shell-maker")
 
 (defvar agent-shell--state)
+(defvar agent-shell-prefer-viewport-interaction)
 (defvar comint-input-ring)
 
 ;; The queueing commands were renamed to the `agent-shell-prompt-queue'
@@ -99,6 +102,7 @@ TODO: Remove after 2026-08-28."
 
 %s
 
+Edit:   M-x agent-shell-prompt-queue-edit
 Resume: M-x agent-shell-prompt-queue-resume
 Remove: M-x agent-shell-prompt-queue-remove
 "
@@ -295,6 +299,81 @@ shell buffer."
         (message "Shell is busy, prompts will auto-resume when ready")
       (agent-shell--prompt-queue-process-next))))
 
+(defun agent-shell--prompt-queue-choices ()
+  "Return an alist of (LABEL . INDEX) for the pending prompts.
+
+LABEL is the prompt's 1-based position and a truncated copy of its text;
+INDEX is the 0-based position in `:pending-prompts'.  Returns nil when the
+queue is empty.
+
+For example, with pending prompts \"first\" and \"second\":
+
+  ((\"1: first\" . 0) (\"2: second\" . 1))"
+  (seq-map-indexed
+   (lambda (prompt idx)
+     (cons (format "%d: %s" (1+ idx)
+                   (truncate-string-to-width prompt 60 nil nil "..."))
+           idx))
+   (map-elt agent-shell--state :pending-prompts)))
+
+(cl-defun agent-shell--prompt-queue-replace (&key index prompt expected)
+  "Replace the pending prompt at INDEX with PROMPT, preserving its position.
+
+When PROMPT is nil or only whitespace, the prompt is left unchanged (no
+error).  When INDEX is out of range (e.g. the queue drained while editing),
+nothing is changed.  When EXPECTED is non-nil, also leave the queue unchanged
+unless the prompt at INDEX still equals EXPECTED.  Otherwise PROMPT is spliced
+in at INDEX."
+  (agent-shell--prompt-queue-migrate)
+  (let ((pending (map-elt agent-shell--state :pending-prompts)))
+    (cond
+     ((or (null prompt) (string-empty-p (string-trim prompt)))
+      (message "Pending prompt unchanged"))
+     ((or (null index) (< index 0) (>= index (length pending)))
+      (message "Prompt no longer pending"))
+     ((and expected (not (equal (nth index pending) expected)))
+      (message "Prompt queue changed; edit not applied"))
+     (t
+      (let ((new-pending (append (seq-take pending index)
+                                 (list prompt)
+                                 (seq-drop pending (1+ index)))))
+        (map-put! agent-shell--state :pending-prompts new-pending)
+        (message "Prompt updated (%d pending)" (length new-pending)))))))
+
+(defun agent-shell-prompt-queue-edit (index)
+  "Edit the pending prompt at INDEX, replacing it in place.
+
+Acts on the current project's shell, resolving it via
+`agent-shell--shell-buffer' so this works even when invoked outside a
+shell buffer.  When called interactively, prompt to choose a pending
+prompt (or use the only one when there is just one).  The current prompt
+text is prefilled for editing: in a viewport-edit buffer when
+`agent-shell-prefer-viewport-interaction' is non-nil, otherwise in the
+minibuffer.  Submitting empty text leaves the prompt unchanged.
+
+While editing, @ completes project files and / completes available agent
+commands when the agent has reported them."
+  (interactive
+   (with-current-buffer (agent-shell--shell-buffer :no-create t)
+     (agent-shell--prompt-queue-migrate)
+     (let ((choices (agent-shell--prompt-queue-choices)))
+       (when (seq-empty-p choices)
+         (user-error "No pending prompts"))
+       (list (if (cdr choices)
+                 (cdr (assoc (completing-read "Edit: " choices nil t) choices))
+               (cdar choices))))))
+  (with-current-buffer (agent-shell--shell-buffer :no-create t)
+    (agent-shell--prompt-queue-migrate)
+    (let ((current (nth index (map-elt agent-shell--state :pending-prompts))))
+      (if agent-shell-prefer-viewport-interaction
+          (agent-shell--display-buffer
+           (agent-shell-viewport--prefill-edit
+            :shell-buffer (current-buffer) :index index :text current))
+        (agent-shell--prompt-queue-replace
+         :index index
+         :expected current
+         :prompt (agent-shell--prompt-queue-read :initial current))))))
+
 (defun agent-shell-prompt-queue-remove (&optional remove-index)
   "Remove all pending prompts or a specific prompt by REMOVE-INDEX.
 
@@ -307,15 +386,8 @@ either remove all or select a specific prompt to remove."
      (agent-shell--prompt-queue-migrate)
      (when (seq-empty-p (map-elt agent-shell--state :pending-prompts))
        (user-error "No pending prompts"))
-     (let* ((pending (map-elt agent-shell--state :pending-prompts))
-            (choices (append
-                      '(("Remove all" . remove-all))
-                      (seq-map-indexed
-                       (lambda (prompt idx)
-                         (cons (format "%d: %s" (1+ idx)
-                                       (truncate-string-to-width prompt 60 nil nil "..."))
-                               idx))
-                       pending)))
+     (let* ((choices (append '(("Remove all" . remove-all))
+                             (agent-shell--prompt-queue-choices)))
             (selection (cdr (assoc (completing-read "Remove: " choices nil t) choices))))
        (list (unless (eq selection 'remove-all) selection)))))
   (with-current-buffer (agent-shell--shell-buffer :no-create t)

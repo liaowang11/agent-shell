@@ -1260,6 +1260,8 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-prompt-bar-submit                           | Submit the bar's prompt to its shell, or queue it when busy.                  |
 |                                                       | agent-shell-prompt-compose                              | Compose an `agent-shell' prompt in a dedicated buffer.                        |
 |                                                       | agent-shell-prompt-queue                                | Queue or immediately send a prompt depending on shell busy state.             |
+|                                                       | agent-shell-prompt-queue-dwim                           | Queue a prompt with DWIM context for an existing shell.                       |
+|                                                       | agent-shell-prompt-queue-edit                           | Edit the pending prompt at INDEX, replacing it in place.                      |
 |                                                       | agent-shell-prompt-queue-remove                         | Remove all pending prompts or a specific prompt by REMOVE-INDEX.              |
 |                                                       | agent-shell-prompt-queue-resume                         | Resume processing pending prompts in the queue.                               |
 |                                                       | agent-shell-prompt-steer                                | Steer PROMPT into the turn the agent is currently running.                    |
@@ -1322,6 +1324,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-viewport-previous-item                      | Go to previous item.                                                          |
 |                                                       | agent-shell-viewport-previous-page                      | Show previous interaction (request / response).                               |
 |                                                       | agent-shell-viewport-prompt-queue                       | Queue or immediately send a prompt depending on shell busy state.             |
+|                                                       | agent-shell-viewport-prompt-queue-edit                  | Edit a pending prompt in the queue.                                           |
 |                                                       | agent-shell-viewport-prompt-queue-remove                | Remove pending prompts.                                                       |
 |                                                       | agent-shell-viewport-prompt-queue-resume                | Resume processing pending prompts in the queue.                               |
 |                                                       | agent-shell-viewport-quote-reply                        | Reply with the entire response block-quoted.                                  |
