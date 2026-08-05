@@ -9281,6 +9281,42 @@ With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an
              (agent-shell--prompt-queue-read :initial (concat text "\n\n"))))
         (agent-shell-insert :text text :shell-buffer shell-buffer))))))
 
+(cl-defun agent-shell-prompt-queue-dwim (&optional arg)
+  "Queue a prompt with DWIM context for an existing shell.
+
+When called with prefix ARG, prompt to choose an existing shell.
+
+Prefills the minibuffer with `agent-shell--context' when available, but does
+not send until the minibuffer input is confirmed.
+
+When `agent-shell-prefer-viewport-interaction' is non-nil, opens the viewport
+compose buffer with context prefilled instead of using the minibuffer."
+  (interactive "P")
+  (let ((shell-buffer
+         (if arg
+             (get-buffer
+              (completing-read "Queue prompt to shell: "
+                               (mapcar #'buffer-name (or (agent-shell-buffers)
+                                                         (user-error "No shells available")))
+                               nil t))
+           (agent-shell--shell-buffer :no-create t))))
+    (if agent-shell-prefer-viewport-interaction
+        (agent-shell--display-viewport-when-ready
+         :shell-buffer shell-buffer
+         :append (or (agent-shell--context :shell-buffer shell-buffer) "")
+         :edit t)
+      (let* ((context (when-let ((text (agent-shell--context :shell-buffer shell-buffer)))
+                        (concat text "\n\n")))
+             (prompt (with-current-buffer shell-buffer
+                       (or (map-nested-elt (agent-shell--state) '(:agent-config :shell-prompt))
+                           "Enqueue prompt: ")))
+             (request (minibuffer-with-setup-hook
+                          (lambda ()
+                            (agent-shell-completion--setup-minibuffer shell-buffer))
+                        (read-string prompt context))))
+        (with-current-buffer shell-buffer
+          (agent-shell-prompt-queue request))))))
+
 (cl-defun agent-shell--get-region-context (&key deactivate no-error agent-cwd)
   "Get region as insertable text, ready for sending to agent.
 
