@@ -6615,6 +6615,55 @@ new one is stacked on top, adding an extra visible blank line per reply."
     (should (equal (map-elt agent-shell--state :pending-prompts)
                    '("selected" "after")))))
 
+(ert-deftest agent-shell--prompt-queue-display-buttons-invoke-commands-test ()
+  "Test the pending prompts fragment renders buttons bound to the queue commands.
+
+Point on a button and RET (or a mouse-1 click) must run the command, so
+each button's label carries a keymap binding both to it."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state (list (cons :pending-prompts (list "a"))
+                                         (cons :request-count 1)))
+    (let (body)
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (setq body (plist-get args :body)))))
+        (agent-shell--prompt-queue-display)
+        (should body)
+        (dolist (action '(("Edit" . agent-shell-prompt-queue-edit)
+                          ("Resume" . agent-shell-prompt-queue-resume)
+                          ("Remove" . agent-shell-prompt-queue-remove)))
+          (let ((keymap (get-text-property (string-match (car action) body)
+                                           'keymap body)))
+            (should (eq (lookup-key keymap (kbd "RET")) (cdr action)))
+            (should (eq (lookup-key keymap [mouse-1]) (cdr action)))))))))
+
+(ert-deftest agent-shell--prompt-queue-display-buttons-bind-keys-test ()
+  "Test each queue action has a key that works from any button in the row.
+
+Like the permission dialog, the keys live in a keymap shared by every
+button, so \"e\" edits while point sits on the Remove button."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state (list (cons :pending-prompts (list "a"))
+                                         (cons :request-count 1)))
+    (let (body)
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (setq body (plist-get args :body)))))
+        (agent-shell--prompt-queue-display)
+        ;; The key is shown in each label, ...
+        (should (string-match-p "Edit (e)" body))
+        (should (string-match-p "Resume (r)" body))
+        (should (string-match-p "Remove (d)" body))
+        ;; ... and every key resolves from a single button.
+        (let ((keymap (get-text-property (string-match "Remove" body)
+                                         'keymap body)))
+          (should (eq (lookup-key keymap (kbd "e"))
+                      'agent-shell-prompt-queue-edit))
+          (should (eq (lookup-key keymap (kbd "r"))
+                      'agent-shell-prompt-queue-resume))
+          (should (eq (lookup-key keymap (kbd "d"))
+                      'agent-shell-prompt-queue-remove)))))))
+
 (ert-deftest agent-shell-prompt-queue-edit-no-pending-errors-test ()
   "Test `agent-shell-prompt-queue-edit' errors when the queue is empty."
   (with-temp-buffer

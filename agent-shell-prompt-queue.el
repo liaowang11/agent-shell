@@ -35,6 +35,7 @@
 (eval-when-compile (require 'cl-lib))
 
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
+(declare-function agent-shell--make-button "agent-shell")
 (declare-function agent-shell--update-fragment "agent-shell")
 (declare-function agent-shell--shell-buffer "agent-shell")
 (declare-function agent-shell--state "agent-shell")
@@ -84,6 +85,46 @@ TODO: Remove after 2026-08-28."
      :submit t
      :no-focus t)))
 
+(defun agent-shell--prompt-queue-actions ()
+  "Return the queue action buttons, to be clicked or invoked with RET.
+
+Each action's key is bound in a keymap shared by all the buttons, so any
+of them accepts every key (as the permission dialog does).
+
+For example, in a terminal frame:
+
+  \"[ Edit (e) ] [ Resume (r) ] [ Remove (d) ]\""
+  (let* ((actions '(((:label . "Edit")
+                     (:char . "e")
+                     (:description . "edit a pending prompt")
+                     (:command . agent-shell-prompt-queue-edit))
+                    ((:label . "Resume")
+                     (:char . "r")
+                     (:description . "resume pending prompts")
+                     (:command . agent-shell-prompt-queue-resume))
+                    ((:label . "Remove")
+                     (:char . "d")
+                     (:description . "remove pending prompts")
+                     (:command . agent-shell-prompt-queue-remove))))
+         (keymap (let ((map (make-sparse-keymap)))
+                   (dolist (action actions)
+                     (define-key map (kbd (map-elt action :char))
+                                 (map-elt action :command)))
+                   map)))
+    (mapconcat
+     (lambda (action)
+       (agent-shell--make-button
+        :text (format "%s (%s)" (map-elt action :label) (map-elt action :char))
+        :help (format "Press RET or %s to %s (M-x %s)"
+                      (map-elt action :char)
+                      (map-elt action :description)
+                      (map-elt action :command))
+        :kind 'prompt-queue
+        :keymap keymap
+        :action (map-elt action :command)))
+     actions
+     " ")))
+
 (defun agent-shell--prompt-queue-display ()
   "Display pending prompts in the shell buffer if queue is not empty."
   (unless (derived-mode-p 'agent-shell-mode)
@@ -98,9 +139,7 @@ TODO: Remove after 2026-08-28."
 
 %s
 
-Edit:   M-x agent-shell-prompt-queue-edit
-Resume: M-x agent-shell-prompt-queue-resume
-Remove: M-x agent-shell-prompt-queue-remove
+  %s
 "
                    (seq-length (map-elt agent-shell--state :pending-prompts))
                    (mapconcat
@@ -111,7 +150,8 @@ Remove: M-x agent-shell-prompt-queue-remove
                                 (1+ idx)
                                 (truncate-string-to-width first-line 80 nil nil "..."))))
                     (seq-map-indexed #'cons (map-elt agent-shell--state :pending-prompts))
-                    "\n"))
+                    "\n")
+                   (agent-shell--prompt-queue-actions))
      :create-new t)))
 
 (cl-defun agent-shell--prompt-queue-echo (&key active-prompt pending-prompts)
