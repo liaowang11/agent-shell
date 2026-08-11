@@ -1702,6 +1702,11 @@ For example, offer to kill associated shell session."
             #'agent-shell--render-markdown nil t)
   (agent-shell-viewport--update-header)
   (setq-local filter-buffer-substring-function #'agent-shell--filter-buffer-substring)
+  ;; Rendered code blocks carry their language's syntax table as a
+  ;; `syntax-table' text property, so sexp commands read a block's body
+  ;; with the block's syntax rather than this buffer's prose syntax.
+  ;; See `agent-shell-markdown--apply-syntax-from'.
+  (setq-local parse-sexp-lookup-properties t)
   (setq buffer-read-only t)
   (add-hook 'kill-buffer-hook #'agent-shell-viewport--clean-up nil t))
 

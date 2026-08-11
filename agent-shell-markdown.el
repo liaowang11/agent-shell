@@ -1600,6 +1600,11 @@ with `emacs-lisp-mode' face properties on the body and a
                                'face 'agent-shell-markdown-source-block)
             (agent-shell-markdown--apply-faces-from highlighted
                                                     (marker-position body-start))
+            ;; Body chars only: the panel chrome and the trailing `\\n'
+            ;; covered by BODY-BG-END are markdown, not code, and keep
+            ;; the host buffer's syntax.
+            (agent-shell-markdown--apply-syntax-from highlighted
+                                                     (marker-position body-start))
             (add-text-properties (marker-position body-start) body-bg-end
                                  `(agent-shell-markdown-frozen t
                                                                agent-shell-non-trimmable t
@@ -4090,6 +4095,40 @@ caller's seeded face shows through."
                                   face))
         (setq pos next)))))
 
+(defun agent-shell-markdown--apply-syntax-from (propertized buffer-start)
+  "Copy `syntax-table' runs from PROPERTIZED onto chars at BUFFER-START.
+
+A rendered code block's body is plain text in a buffer whose major
+mode is not the block's language, so the host mode's syntax
+applies to it.  In a `text-mode' buffer that makes `\"'
+punctuation rather than a string delimiter, so an elisp string
+like \"\\e]777;...\" parses as a stray close bracket and
+`forward-sexp' / `eval-last-sexp' inside the block fail with
+\"Unbalanced parentheses\".
+
+`agent-shell-markdown--highlight-code' stamps the language mode's
+syntax table on the highlighted string; carrying it onto the
+buffer makes sexp scanning read the body with the block's own
+syntax.  Buffers that render markdown set
+`parse-sexp-lookup-properties' so the property takes effect.
+
+Flushes the `syntax-ppss' cache from BUFFER-START, since callers
+may apply the property with change hooks inhibited."
+  (let ((pos 0)
+        (len (length propertized))
+        (applied nil))
+    (while (< pos len)
+      (let ((table (get-text-property pos 'syntax-table propertized))
+            (next (or (next-single-property-change pos 'syntax-table propertized)
+                      len)))
+        (when table
+          (setq applied t)
+          (put-text-property (+ buffer-start pos) (+ buffer-start next)
+                             'syntax-table table))
+        (setq pos next)))
+    (when applied
+      (syntax-ppss-flush-cache buffer-start))))
+
 (defun agent-shell-markdown--mirror-face-to-font-lock-face (start end)
   "Copy each `face' run across [START, END) to `font-lock-face'.
 
@@ -4121,8 +4160,10 @@ produced."
 LANG is a language identifier as written after the opening
 fence (e.g. \"python\", \"elisp\").  When the resolved mode is
 loadable, CODE is fontified in a temporary buffer and returned
-with face properties applied.  Otherwise CODE is returned
-unchanged."
+with face properties applied, plus a `syntax-table' property
+carrying the mode's syntax table (see
+`agent-shell-markdown--apply-syntax-from').  Otherwise CODE is
+returned unchanged."
   (if-let* ((mode (agent-shell-markdown--resolve-lang-mode lang))
             ((fboundp mode)))
       (with-temp-buffer
@@ -4131,6 +4172,7 @@ unchanged."
           (delay-mode-hooks
             (funcall mode)
             (font-lock-ensure)))
+        (put-text-property (point-min) (point-max) 'syntax-table (syntax-table))
         (buffer-string))
     code))
 
