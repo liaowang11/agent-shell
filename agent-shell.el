@@ -4970,6 +4970,11 @@ variable (see makunbound)"))
       ;; Initialize buffer-local shell-maker-config
       (setq-local agent-shell--shell-maker-config shell-maker-config)
       (setq-local filter-buffer-substring-function #'agent-shell--filter-buffer-substring)
+      ;; Rendered code blocks carry their language's syntax table as a
+      ;; `syntax-table' text property, so sexp commands read a block's
+      ;; body with the block's syntax rather than this buffer's prose
+      ;; syntax.  See `agent-shell-markdown--apply-syntax-from'.
+      (setq-local parse-sexp-lookup-properties t)
       (agent-shell--update-header-and-mode-line)
       (add-hook 'kill-buffer-hook #'agent-shell--clean-up nil t)
       (add-hook 'change-major-mode-hook #'agent-shell--clean-up nil t)

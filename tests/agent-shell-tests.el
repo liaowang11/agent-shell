@@ -5873,6 +5873,21 @@ page to disambiguate, so a position label would just repeat it."
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
 
+(ert-deftest agent-shell-viewport-view-mode-enables-syntax-properties-test ()
+  "View mode should honour the `syntax-table' property rendered code blocks carry.
+
+Without `parse-sexp-lookup-properties', a block's language syntax
+table is ignored and sexp commands parse the body with `text-mode'
+syntax."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-view-mode))
+          (should parse-sexp-lookup-properties))
+      (kill-buffer viewport-buffer))))
+
 (ert-deftest agent-shell-viewport-refresh-renders-after-turn-tail-test ()
   "Viewport refresh should preserve out-of-turn content from the interaction model."
   (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
