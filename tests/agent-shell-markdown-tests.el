@@ -11,6 +11,8 @@
 
 (require 'cl-lib)
 (require 'ert)
+;; A per-language syntax-table test compares against `python-mode-syntax-table'.
+(require 'python)
 
 (load-file (expand-file-name "../agent-shell-markdown.el"
                              (file-name-directory
@@ -1939,6 +1941,61 @@ print(\"hi\")
          "" "agent-shell-markdown-tests"))
       (should-not highlighted-mode-hook-ran)
       (should observer-hook-ran))))
+
+(ert-deftest agent-shell-markdown-highlight-code-carries-syntax-table ()
+  "Highlighted code carries its language's syntax table as a property."
+  (let ((highlighted (agent-shell-markdown--highlight-code "(if t nil)" "elisp")))
+    (should (eq (get-text-property 0 'syntax-table highlighted)
+                emacs-lisp-mode-syntax-table))))
+
+(ert-deftest agent-shell-markdown-source-block-body-carries-syntax-table ()
+  "A rendered block's body chars carry the language's syntax table."
+  (let ((rendered (agent-shell-markdown-convert "```elisp
+(if t nil)
+```")))
+    (should (eq (get-text-property (string-search "(if t nil)" rendered)
+                                   'syntax-table rendered)
+                emacs-lisp-mode-syntax-table))))
+
+(ert-deftest agent-shell-markdown-source-block-syntax-table-is-per-language ()
+  "Each block gets its own language's syntax table, not elisp's."
+  (let ((rendered (agent-shell-markdown-convert "```python
+x = \"y\"
+```")))
+    (should (eq (get-text-property (string-search "x = " rendered)
+                                   'syntax-table rendered)
+                python-mode-syntax-table))))
+
+(ert-deftest agent-shell-markdown-prose-carries-no-syntax-table ()
+  "Prose outside a fenced block keeps the host buffer's syntax."
+  (let ((rendered (agent-shell-markdown-convert "prose (a \"b\") more
+```elisp
+(if t nil)
+```")))
+    (should-not (get-text-property (string-search "prose" rendered)
+                                   'syntax-table rendered))))
+
+(ert-deftest agent-shell-markdown-source-block-sexp-scan-uses-block-syntax ()
+  "Sexp scanning inside an elisp block reads the body as elisp.
+
+Regression: the body is plain text in a `text-mode'-derived buffer,
+where `\"' is punctuation rather than a string delimiter.  The `]'
+inside the OSC escape string then parsed as an unmatched close
+bracket and `backward-sexp' signalled \"Unbalanced parentheses\"."
+  (let ((rendered (agent-shell-markdown-convert "```elisp
+(run-at-time 5 nil #'send-string-to-terminal
+             \"\\e]777;notify;Emacs;Delayed test\\a\" (frame-terminal))
+```")))
+    (with-temp-buffer
+      (text-mode)
+      (setq-local parse-sexp-lookup-properties t)
+      (insert rendered)
+      (goto-char (point-max))
+      (search-backward ")")
+      (let ((end (1+ (point))))
+        (should (string-prefix-p
+                 "(run-at-time"
+                 (buffer-substring-no-properties (scan-sexps end -1) end)))))))
 
 (ert-deftest agent-shell-markdown-convert-source-block-body-tagged ()
   ;; Body chars carry `agent-shell-markdown-frozen t' so subsequent calls
