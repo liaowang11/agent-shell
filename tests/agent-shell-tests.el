@@ -9258,5 +9258,74 @@ Then [after](https://after.com/y)
     (agent-shell-previous-item)
     (should (eq (char-after) ?A))))
 
+(ert-deftest agent-shell--render-deferred-images-keeps-trailing-whitespace-hidden-test ()
+  "The turn-end image render must not re-expose the body's hidden tail.
+Rendering rewrites body chars and can drop the trailing-whitespace
+`invisible' marking applied on insert (see
+`agent-shell--render-markdown-body').  The deferred image pass is a
+render like any other: a body ending in image markup plus its padding
+must keep that padding hidden, or a block inserted below counts those
+newlines as separation and collapsing this body later joins its header
+with the next block's."
+  (let ((image-file (make-temp-file "agent-shell-test" nil ".svg")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _d) t))
+                  ((symbol-function 'image-supported-file-p) (lambda (_f) t))
+                  ((symbol-function 'create-image) (lambda (&rest _) '(image :fake t)))
+                  ((symbol-function 'image-flush) (lambda (&rest _) nil)))
+          (with-temp-buffer
+            (insert (format "![alt](%s)\n\n```sh\nls\n```\n\n" image-file))
+            (put-text-property (point-min) (point-max) 'agent-shell-ui-section 'body)
+            (agent-shell-ui--apply-trailing-whitespace-invisible (point-min) (point-max))
+            (agent-shell--render-deferred-images)
+            (should-not (string-match-p "\n\\'" (agent-shell-tests--visible-text)))))
+      (delete-file image-file))))
+
+(defun agent-shell-tests--visible-text ()
+  "Return the current buffer's text with `invisible' chars removed."
+  (let ((pos (point-min))
+        (visible ""))
+    (while (< pos (point-max))
+      (let ((next (next-single-property-change pos 'invisible nil (point-max))))
+        (unless (get-text-property pos 'invisible)
+          (setq visible (concat visible
+                                (buffer-substring-no-properties pos next))))
+        (setq pos next)))
+    visible))
+
+(ert-deftest agent-shell-collapsed-member-keeps-next-header-on-own-line-test ()
+  "A collapsed member must not pull the next member's header onto its line.
+Rendering a fenced code block rewrites the body's tail with visible
+newlines, dropping the trailing-whitespace `invisible' marking.  A
+member inserted after that render then finds enough visible newlines
+and adds no padding of its own, so the only separator before its
+header is body text of the previous member.  That body text vanishes
+when the member is collapsed, joining both headers on one line."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local comint-last-output-start (copy-marker (point-min)))
+    (let ((state `((:buffer . ,(current-buffer))
+                   (:request-count . 1))))
+      ;; No viewport in this test; exercise the shell buffer path only.
+      (cl-letf (((symbol-function 'agent-shell-viewport--buffer) #'ignore))
+        (agent-shell--update-fragment
+         :state state :block-id "a"
+         :label-left "Command" :label-right "first command"
+         :body "```console\nls\nREADME.org\n```\n\n"
+         :expanded t
+         :group-id "grp" :group-label "Thought, run 2 commands")
+        (agent-shell--update-fragment
+         :state state :block-id "b"
+         :label-left "Command" :label-right "second command"
+         :group-id "grp" :group-label "Thought, run 2 commands")))
+    ;; Collapse the first member.
+    (let ((inhibit-read-only t))
+      (goto-char (map-elt (car (agent-shell-ui--group-children
+                                :group-qualified-id "1-grp"))
+                          :start))
+      (agent-shell-ui--toggle-fragment-at-point))
+    (should (string-match-p "first command\n"
+                            (agent-shell-tests--visible-text)))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here
