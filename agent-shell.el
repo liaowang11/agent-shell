@@ -457,11 +457,25 @@ bullet, while a body of prose is untouched."
                                (not (get-text-property
                                      (1- (point-max))
                                      'agent-shell-markdown-table-source))))))
-            (agent-shell--render-markdown :complete t))))))
+            (agent-shell--render-markdown-body :complete t))))))
   ;; Rendering can resize text above the prompt, shifting any unsubmitted
   ;; input away from the undo entries recorded for it.
   (when (agent-shell--live-input-prompt-p comint-last-prompt)
     (agent-shell--reset-undo-history)))
+
+(cl-defun agent-shell--render-markdown-body (&key (render-images t) complete)
+  "Render the narrowed body region as markdown, keeping its tail hidden.
+
+The render rewrites body chars and can leave the region's trailing
+newlines visible (e.g. a fenced block's bottom padding), dropping the
+trailing-whitespace `invisible' marking applied on insert.  A block
+inserted below then counts those newlines as separation and skips its
+own padding, so collapsing this body later swallows the only newlines
+before the next block's header, joining both headers on one line.
+Re-hide the tail to restore the invariant.  RENDER-IMAGES and COMPLETE
+as in `agent-shell--render-markdown'."
+  (agent-shell--render-markdown :render-images render-images :complete complete)
+  (agent-shell-ui--apply-trailing-whitespace-invisible (point-min) (point-max)))
 
 (defcustom agent-shell-confirm-interrupt t
   "Whether to prompt for confirmation before interrupting.
@@ -5544,7 +5558,7 @@ variable (see makunbound)"))
       (add-hook 'window-configuration-change-hook #'agent-shell--resize-header nil t)
       (agent-shell-ui-mode +1)
       (add-hook 'agent-shell-ui-post-expand-fragment-at-point-hook
-                #'agent-shell--render-markdown nil t)
+                #'agent-shell--render-markdown-body nil t)
       (agent-shell-completion--setup)
       (agent-shell--enable-dnd)
       (yank-media-handler "image/.*" #'agent-shell--yank-media-image)
@@ -5958,7 +5972,7 @@ with GROUP-EXPANDED as the group's initial fold state."
                 ;; rendered on expand via
                 ;; `agent-shell-ui-post-expand-fragment-at-point-hook'.
                 (unless (agent-shell-ui--body-invisible-p (point-min) (point-max))
-                  (agent-shell--render-markdown :render-images render-body-images))))
+                  (agent-shell--render-markdown-body :render-images render-body-images))))
             ;; Note: For now, we're skipping applying markdown
             ;; on left labels as they currently carry propertized text
             ;; for statuses (ie. boxed).
@@ -6057,7 +6071,7 @@ with GROUP-EXPANDED as the group's initial fold state."
                ;; rendered on expand via
                ;; `agent-shell-ui-post-expand-fragment-at-point-hook'.
                (unless (agent-shell-ui--body-invisible-p (point-min) (point-max))
-                 (agent-shell--render-markdown))
+                 (agent-shell--render-markdown-body))
                (widen))
              ;;
              ;; Note: For now, we're skipping applying markdown
