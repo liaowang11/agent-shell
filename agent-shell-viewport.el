@@ -78,7 +78,7 @@
 (declare-function agent-shell-ui-backward-block "agent-shell")
 (declare-function agent-shell-ui-forward-block "agent-shell")
 (declare-function agent-shell-ui-mode "agent-shell")
-(declare-function agent-shell--render-markdown "agent-shell")
+(declare-function agent-shell--render-markdown-body "agent-shell")
 (declare-function agent-shell-completion-mode "agent-shell-completion")
 (declare-function agent-shell-yank-dwim "agent-shell")
 
@@ -1699,7 +1699,7 @@ For example, offer to kill associated shell session."
   (cursor-intangible-mode +1)
   (agent-shell-ui-mode +1)
   (add-hook 'agent-shell-ui-post-expand-fragment-at-point-hook
-            #'agent-shell--render-markdown nil t)
+            #'agent-shell--render-markdown-body nil t)
   (agent-shell-viewport--update-header)
   (setq-local filter-buffer-substring-function #'agent-shell--filter-buffer-substring)
   ;; Rendered code blocks carry their language's syntax table as a
