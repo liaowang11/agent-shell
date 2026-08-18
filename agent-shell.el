@@ -9869,30 +9869,31 @@ TEXT is the error message."
 
 (defun agent-shell--get-flymake-error-context ()
   "Get flymake error at point, ready for sending to agent."
-  (when-let* ((diagnostics (flymake-diagnostics (point))))
-    (mapconcat
-     (lambda (diagnostic)
-       (let* ((buffer (flymake-diagnostic-buffer diagnostic))
-              (beg (flymake-diagnostic-beg diagnostic))
-              (end (flymake-diagnostic-end diagnostic))
-              (type (flymake-diagnostic-type diagnostic))
-              (text (flymake-diagnostic-text diagnostic))
-              (line (with-current-buffer buffer
-                      (line-number-at-pos beg)))
-              (col (with-current-buffer buffer
-                     (save-excursion
-                       (goto-char beg)
-                       (current-column)))))
-         (agent-shell--format-diagnostic
-          :buffer buffer
-          :beg beg
-          :end end
-          :line line
-          :col col
-          :type type
-          :text text)))
-     diagnostics
-     "\n\n")))
+  (when (bound-and-true-p flymake-mode)
+    (when-let* ((diagnostics (flymake-diagnostics (point))))
+      (mapconcat
+       (lambda (diagnostic)
+         (let* ((buffer (flymake-diagnostic-buffer diagnostic))
+                (beg (flymake-diagnostic-beg diagnostic))
+                (end (flymake-diagnostic-end diagnostic))
+                (type (flymake-diagnostic-type diagnostic))
+                (text (flymake-diagnostic-text diagnostic))
+                (line (with-current-buffer buffer
+                        (line-number-at-pos beg)))
+                (col (with-current-buffer buffer
+                       (save-excursion
+                         (goto-char beg)
+                         (current-column)))))
+           (agent-shell--format-diagnostic
+            :buffer buffer
+            :beg beg
+            :end end
+            :line line
+            :col col
+            :type type
+            :text text)))
+       diagnostics
+       "\n\n"))))
 
 (defun agent-shell--get-flycheck-error-context ()
   "Get flycheck error at point, ready for sending to agent."
