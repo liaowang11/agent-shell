@@ -662,7 +662,7 @@ Use one of these entry points to create and initialize the viewport buffer:
 (setopt agent-shell-prefer-viewport-interaction t)
 #+end_src
 
-In edit mode, =C-c C-c= sends or queues the prompt and switches to view mode when viewport interaction is preferred.  Use =C-u C-c C-c= to send or queue while keeping the compose buffer open, =C-c C-p= to peek at the latest interaction without losing the draft, =C-c C-k= to cancel, and =C-c C-h= for help.
+In edit mode, =C-c C-c= sends the prompt and switches to view mode when viewport interaction is preferred.  Use =C-u C-c C-c= to send while keeping the compose buffer open, =C-c C-q= to wait behind a running turn or submit when idle, and =C-c C-i= to deliver it to the running turn instead (see [[*Steering a running turn]]).  Use =C-c C-p= to peek at the latest interaction without losing the draft, =C-c C-k= to cancel, and =C-c C-h= for help.
 
 In view mode, use =r= to compose a reply, =R= to quote the response in a reply, =b= / =f= to move between interactions, =p= / =n= to move between items, =?= for help, and =q= to bury the viewport.
 
@@ -671,6 +671,35 @@ In view mode, use =r= to compose a reply, =R= to quote the response in a reply, 
 
 Do not invoke =agent-shell-viewport-edit-mode= or =agent-shell-viewport-view-mode= directly in an agent shell buffer.  They are major modes installed by the entry points above on the separate viewport buffer, not commands for converting the shell buffer.
 #+end_quote
+
+*** Steering a running turn
+
+A prompt sent while a turn is running can either wait for the turn to end or be delivered to the turn already running, so the agent reads it at its next stopping point and changes course without losing the work already done.
+
+=agent-shell-prompt-while-busy= chooses which one a plain send does.  It defaults to =inject=; set it to =queue= to wait for the turn to end.  Generic send stays lossless: with no turn running the prompt is submitted, and an agent that cannot take a preferred mid-turn prompt gets it queued.
+
+Each busy-state behavior also has an explicit command, whatever the setting says:
+
+- =M-x agent-shell-prompt-send= - follow =agent-shell-prompt-while-busy=.
+- =M-x agent-shell-prompt-queue= - queue until the running turn ends, or submit immediately when idle.
+- =M-x agent-shell-prompt-inject= - deliver to the running turn, submit when idle, or error when injection is unavailable.
+- =M-x agent-shell-prompt-inject-queued= - inject a prompt that is already queued; it leaves the queue only after delivery.  Also available as =Inject (i)= in the pending prompts block.
+
+Each of the first three has a =-dwim= variant (=agent-shell-prompt-send-dwim=, =agent-shell-prompt-queue-dwim=, =agent-shell-prompt-inject-dwim=) that prefills the region or error at point as context, so the thing you are looking at can redirect work already under way.  With a prefix argument they ask which shell to use.  When =agent-shell-prefer-viewport-interaction= is on they open the compose buffer instead of the minibuffer, and the disposition travels with that buffer, so its =C-c C-c= still does what the command's name said.
+
+The compose buffer's keys line up with those three: =C-c C-c= (=agent-shell-viewport-compose-send=) follows the setting, =C-c C-q= (=agent-shell-viewport-compose-queue=) queues behind work in progress or submits when idle, and =C-c C-i= (=agent-shell-viewport-compose-inject=) explicitly injects.  Explicit injection errors without clearing the draft when the running turn cannot accept it.  All three leave the compose buffer the same way after successful delivery, following =agent-shell-viewport-dismiss-on-send= and =agent-shell-prefer-viewport-interaction=; with a prefix argument (=C-u=) the buffer stays open, cleared, for the next prompt.
+
+While a turn is running, the edit-mode header names what =C-c C-c= will do with the draft.  Generic send reads =Edit (inject)= or =Edit (queue)=.  A draft opened by an explicit injection command reads =Edit (inject unavailable)= when the turn cannot accept it, because sending will error instead of changing delivery methods.
+
+An injected prompt renders under an =Injected prompt= label where the agent's output paused, keeping the steered turn a single interaction so the viewport shows the whole thing.
+
+This rides the =_session/steering= ACP extension request, which agents advertise in the =initialize= response at the top-level =_meta.steering.supported=.  Agents that advertise it are listed as =promptInjection= in the shell's Agent capabilities block.  Verified with =@agentclientprotocol/claude-agent-acp= (which interrupts the current generation and answers in seconds) and =@agentclientprotocol/codex-acp= (which finishes the current message first).
+
+A prompt that arrives just as a turn ends is handled by asking the agent to hand it back rather than start a turn of its own.  Only the Claude adapter honors that request; Codex ignores unknown options, so there the agent can start a turn nobody asked for.  When that happens the shell says so in a block explaining that the output arrives out of turn and that the shell will not show as busy while it runs.
+
+Explicit injection submits normally when no turn is running, but errors without changing the draft when a running turn cannot accept it.  If an attempted injection is declined or fails, it is reported rather than delivered by another method.  Injecting a pending prompt temporarily claims it from the queue, so turn completion cannot also submit it normally; a declined request restores it at the same position.
+
+Some agents answer with =startedNewTurn=: they consumed the prompt by starting a turn that Agent Shell does not own and therefore cannot mark busy.  Agent Shell pauses automatic queue delivery in that case.  Wait for the detached response to finish, then run =M-x agent-shell-prompt-queue-resume=; viewport =C-c C-c= submissions remain queued until then.
 
 *** Specific Agent Commands
 
@@ -970,6 +999,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-pi-environment                    | Environment variables for the Pi client.                                        |
 | agent-shell-prefer-viewport-interaction       | Non-nil makes ‘agent-shell’ prefer viewport interaction over shell interaction. |
 | agent-shell-preferred-agent-config            | Default agent to use for all new shells.                                        |
+| agent-shell-prompt-while-busy                 | What sending a prompt does while the agent is working on a turn.                |
 | agent-shell-qwen-acp-command                  | Command and parameters for the Qwen Code client.                                |
 | agent-shell-qwen-authentication               | Configuration for Qwen Code authentication.                                     |
 | agent-shell-qwen-environment                  | Environment variables for the Qwen Code client.                                 |
@@ -1067,11 +1097,16 @@ always go to Evil modes if you need to with ~C-z~).
 | p or <backtab>  | agent-shell-previous-item                               | Go to previous item.                                                          |
 |                 | agent-shell-previous-permission-button                  | Jump to the previous button.                                                  |
 |                 | agent-shell-prompt-compose                              | Compose an `agent-shell' prompt in a dedicated buffer.                        |
+|                 | agent-shell-prompt-inject                               | Deliver a prompt to the turn that is already running.                         |
+|                 | agent-shell-prompt-inject-dwim                          | Deliver a prompt with DWIM context to the turn already running.               |
 |                 | agent-shell-prompt-queue                                | Queue or immediately send a prompt depending on shell busy state.             |
 |                 | agent-shell-prompt-queue-dwim                           | Queue a prompt with DWIM context for an existing shell.                       |
 |                 | agent-shell-prompt-queue-edit                           | Edit the pending prompt at INDEX, replacing it in place.                      |
+|                 | agent-shell-prompt-inject-queued                        | Deliver the pending prompt at INDEX to the running turn.                      |
 |                 | agent-shell-prompt-queue-remove                         | Remove all pending prompts or a specific prompt by REMOVE-INDEX.              |
 |                 | agent-shell-prompt-queue-resume                         | Resume processing pending prompts in the queue.                               |
+|                 | agent-shell-prompt-send                                 | Send a prompt, injecting or queueing it when a turn is already running.       |
+|                 | agent-shell-prompt-send-dwim                            | Send a prompt with DWIM context to an existing shell.                         |
 | r               | agent-shell-quote-region                                | Quote the active region into the shell's latest prompt.                       |
 |                 | agent-shell-qwen-start                                  | Start an interactive Qwen Code CLI agent shell.                               |
 | C-x x r         | agent-shell-rename-buffer                               | Rename current shell buffer.                                                  |
@@ -1098,6 +1133,8 @@ always go to Evil modes if you need to with ~C-z~).
 |                 | agent-shell-view-acp-logs                               | View agent shell ACP logs buffer.                                             |
 |                 | agent-shell-view-traffic                                | View agent shell traffic buffer.                                              |
 |                 | agent-shell-viewport-compose-cancel                     | Cancel prompt composition.                                                    |
+| C-c C-i         | agent-shell-viewport-compose-inject                     | Inject the composed prompt into the running turn, then clear the buffer.      |
+| C-c C-q         | agent-shell-viewport-compose-queue                      | Queue behind a running turn or submit when idle, then clear the buffer.       |
 |                 | agent-shell-viewport-compose-send                       | Send the viewport composed prompt to the agent shell.                         |
 |                 | agent-shell-viewport-compose-send-and-kill              | Send the viewport composed prompt to the agent shell and kill compose buffer. |
 |                 | agent-shell-viewport-compose-send-and-wait-for-response | Send the viewport composed prompt and display response in viewport.           |

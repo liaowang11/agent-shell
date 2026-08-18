@@ -134,6 +134,25 @@ response for line motion such as `end-of-visual-line'."
         (should (> (overlay-start agent) terminator))
         (should-not (get-char-property terminator 'display))))))
 
+(ert-deftest agent-shell-chat-agent-labels-single-newline-response-test ()
+  "A response one newline below an abutting marker is still labeled.
+
+Input that abuts the marker (\"input<marker>\") followed by a single
+newline leaves nothing between the input's terminator and the response,
+so the overlay span is empty.  `evaporate' deletes an overlay created
+empty, and reading the deleted overlay's start signaled
+`wrong-type-argument number-or-marker-p nil' from the relabel timer."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "input")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "\nreply\n")
+    (agent-shell-chat--relabel)
+    (let ((agent (car (agent-shell-chat-mode-tests--agent-overlays))))
+      (should agent)
+      (should (overlay-buffer agent))
+      (should (string-match-p "Claude" (overlay-get agent 'before-string))))))
+
 (ert-deftest agent-shell-chat-agent-keeps-terminator-restored-test ()
   "A restored turn keeps the input terminator that follows the marker.
 Restored input abuts the marker (\"input<marker>\\n\") rather than

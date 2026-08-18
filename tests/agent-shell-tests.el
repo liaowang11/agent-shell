@@ -1606,6 +1606,20 @@ _world_")
                         " me")))
     (should (equal (agent-shell--expand-truncated-regions prompt) "keep preview me"))))
 
+(ert-deftest agent-shell--send-request-cleans-active-state-on-error-test ()
+  "Test a send error removes the request from active state."
+  (let ((request '((:method . "test")))
+        (state '((:active-requests))))
+    (cl-letf (((symbol-function 'acp-send-request)
+               (lambda (&rest _)
+                 (signal 'wrong-type-argument '(symbolp (type . "text"))))))
+      (should-error (agent-shell--send-request
+                     :state state
+                     :client 'fake-client
+                     :request request)
+                    :type 'wrong-type-argument)
+      (should-not (map-elt state :active-requests)))))
+
 (ert-deftest agent-shell--send-command-integration-test ()
   "Integration test: verify `agent-shell--send-command' calls ACP correctly."
   (let ((sent-request nil)
@@ -1851,16 +1865,16 @@ compose buffer keeps its draft in place and stays in edit mode."
 (ert-deftest agent-shell-viewport-compose-send-and-dismiss-test ()
   "Composed prompts are queued, cleared, and dismissed or kept.
 
-`agent-shell-viewport--compose-queue' hands the draft to
-`agent-shell-prompt-queue' and clears the compose buffer;
+`agent-shell-viewport--compose-deliver' hands the draft to
+`agent-shell--prompt-send' and clears the compose buffer;
 `agent-shell-viewport-compose-send-and-dismiss' additionally dismisses
 the window.  An empty draft signals an error."
   (let ((agent-shell-header-style 'graphical)
         queued dismissed)
     (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
                (lambda (&rest _) (current-buffer)))
-              ((symbol-function 'agent-shell-prompt-queue)
-               (lambda (prompt) (setq queued prompt)))
+              ((symbol-function 'agent-shell--prompt-send)
+               (lambda (&rest args) (setq queued (plist-get args :prompt))))
               ((symbol-function 'agent-shell-viewport--dismiss)
                (lambda (&rest _) (setq dismissed t)))
               ((symbol-function 'agent-shell-viewport--position)
@@ -1880,7 +1894,7 @@ the window.  An empty draft signals an error."
       (with-temp-buffer
         (agent-shell-viewport-edit-mode)
         (insert "another prompt")
-        (agent-shell-viewport--compose-queue)
+        (agent-shell-viewport--compose-deliver)
         (should (equal queued "another prompt"))
         (should (string-empty-p (string-trim (buffer-string))))
         (should-not dismissed))
@@ -3740,21 +3754,35 @@ so the command must not append a second time."
             (shell-buffer (generate-new-buffer " *agent-shell shell*"))
             (appends nil))
         (unwind-protect
-            (cl-letf (((symbol-function 'agent-shell--shell-buffer)
-                       (lambda (&rest _) shell-buffer))
-                      ((symbol-function 'agent-shell--context)
-                       (lambda (&key shell-buffer)
-                         (ignore shell-buffer)
-                         "context from source"))
-                      ((symbol-function 'shell-maker-busy)
-                       (lambda (&rest _) nil))
-                      ((symbol-function 'agent-shell-viewport--show-buffer)
-                       (lambda (&rest args)
-                         (push (plist-get args :append) appends))))
-              (with-current-buffer source-buffer
-                (agent-shell-send-dwim))
-              (should (equal appends '("context from source"))))
+            (progn
+              (with-current-buffer shell-buffer
+                (setq-local agent-shell-session-strategy 'reuse)
+                (setq-local agent-shell--state
+                            `((:buffer . ,shell-buffer)
+                              (:session . ((:id . "session-1"))))))
+              (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+                         (lambda (&rest _) shell-buffer))
+                        ((symbol-function 'agent-shell--context)
+                         (lambda (&key shell-buffer)
+                           (ignore shell-buffer)
+                           "context from source"))
+                        ((symbol-function 'shell-maker-busy)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'agent-shell-viewport--show-buffer)
+                         (lambda (&rest args)
+                           (push (plist-get args :append) appends))))
+                (with-current-buffer source-buffer
+                  (agent-shell-send-dwim))
+                (should (equal appends '("context from source")))))
           (kill-buffer shell-buffer))))))
+
+(ert-deftest agent-shell-send-dwim-without-prefix-delegates-test ()
+  "Test no-prefix `agent-shell-send-dwim' uses the prompt DWIM path."
+  (let (called)
+    (cl-letf (((symbol-function 'agent-shell-prompt-send-dwim)
+               (lambda (&optional arg) (setq called (or arg 'no-prefix)))))
+      (agent-shell-send-dwim)
+      (should (eq called 'no-prefix)))))
 
 (ert-deftest agent-shell-prompt-queue-dwim-prefills-context-test ()
   "Test `agent-shell-prompt-queue-dwim' prefills context before queueing."
@@ -3764,6 +3792,7 @@ so the command must not append a second time."
           (agent-shell-prefer-viewport-interaction nil)
           read-args
           queued-prompt
+          queued-disposition
           queued-buffer)
       (unwind-protect
           (cl-letf (((symbol-function 'agent-shell--shell-buffer)
@@ -3782,14 +3811,18 @@ so the command must not append a second time."
                      (lambda (prompt &optional initial-input _history _default-value _inherit-input-method)
                        (setq read-args (list prompt initial-input))
                        (concat initial-input "\nextra prompt")))
-                    ((symbol-function 'agent-shell-prompt-queue)
-                     (lambda (prompt)
-                       (setq queued-prompt prompt
+                    ((symbol-function 'agent-shell--prompt-send)
+                     (lambda (&rest args)
+                       (setq queued-prompt (plist-get args :prompt)
+                             queued-disposition (plist-get args :disposition)
                              queued-buffer (current-buffer)))))
             (agent-shell-prompt-queue-dwim)
             (should (equal read-args '("Enqueue prompt: " "context from source\n\n")))
             (should (equal queued-prompt "context from source\n\n\nextra prompt"))
-            (should (eq queued-buffer shell-buffer)))
+            (should (eq queued-buffer shell-buffer))
+            ;; Named `queue', so it queues whatever
+            ;; `agent-shell-prompt-while-busy' is set to.
+            (should (eq queued-disposition 'queue)))
         (kill-buffer shell-buffer)))))
 
 (ert-deftest agent-shell-prompt-queue-dwim-sends-immediately-when-idle-test ()
@@ -3891,7 +3924,7 @@ so the command must not append a second time."
                     ((symbol-function 'read-string)
                      (lambda (&rest _)
                        "final prompt"))
-                    ((symbol-function 'agent-shell-prompt-queue)
+                    ((symbol-function 'agent-shell--prompt-send)
                      (lambda (&rest _)
                        (setq queued-buffer (current-buffer)))))
             (agent-shell-prompt-queue-dwim '(4))
@@ -6014,6 +6047,9 @@ Returns the resulting buffer string, with the live prompt trailing."
   (let* ((buffer (generate-new-buffer " *agent-shell-restore-test*"))
          (fake-process (start-process "fake-agent" buffer "cat")))
     (set-process-query-on-exit-flag fake-process nil)
+    ;; The default sentinel reports the exit into the buffer, whose comint
+    ;; output is read-only, and a failing sentinel aborts the whole run.
+    (set-process-sentinel fake-process #'ignore)
     (unwind-protect
         (with-current-buffer buffer
           (comint-mode)
@@ -6312,6 +6348,91 @@ interaction (e.g. \"1/2\" after switching to the latest interaction)."
             (should (equal rendered-position '((:current . 2) (:total . 2))))))
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
+
+(defmacro agent-shell-tests--with-restored-turns (&rest body)
+  "Evaluate BODY in a shell holding two restored turns.
+
+Replays each prompt through `agent-shell--dispatch-notification', as a
+`session/load' does, and closes it with shell-maker's end-of-prompt
+marker and a response.  Binds `shell-buffer' to that shell."
+  (declare (indent 0))
+  `(let* ((shell-buffer (generate-new-buffer " *agent-shell restored turns test*"))
+          (process (start-process "agent-shell-restore-turns-test" shell-buffer "cat")))
+     (set-process-query-on-exit-flag process nil)
+     ;; The default sentinel reports the exit into the buffer, whose comint
+     ;; output is read-only, and a failing sentinel aborts the whole run.
+     (set-process-sentinel process #'ignore)
+     (unwind-protect
+         (with-current-buffer shell-buffer
+           (comint-mode)
+           ;; Claim the mode without running it, as `agent-shell-mode' would
+           ;; start an agent this test neither needs nor can drive.
+           (setq-local major-mode 'agent-shell-mode)
+           (setq-local comint-prompt-regexp "^Claude> ")
+           (setq-local shell-maker--config
+                       (make-shell-maker-config :name "Claude"
+                                                :prompt "Claude> "
+                                                :prompt-regexp "^Claude> "))
+           (let ((state (list (cons :agent-config '((:shell-prompt . "Claude> ")))
+                              (cons :buffer shell-buffer)
+                              (cons :active-requests (list (list (cons :method "session/load"))))
+                              (cons :chunked-group-count 0)
+                              (cons :request-count 1)
+                              (cons :last-entry-type nil)
+                              (cons :pending-restore nil))))
+             (setq-local agent-shell--state state)
+             (cl-letf (((symbol-function 'shell-maker--process) (lambda () process))
+                       ((symbol-function 'agent-shell--state) (lambda () state))
+                       ((symbol-function 'agent-shell--append-transcript) #'ignore)
+                       ((symbol-function 'agent-shell--separate-transcript-after-agent-message)
+                        #'ignore)
+                       ((symbol-function 'agent-shell--emit-event) #'ignore))
+               (dolist (turn '(("first prompt" . "first reply")
+                               ("second prompt" . "second reply")))
+                 (map-put! state :last-entry-type "agent_message_chunk")
+                 (agent-shell--dispatch-notification
+                  :state state
+                  :acp-notification (agent-shell-tests--make-session-update
+                                     "user_message_chunk" (car turn)))
+                 ;; Closed the way dispatch closes a replayed prompt once the
+                 ;; next notification arrives.
+                 (shell-maker-insert-end-of-prompt-marker)
+                 (let ((inhibit-read-only t))
+                   (goto-char (point-max))
+                   (insert "\n\n" (cdr turn) "\n\n")))
+               ,@body)))
+       (when (process-live-p process)
+         (delete-process process))
+       (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-restored-prompt-pairs-with-its-response-test ()
+  "Test a restored prompt reads as an interaction boundary everywhere.
+
+`shell-maker--extract-history' only counts a prompt whose text carries
+`comint-highlight-prompt', while `shell-maker-narrow-to-prompt' finds
+boundaries with `comint-prompt-regexp'.  A restored prompt that only the
+regexp matched split the buffer where extraction could not follow, so
+`agent-shell-interaction-at-point' returned nil inside a restored turn
+and the viewport, which rebuilds from it, showed nothing."
+  (agent-shell-tests--with-restored-turns
+    (let ((history (shell-maker--extract-history "^Claude> ")))
+      (should (equal (mapcar (lambda (item)
+                               (substring-no-properties (car item)))
+                             history)
+                     '("first prompt" "second prompt")))
+      (should (equal (mapcar (lambda (item)
+                               (substring-no-properties (cdr item)))
+                             history)
+                     '("first reply" "second reply"))))
+    ;; Point inside a restored turn resolves that turn, as a shell -> viewport
+    ;; switch needs it to.
+    (goto-char (point-min))
+    (search-forward "first reply")
+    (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+               (lambda (&rest _) shell-buffer)))
+      (let ((interaction (agent-shell-interaction-at-point)))
+        (should (equal (string-trim (map-elt interaction :prompt)) "first prompt"))
+        (should (equal (string-trim (map-elt interaction :response)) "first reply"))))))
 
 (ert-deftest agent-shell-interaction-at-point-includes-after-turn-tail-test ()
   "The latest interaction should expose out-of-turn tail content separately.
@@ -6744,7 +6865,7 @@ button, so \"e\" edits while point sits on the Remove button."
                      (lambda (&rest _) shell-buffer))
                     ((symbol-function 'agent-shell--prompt-queue-replace)
                      (lambda (&rest args) (setq replaced args)))
-                    ((symbol-function 'agent-shell-prompt-queue)
+                    ((symbol-function 'agent-shell--prompt-send)
                      (lambda (&rest _) (setq queued t)))
                     ((symbol-function 'agent-shell-viewport--busy-p)
                      (lambda (&rest _) t))

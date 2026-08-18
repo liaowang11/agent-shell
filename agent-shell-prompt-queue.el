@@ -41,12 +41,34 @@
 (declare-function agent-shell--state "agent-shell")
 (declare-function agent-shell--echo "agent-shell")
 (declare-function agent-shell--display-buffer "agent-shell")
+(declare-function agent-shell--inject-or-queue "agent-shell-inject")
+(declare-function agent-shell--inject-strict "agent-shell-inject")
+(declare-function agent-shell--inject-available-p "agent-shell-inject")
+(declare-function agent-shell-prompt-inject-queued "agent-shell-inject")
 (declare-function agent-shell-viewport--prefill-edit "agent-shell-viewport")
 (declare-function shell-maker-busy "shell-maker")
 
 (defvar agent-shell--state)
 (defvar agent-shell-prefer-viewport-interaction)
 (defvar comint-input-ring)
+
+(defcustom agent-shell-prompt-while-busy 'inject
+  "What sending a prompt does while the agent is working on a turn.
+
+`inject'  Prefer delivering the prompt to the turn already running, so
+          the agent reads it at its next stopping point and changes course
+          without losing the work already done.  Agents that cannot take
+          it, and shells waiting on a permission answer, queue instead.
+`queue'   Hold the prompt until the turn ends, then send it as a new
+          turn.
+
+Only `agent-shell-prompt-send' and the compose buffer's send key consult
+this.  Generic send queues when preferred injection is unavailable.
+`agent-shell-prompt-queue' queues only while work is in progress, and
+`agent-shell-prompt-inject' errors when a running turn cannot be steered."
+  :type '(choice (const :tag "Deliver to the running turn" inject)
+                 (const :tag "Queue until the turn ends" queue))
+  :group 'agent-shell)
 
 ;; The queueing commands were renamed to the `agent-shell-prompt-queue'
 ;; namespace.  A package upgrade reloads this file into a running session
@@ -59,31 +81,47 @@
                    agent-shell-remove-pending-request))
   (fmakunbound command))
 
+;; These injection commands were renamed into the `agent-shell-prompt'
+;; namespace for the same reason.
+;; TODO: Remove after 2026-09-22.
+(dolist (command '(agent-shell-inject-prompt
+                   agent-shell-prompt-queue-inject))
+  (fmakunbound command))
+
 (defun agent-shell--prompt-queue-migrate ()
-  "Migrate the obsolete `:pending-requests' state key to `:pending-prompts'.
+  "Bring prompt queue state in a live shell up to date.
 
-Preserves queued prompts in live shells created before the key was
-renamed (e.g. across a mid-session package upgrade).
+Preserve queued prompts in shells created before `:pending-requests' was
+renamed, and add `:prompt-queue-paused' to shells created before prompt
+injection could pause automatic delivery.
 
-TODO: Remove after 2026-08-28."
+TODO: Remove only the `:pending-requests' migration after 2026-08-28."
   (when (and (assq :pending-requests agent-shell--state)
              (not (assq :pending-prompts agent-shell--state)))
     (nconc agent-shell--state
            (list (cons :pending-prompts
-                       (map-elt agent-shell--state :pending-requests))))))
+                       (map-elt agent-shell--state :pending-requests)))))
+  (unless (assq :prompt-queue-paused agent-shell--state)
+    (nconc agent-shell--state (list (cons :prompt-queue-paused nil)))))
 
 (cl-defun agent-shell--prompt-queue-process-next ()
   "Process the next pending prompt from the queue if available."
   (unless (derived-mode-p 'agent-shell-mode)
     (error "Not in a shell"))
   (agent-shell--prompt-queue-migrate)
-  (when-let* ((pending (map-elt agent-shell--state :pending-prompts))
-              (next-prompt (car pending)))
-    (map-put! agent-shell--state :pending-prompts (cdr pending))
-    (agent-shell--insert-to-shell-buffer
-     :text next-prompt
-     :submit t
-     :no-focus t)))
+  (unless (map-elt agent-shell--state :prompt-queue-paused)
+    (when-let* ((pending (map-elt agent-shell--state :pending-prompts))
+                (next-prompt (car pending)))
+      (map-put! agent-shell--state :pending-prompts (cdr pending))
+      (agent-shell--insert-to-shell-buffer
+       :text next-prompt
+       :submit t
+       :no-focus t))))
+
+(defun agent-shell--prompt-queue-paused-p ()
+  "Return non-nil when automatic prompt delivery is paused in this shell."
+  (agent-shell--prompt-queue-migrate)
+  (map-elt agent-shell--state :prompt-queue-paused))
 
 (defun agent-shell--prompt-queue-actions ()
   "Return the queue action buttons, to be clicked or invoked with RET.
@@ -98,6 +136,10 @@ For example, in a terminal frame:
                      (:char . "e")
                      (:description . "edit a pending prompt")
                      (:command . agent-shell-prompt-queue-edit))
+                    ((:label . "Inject")
+                     (:char . "i")
+                     (:description . "inject a pending prompt into the running turn")
+                     (:command . agent-shell-prompt-inject-queued))
                     ((:label . "Resume")
                      (:char . "r")
                      (:description . "resume pending prompts")
@@ -249,14 +291,60 @@ agent commands when the agent has reported them."
       (read-string (or (map-nested-elt (agent-shell--state) '(:agent-config :shell-prompt))
                        "Enqueue prompt: ")))))
 
-(defun agent-shell-prompt-queue (prompt)
-  "Queue or immediately send a prompt depending on shell busy state.
+(cl-defun agent-shell--prompt-send (&key prompt disposition on-delivered)
+  "Send PROMPT to the shell in the current buffer.
+
+DISPOSITION decides what happens while a turn is running: `inject'
+delivers PROMPT to that turn, `queue' holds it until the turn ends, and
+nil follows `agent-shell-prompt-while-busy'.  An explicit DISPOSITION is
+how an entry point keeps its own promise regardless of the setting.
+Explicit `inject' errors when injection is unavailable and never falls
+back after an agent declines it; a nil DISPOSITION with an `inject'
+preference remains forgiving and queues.
+
+Injection is tried first when `agent-shell--inject-available-p' says the
+prompt can really reach a running turn.
+
+Otherwise PROMPT queues while a turn is running, and also while automatic
+delivery is paused: a paused queue means an untracked turn is still going
+even though the shell looks idle (see
+`agent-shell--prompt-queue-paused-p'), and submitting into that fires a
+prompt at a working agent.  Pausing does not block injection, though,
+since it exists to hold back automatic delivery into an untracked turn
+rather than to stop the user steering a tracked one.
+
+With nothing running and nothing paused, PROMPT is submitted.  Queueing
+then would leave it pending until `agent-shell-prompt-queue-resume'.
+
+ON-DELIVERED (lambda ()) is called once the prompt reached the agent, so
+a caller holding its own copy (an edited pending prompt) can drop it.
+Queueing does not call it: the queue now owns that copy."
+  (agent-shell--prompt-queue-migrate)
+  (let ((effective-disposition
+         (or disposition agent-shell-prompt-while-busy)))
+    (cond
+     ((eq disposition 'inject)
+      (agent-shell--inject-strict :prompt prompt :on-delivered on-delivered))
+     ((and (eq effective-disposition 'inject)
+           (agent-shell--inject-available-p))
+      (agent-shell--inject-or-queue :prompt prompt :on-delivered on-delivered))
+     ((or (shell-maker-busy) (agent-shell--prompt-queue-paused-p))
+      (agent-shell--prompt-queue-enqueue :prompt prompt))
+     (t
+      (agent-shell--insert-to-shell-buffer :text prompt :submit t :no-focus t)
+      (when on-delivered
+        (funcall on-delivered))))))
+
+(defun agent-shell-prompt-send (prompt)
+  "Send PROMPT, injecting or queueing it when a turn is already running.
 
 Read PROMPT from the minibuffer and act on the current project's shell,
 resolving it via `agent-shell--shell-buffer' so this works even when
-invoked outside a shell buffer.  If the shell is busy, add PROMPT to the
-pending prompts queue.  Otherwise, submit it immediately.  Queued prompts
-will be automatically sent when the current prompt completes.
+invoked outside a shell buffer.
+
+`agent-shell-prompt-while-busy' decides which it is.  Use
+`agent-shell-prompt-queue' or `agent-shell-prompt-inject' to pick one
+outright for a single prompt.
 
 While reading, @ completes project files and / completes available agent
 commands when the agent has reported them."
@@ -264,7 +352,27 @@ commands when the agent has reported them."
    (list (with-current-buffer (agent-shell--shell-buffer :no-create t)
            (agent-shell--prompt-queue-read))))
   (with-current-buffer (agent-shell--shell-buffer :no-create t)
-    (if (shell-maker-busy)
+    (agent-shell--prompt-send :prompt prompt)))
+
+(defun agent-shell-prompt-queue (prompt)
+  "Queue or immediately send a prompt depending on shell busy state.
+
+Read PROMPT from the minibuffer and act on the current project's shell,
+resolving it via `agent-shell--shell-buffer' so this works even when
+invoked outside a shell buffer.  If the shell is busy or automatic queue
+delivery is paused, add PROMPT to the pending prompts queue.  Otherwise,
+submit it immediately.  Queued prompts are automatically sent when the
+current prompt completes or the queue resumes.
+
+While reading, @ completes project files and / completes available agent
+commands when the agent has reported them."
+  (interactive
+   (list (with-current-buffer (agent-shell--shell-buffer :no-create t)
+           (agent-shell--prompt-queue-read))))
+  (with-current-buffer (agent-shell--shell-buffer :no-create t)
+    (agent-shell--prompt-queue-migrate)
+    (if (or (shell-maker-busy)
+            (agent-shell--prompt-queue-paused-p))
         (agent-shell--prompt-queue-enqueue :prompt prompt)
       (agent-shell--insert-to-shell-buffer :text prompt :submit t :no-focus t))))
 
@@ -279,6 +387,9 @@ shell buffer."
     (agent-shell--prompt-queue-migrate)
     (when (seq-empty-p (map-elt agent-shell--state :pending-prompts))
       (user-error "No pending prompts"))
+    (when (eq (map-elt agent-shell--state :prompt-queue-paused) 'steering)
+      (user-error "Prompt injection is still pending"))
+    (map-put! agent-shell--state :prompt-queue-paused nil)
     (if (shell-maker-busy)
         (message "Shell is busy, prompts will auto-resume when ready")
       (agent-shell--prompt-queue-process-next))))
@@ -323,6 +434,63 @@ in at INDEX."
                                  (seq-drop pending (1+ index)))))
         (map-put! agent-shell--state :pending-prompts new-pending)
         (message "Prompt updated (%d pending)" (length new-pending)))))))
+
+(cl-defun agent-shell--prompt-queue-remove-at (&key index expected)
+  "Remove the pending prompt at INDEX, leaving the rest of the queue in order.
+
+When INDEX is out of range (e.g. the queue drained meanwhile), nothing is
+changed.  When EXPECTED is non-nil, also leave the queue unchanged unless
+the prompt at INDEX still equals EXPECTED, so a queue that shifted under
+us doesn't lose the wrong prompt.
+
+For example, with pending prompts \"first\" and \"second\":
+
+  (agent-shell--prompt-queue-remove-at :index 0 :expected \"first\")
+
+leaves (\"second\")."
+  (agent-shell--prompt-queue-migrate)
+  (let ((pending (map-elt agent-shell--state :pending-prompts)))
+    (cond
+     ((or (null index) (< index 0) (>= index (length pending)))
+      (message "Prompt no longer pending"))
+     ((and expected (not (equal (nth index pending) expected)))
+      (message "Prompt queue changed; prompt left pending"))
+     (t
+      (map-put! agent-shell--state :pending-prompts
+                (append (seq-take pending index)
+                        (seq-drop pending (1+ index))))
+      (message "Prompt sent (%d pending)"
+               (length (map-elt agent-shell--state :pending-prompts)))))))
+
+(cl-defun agent-shell--prompt-queue-take-at (&key index expected)
+  "Remove and return the pending prompt at INDEX when it equals EXPECTED.
+
+Return nil and leave the queue unchanged when INDEX is invalid or its
+prompt no longer equals EXPECTED.  Unlike
+`agent-shell--prompt-queue-remove-at', do not announce delivery: callers
+use this to claim a prompt while asynchronous delivery is unresolved."
+  (agent-shell--prompt-queue-migrate)
+  (let* ((pending (map-elt agent-shell--state :pending-prompts))
+         (prompt (and index (>= index 0) (nth index pending))))
+    (when (and prompt (or (null expected) (equal prompt expected)))
+      (map-put! agent-shell--state :pending-prompts
+                (append (seq-take pending index)
+                        (seq-drop pending (1+ index))))
+      prompt)))
+
+(cl-defun agent-shell--prompt-queue-insert-at (&key index prompt)
+  "Insert PROMPT into the pending queue at INDEX and return PROMPT.
+
+Clamp INDEX to the current queue bounds.  This preserves the selected
+prompt's relative position when steering declines after other queue edits."
+  (agent-shell--prompt-queue-migrate)
+  (let* ((pending (map-elt agent-shell--state :pending-prompts))
+         (position (min (max (or index 0) 0) (length pending))))
+    (map-put! agent-shell--state :pending-prompts
+              (append (seq-take pending position)
+                      (list prompt)
+                      (seq-drop pending position)))
+    prompt))
 
 (defun agent-shell-prompt-queue-edit (index)
   "Edit the pending prompt at INDEX, replacing it in place.
