@@ -2496,12 +2496,14 @@ An agent asked about `<shell-maker-end-of-prompt>' writes those
 characters back without the `shell-maker--marker' property, and reading
 them as the delimiter would report the response starting mid-sentence."
   (with-temp-buffer
-    (insert "Claude> ask\nplain <shell-maker-end-of-prompt> text\n")
+    (insert (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt)
+            "ask\nplain <shell-maker-end-of-prompt> text\n")
     (cl-letf (((symbol-function 'shell-maker--prompt-begin-position)
                (lambda () (point-min))))
       (should-not (agent-shell--shell-response-start))))
   (with-temp-buffer
-    (insert "Claude> ask\n"
+    (insert (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt)
+            "ask\n"
             (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t)
             "\nthe reply\n")
     (cl-letf (((symbol-function 'shell-maker--prompt-begin-position)
@@ -6262,12 +6264,12 @@ Scaling an exact cent overshoots it, for example (* 0.07 100) is
                        (lambda (&rest _) shell-buffer))
                       ((symbol-function 'agent-shell-viewport--position)
                        (lambda (&rest _) '((:current . 2) (:total . 2))))
-                      ((symbol-function 'shell-maker--prompt-begin-position)
-                       (lambda () latest-prompt-begin))
-                      ((symbol-function 'shell-maker-next-command-and-response)
-                       (lambda (backwards &rest _)
-                         (should backwards)
-                         '("older prompt" . "older response")))
+                      ((symbol-function 'agent-shell--turn-at-index)
+                       (lambda (index)
+                         (should (equal index 1))
+                         (list (cons :prompt "older prompt")
+                               (cons :response "older response")
+                               (cons :position latest-prompt-begin))))
                       ((symbol-function 'agent-shell-viewport--initialize)
                        (lambda (&rest args)
                          (setq initialized args)
@@ -6350,6 +6352,134 @@ nothing to page forward to."
                        (lambda (&rest _) '((:current . 1) (:total . 3)))))
               (should-error (agent-shell-viewport-previous-page) :type 'user-error))))
       (kill-buffer viewport-buffer))))
+
+(defun agent-shell-viewport-tests--with-pages (current total body)
+  "Run BODY in a view-mode viewport starting at page CURRENT of TOTAL.
+BODY is called with no arguments.  History entries are named
+\"page one\", \"page two\", ...  Navigating updates the stubbed position
+the way real navigation does, so BODY can page more than once.  Returns
+an alist of :index (the page `agent-shell--turn-at-index' was asked for
+last), :initialized (the keyword plist passed to
+`agent-shell-viewport--initialize'), :cursor (the resulting
+`agent-shell-viewport--page-cursor') and :entered-compose (whether the
+compose page was opened)."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (requested-index nil)
+        (initialized nil)
+        (entered-compose nil)
+        (pages '(("page one" . "one")
+                 ("page two" . "two")
+                 ("page three" . "three")
+                 ("page four" . "four"))))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) `((:current . ,current) (:total . ,total))))
+                      ((symbol-function 'agent-shell--turn-at-index)
+                       (lambda (index)
+                         (setq requested-index index)
+                         ;; Landing on a page is what moves the position.
+                         (setq current index)
+                         (let ((page (nth (1- index) pages)))
+                           (list (cons :prompt (car page))
+                                 (cons :response (cdr page))
+                                 (cons :position 1)))))
+                      ((symbol-function 'agent-shell-viewport-edit-mode)
+                       (lambda () (setq entered-compose t)))
+                      ((symbol-function 'agent-shell-viewport--initialize)
+                       (lambda (&rest args)
+                         (setq initialized args)))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (funcall body)
+              `((:index . ,requested-index)
+                (:initialized . ,initialized)
+                (:cursor . ,agent-shell-viewport--page-cursor)
+                (:entered-compose . ,entered-compose)))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-next-page-jumps-n-pages-test ()
+  "Test `agent-shell-viewport-next-page' jumps N pages.
+
+On page 1 of 4, N=2 shows page 3.  A numeric prefix argument is the
+same N."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 1 4 (lambda () (agent-shell-viewport-next-page :n 2)))))
+    (should (equal (map-elt result :index) 3))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page three" :response "three")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 3)))
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 1 4 (lambda ()
+                        (let ((current-prefix-arg 2))
+                          (call-interactively #'agent-shell-viewport-next-page))))))
+    (should (equal (map-elt result :index) 3))
+    (should (equal (map-elt (map-elt result :cursor) :index) 3))))
+
+(ert-deftest agent-shell-viewport-previous-page-jumps-n-pages-test ()
+  "Test `agent-shell-viewport-previous-page' jumps N pages.
+
+On page 4 of 4, N=2 shows page 2.  A numeric prefix argument is the
+same N."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 4 4 (lambda () (agent-shell-viewport-previous-page 2)))))
+    (should (equal (map-elt result :index) 2))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page two" :response "two")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 2)))
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 4 4 (lambda ()
+                        (let ((current-prefix-arg 2))
+                          (call-interactively #'agent-shell-viewport-previous-page))))))
+    (should (equal (map-elt result :index) 2))))
+
+(ert-deftest agent-shell-viewport-next-page-n-past-last-enters-compose-test ()
+  "Test jumping forward past the last history page enters compose.
+
+On page 3 of 4, N=2 has no fifth history page, so it enters compose the
+same way a single step from page 4 does.  The jump passes through the
+newest page on its way, so that is the page compose remembers -- what
+pressing the key twice would have left behind."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 3 4 (lambda () (agent-shell-viewport-next-page :n 2)))))
+    (should (map-elt result :entered-compose))
+    (should (equal (map-elt (map-elt result :cursor) :index) 4))))
+
+(ert-deftest agent-shell-viewport-next-page-n-past-last-remembers-newest-page-test ()
+  "Test a long jump into compose still remembers the newest page.
+
+On page 2 of 4, N=3 overshoots by two pages.  Pressing the key three
+times would show pages 3 and 4 and then enter compose, leaving page 4
+recorded, so the jump must record page 4 too rather than the page it
+started from."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 2 4 (lambda () (agent-shell-viewport-next-page :n 3)))))
+    (should (map-elt result :entered-compose))
+    (should (equal (map-elt (map-elt result :cursor) :index) 4))))
+
+(ert-deftest agent-shell-viewport-previous-page-n-clamps-to-first-page-test ()
+  "Test jumping backward past the first page lands on page 1.
+
+On page 3 of 4, N=5 has no page before 1, so it shows page 1 rather
+than erroring.  Already being on page 1 still errors (see
+`agent-shell-viewport-previous-page-first-page-error-test')."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 3 4 (lambda () (agent-shell-viewport-previous-page 5)))))
+    (should (equal (map-elt result :index) 1))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page one" :response "one")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 1))))
 
 (defun agent-shell-viewport-tests--insert-interaction (prompt response)
   "Insert a real PROMPT/RESPONSE interaction at point, comint style.
@@ -6464,27 +6594,38 @@ needs a live process -- see `agent-shell-viewport-tests--make-shell-buffer'."
       (kill-buffer shell-buffer))))
 
 (ert-deftest agent-shell-goto-last-interaction-past-steered-prompt-test ()
-  "Test `agent-shell-goto-last-interaction' lands on the newest page.
+  "Test `agent-shell-goto-last-interaction' lands on the newest turn's prompt.
 
-A steered prompt is rendered by the client rather than submitted through
-comint, so `comint-last-input-start' still marks the interaction it
-steered.  Going by that marker opens page 2 of 3, and leaving the compose
-page then returns there instead of to the newest page."
+A steered prompt is an exchange of its own to the shell but part of the
+turn it joined to the viewport (see `agent-shell--turns'), so the newest
+page starts at the prompt the user submitted, not at the steer.  Landing
+on the steer instead would have `agent-shell-interaction-at-point' read
+that same turn, but leave the shell's point where paging reads it as the
+newest exchange rather than the newest turn."
   (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
                        '(("first" . "one")
                          ("second" . "two")
-                         ("[steer] third" . "three")))))
+                         ("[steer] third" . "three"))))
+        second-start)
     (unwind-protect
         (with-current-buffer shell-buffer
-          (setq comint-last-input-start
-                (copy-marker (agent-shell--prompt-begin-position-at-index 2)))
+          (goto-char (point-min))
+          (search-forward "Claude> second")
+          (setq second-start (match-beginning 0))
+          (search-forward "Claude> [steer] third")
+          (put-text-property (match-beginning 0) (+ (match-beginning 0) (length "Claude> "))
+                             'agent-shell-steered-prompt t)
+          (setq comint-last-input-start (copy-marker second-start))
+          (goto-char (point-max))
           (cl-letf (((symbol-function 'agent-shell--shell-buffer)
                      (lambda (&rest _) shell-buffer)))
             (agent-shell-goto-last-interaction))
-          (should (equal (point)
-                         (agent-shell--prompt-begin-position-at-index 3)))
+          (should (equal (point) second-start))
+          (should (equal (agent-shell--turn-position)
+                         '((:current . 2) (:total . 2))))
+          ;; The shell itself still counts the steer.
           (should (equal (shell-maker-history-position)
-                         '((:current . 3) (:total . 3)))))
+                         '((:current . 2) (:total . 3)))))
       (kill-buffer shell-buffer))))
 
 (ert-deftest agent-shell-viewport-previous-page-from-compose-requires-history-test ()
@@ -7750,13 +7891,97 @@ itself; otherwise the next section header glues onto the restored prompt:
         (should session-init-called)
         (should-not (map-elt agent-shell--state :pending-restore))))))
 
-(ert-deftest agent-shell-viewport-next-page-navigates-from-current-prompt-begin-test ()
-  "Test `agent-shell-viewport-next-page' navigates from the current prompt.
+(ert-deftest agent-shell-prompt-begin-position-terminates-on-empty-match-test ()
+  "The walk back to a real prompt always makes progress.
 
-When the shell point sits mid-interaction (e.g. after switching to the
-viewport without repositioning), navigation must start from the current
-interaction's prompt begin, otherwise a backward step lands on the
-current interaction instead of the previous one."
+`comint-prompt-regexp' can match the empty string -- comint's own default
+is \"^\" -- and `re-search-backward' then returns the position it started
+from.  Without requiring the search to move strictly backwards, a buffer
+with no prompt face walks that same position forever and hangs Emacs."
+  (with-temp-buffer
+    (insert "older prompt\n\nlatest prompt\n")
+    (goto-char (point-max))
+    (let ((latest-prompt-begin (save-excursion (goto-char (point-min))
+                                               (forward-line 2)
+                                               (point))))
+      (cl-letf (((symbol-function 'shell-maker--prompt-begin-position)
+                 (lambda () latest-prompt-begin)))
+        ;; No prompt carries a prompt face, so there is nothing to find and
+        ;; the answer is nil -- reached, rather than looped for.
+        (should-not (with-timeout (5 (ert-fail "walk did not terminate"))
+                      (agent-shell--prompt-begin-position)))))))
+
+(ert-deftest agent-shell-viewport-next-page-skips-prompt-text-in-a-response-test ()
+  "Paging skips prompt text quoted in a response.
+
+`comint-prompt-regexp' is the agent's prompt string unanchored, so a tool
+result echoing \"Claude> \" matches it.  Both directions must skip that text,
+render the adjacent real interaction, and move the shell point to its prompt."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (first-prompt nil)
+        (second-prompt nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (comint-mode)
+            (setq-local major-mode 'agent-shell-mode)
+            (setq-local shell-maker--config
+                        (make-shell-maker-config
+                         :name "agent"
+                         :prompt "Claude> "
+                         :prompt-regexp "Claude> "))
+            (setq-local comint-use-prompt-regexp t)
+            (setq-local comint-prompt-regexp "Claude> ")
+            (setq first-prompt (point))
+            (insert (propertize "Claude> "
+                                'font-lock-face 'comint-highlight-prompt)
+                    "first question"
+                    (propertize "<shell-maker-end-of-prompt>"
+                                'shell-maker--marker t)
+                    "\n"
+                    "first answer\n"
+                    "   :shell-prompt \"Claude> \"\n"
+                    "more response\n\n")
+            (setq second-prompt (point))
+            (insert (propertize "Claude> "
+                                'font-lock-face 'comint-highlight-prompt)
+                    "show me the config"
+                    (propertize "<shell-maker-end-of-prompt>"
+                                'shell-maker--marker t)
+                    "\n"
+                    "second answer\n")
+            (goto-char second-prompt))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport--initialize
+               :prompt "show me the config<shell-maker-end-of-prompt>\n"
+               :response "second answer\n")
+              (let ((previous (agent-shell-viewport-next-page :backwards t)))
+                (should (string-match-p "first question" (car previous)))
+                (should (string-match-p "first question" (buffer-string))))
+              (with-current-buffer shell-buffer
+                (should (equal (point) first-prompt))
+                (should-not (equal (point) second-prompt)))
+              (let ((next (agent-shell-viewport-next-page)))
+                (should (string-match-p "show me the config" (car next)))
+                (should (string-match-p "show me the config" (buffer-string))))
+              (with-current-buffer shell-buffer
+                (should (equal (point) second-prompt))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-next-page-navigates-by-history-index-test ()
+  "Test backward paging selects the preceding real prompt by history index."
   (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
         (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
         (navigated-from nil)
@@ -7764,10 +7989,11 @@ current interaction instead of the previous one."
     (unwind-protect
         (progn
           (with-current-buffer shell-buffer
-            (insert "line one\nprompt two line\nresponse line three\nmore content")
-            (goto-char (point-min))
-            (forward-line 1)
+            (insert "line one\n")
             (setq prompt-begin (point))
+            (insert (propertize "prompt two line"
+                                'font-lock-face 'comint-highlight-prompt)
+                    "\nresponse line three\nmore content")
             ;; Point sits mid/after the interaction, not at the prompt begin.
             (goto-char (point-max)))
           (with-current-buffer viewport-buffer
@@ -7781,14 +8007,13 @@ current interaction instead of the previous one."
                        (lambda (&rest _) shell-buffer))
                       ((symbol-function 'agent-shell-viewport--position)
                        (lambda (&rest _) '((:current . 2) (:total . 2))))
-                      ((symbol-function 'shell-maker--prompt-begin-position)
-                       (lambda () prompt-begin))
-                      ((symbol-function 'comint-previous-prompt)
-                       (lambda (&rest _) (forward-line -1)))
-                      ((symbol-function 'shell-maker-next-command-and-response)
-                       (lambda (_backwards &rest _)
-                         (setq navigated-from (point))
-                         '("prompt two" . "response")))
+                      ((symbol-function 'agent-shell--turn-at-index)
+                       (lambda (index)
+                         (should (equal index 1))
+                         (setq navigated-from prompt-begin)
+                         (list (cons :prompt "previous prompt")
+                               (cons :response "previous response")
+                               (cons :position prompt-begin))))
                       ((symbol-function 'agent-shell-viewport--initialize)
                        (lambda (&rest _) nil))
                       ((symbol-function 'agent-shell-viewport--update-header)
@@ -7797,187 +8022,6 @@ current interaction instead of the previous one."
               (should (equal navigated-from prompt-begin)))))
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
-
-(cl-defun agent-shell-viewport-tests--with-page-steps
-    (&key entries position snapshot body)
-  "Run BODY in a view-mode viewport that can step through ENTRIES.
-Each step hands out the next of ENTRIES, a list of (prompt . response),
-and returns nil once they run out, the way
-`shell-maker-next-command-and-response' does at the end of history.
-POSITION is the stubbed `agent-shell-viewport--position' alist, and
-SNAPSHOT the compose snapshot parked before BODY runs.  Returns an alist
-of :steps (how many steps were taken), :directions (the BACKWARDS
-argument each step saw), :initialized (the keyword plist passed to
-`agent-shell-viewport--initialize'), :entered-edit (whether the compose
-page was opened) and :snapshot-after (the snapshot left behind)."
-  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
-        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
-        (remaining entries)
-        (directions nil)
-        (steps 0)
-        (initialized nil)
-        (entered-edit nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer shell-buffer
-            (insert "page one\npage two\npage three\npage four\n")
-            ;; Mid-buffer, so the stubbed comint prompt motion below has
-            ;; somewhere to move in either direction.
-            (goto-char (point-min))
-            (forward-line 2))
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (agent-shell-viewport-view-mode)))
-          (with-current-buffer viewport-buffer
-            (setq-local agent-shell-viewport--compose-snapshot snapshot)
-            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
-                       (lambda (&rest _) nil))
-                      ((symbol-function 'agent-shell-viewport--shell-buffer)
-                       (lambda (&rest _) shell-buffer))
-                      ((symbol-function 'agent-shell-viewport--position)
-                       (lambda (&rest _)
-                         (or position '((:current . 2) (:total . 4)))))
-                      ((symbol-function 'shell-maker--prompt-begin-position)
-                       (lambda () (line-beginning-position)))
-                      ((symbol-function 'comint-next-prompt)
-                       (lambda (&rest _) (forward-line 1)))
-                      ((symbol-function 'comint-previous-prompt)
-                       (lambda (&rest _) (forward-line -1)))
-                      ((symbol-function 'shell-maker-next-command-and-response)
-                       (lambda (step-backwards &rest _)
-                         (push step-backwards directions)
-                         (when remaining
-                           (setq steps (1+ steps))
-                           (pop remaining))))
-                      ((symbol-function 'agent-shell-viewport-edit-mode)
-                       (lambda ()
-                         (setq entered-edit t)
-                         ;; Real edit mode makes the buffer writable, which
-                         ;; the snapshot restore below relies on.
-                         (setq-local buffer-read-only nil)))
-                      ((symbol-function 'agent-shell-viewport--initialize)
-                       (lambda (&rest args) (setq initialized args)))
-                      ((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (funcall body)
-              `((:steps . ,steps)
-                (:directions . ,(nreverse directions))
-                (:initialized . ,initialized)
-                (:entered-edit . ,entered-edit)
-                (:snapshot-after . ,agent-shell-viewport--compose-snapshot)))))
-      (kill-buffer viewport-buffer)
-      (kill-buffer shell-buffer))))
-
-(ert-deftest agent-shell-viewport-next-page-jumps-n-pages-test ()
-  "Test `agent-shell-viewport-next-page' moves N interactions.
-
-N=2 takes two forward steps and shows the interaction reached last, not
-the one after a single step."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :body (lambda () (agent-shell-viewport-next-page :n 2)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :directions) '(nil nil)))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page four" :response "four")))))
-
-(ert-deftest agent-shell-viewport-previous-page-jumps-n-pages-test ()
-  "Test `agent-shell-viewport-previous-page' moves N interactions back.
-
-N=2 takes two backward steps.  A numeric prefix argument supplies the
-same N."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page two" . "two") ("page one" . "one"))
-                 :body (lambda () (agent-shell-viewport-previous-page 2)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :directions) '(t t)))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page one" :response "one"))))
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page two" . "two") ("page one" . "one"))
-                 :body (lambda ()
-                         (let ((current-prefix-arg 2))
-                           (call-interactively
-                            #'agent-shell-viewport-previous-page))))))
-    (should (equal (map-elt result :steps) 2))))
-
-(ert-deftest agent-shell-viewport-next-page-without-n-moves-one-page-test ()
-  "Test paging with no prefix argument still moves a single interaction."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :body (lambda () (agent-shell-viewport-next-page)))))
-    (should (equal (map-elt result :steps) 1))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page three" :response "three")))))
-
-(ert-deftest agent-shell-viewport-next-page-n-past-last-enters-compose-test ()
-  "Test a prefix jump running past the newest interaction opens the draft.
-
-Pressing the key three times from page 2 of 4 would show pages 3 and 4
-and then restore the parked draft, so C-u 3 must land there too."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :snapshot '((:content . "draft") (:location . 1))
-                 :body (lambda () (agent-shell-viewport-next-page :n 3)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (map-elt result :entered-edit))
-    (should-not (map-elt result :snapshot-after))))
-
-(ert-deftest agent-shell-viewport-next-page-n-from-last-page-enters-compose-test ()
-  "Test a prefix jump from the newest interaction opens the draft.
-
-Already being on the last page, there is nothing to step through, so
-any N restores the parked draft the way a plain step does."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three"))
-                 :position '((:current . 4) (:total . 4))
-                 :snapshot '((:content . "draft") (:location . 1))
-                 :body (lambda () (agent-shell-viewport-next-page :n 3)))))
-    (should (equal (map-elt result :steps) 0))
-    (should (map-elt result :entered-edit))
-    (should-not (map-elt result :snapshot-after))))
-
-(ert-deftest agent-shell-viewport-next-page-negative-n-moves-backwards-test ()
-  "Test a negative N reverses `agent-shell-viewport-next-page'.
-
-Emacs motion commands read a negative prefix argument as the same
-motion the other way, so C-u -2 f steps back twice."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page one" . "one") ("page zero" . "zero"))
-                 :body (lambda () (agent-shell-viewport-next-page :n -2)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :directions) '(t t)))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page zero" :response "zero")))))
-
-(ert-deftest agent-shell-viewport-previous-page-negative-n-moves-forwards-test ()
-  "Test a negative N reverses `agent-shell-viewport-previous-page'.
-
-C-u -2 b steps forward twice, mirroring the forward command."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :body (lambda () (agent-shell-viewport-previous-page -2)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :directions) '(nil nil)))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page four" :response "four")))))
-
-(ert-deftest agent-shell-viewport-next-page-zero-n-does-nothing-test ()
-  "Test a zero N leaves the viewport where it is.
-
-Sitting on the newest interaction with a draft parked, C-u 0 f must not
-step, re-render, or consume the snapshot the way a plain step would."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three"))
-                 :position '((:current . 4) (:total . 4))
-                 :snapshot '((:content . "draft") (:location . 1))
-                 :body (lambda () (agent-shell-viewport-next-page :n 0)))))
-    (should (equal (map-elt result :steps) 0))
-    (should-not (map-elt result :initialized))
-    (should-not (map-elt result :entered-edit))
-    (should (equal (map-elt result :snapshot-after)
-                   '((:content . "draft") (:location . 1))))))
 
 (ert-deftest agent-shell-viewport-initialize-rerenders-header-position-test ()
   "Test `agent-shell-viewport--initialize' re-renders the header position.
@@ -7997,7 +8041,7 @@ interaction (e.g. \"1/2\" after switching to the latest interaction)."
           (setq agent-shell-viewport--position-cache '((:current . 1) (:total . 2)))
           (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
                      (lambda (&rest _) shell-buffer))
-                    ((symbol-function 'shell-maker-history-position)
+                    ((symbol-function 'agent-shell--turn-position)
                      (lambda () '((:current . 2) (:total . 2))))
                     ((symbol-function 'agent-shell-viewport--update-header)
                      (lambda ()
@@ -8028,6 +8072,61 @@ interaction (e.g. \"1/2\" after switching to the latest interaction)."
                         'agent-shell-viewport-prompt))
             (should (eq (get-text-property prompt-start 'font-lock-face)
                         'agent-shell-viewport-prompt))))))))
+(ert-deftest agent-shell-response-start-ignores-prompt-text-in-response-test ()
+  "Test a response quoting the agent's own prompt is not read as a prompt.
+
+`comint-prompt-regexp' is the agent's prompt string unanchored (for
+example \"Claude> \"), so a tool result echoing that string matches it.
+`shell-maker--prompt-begin-position' matched such text and reported a
+prompt in the middle of a response, leaving
+`agent-shell--shell-response-start' with no end-of-prompt marker ahead of
+it.  A nil response start tells `agent-shell-other-buffer' point is on
+the live prompt, so switching from a completed interaction opened the
+viewport's compose buffer instead of its view."
+  (with-temp-buffer
+    (comint-mode)
+    (setq-local major-mode 'agent-shell-mode)
+    (setq-local comint-prompt-regexp "Claude> ")
+    (let ((inhibit-read-only t)
+          (response-start nil))
+      (insert (propertize "Claude> " 'field 'output
+                          'font-lock-face 'comint-highlight-prompt)
+              "show me the config\n")
+      (insert (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t))
+      (setq response-start (point))
+      (insert "\n")
+      ;; A tool result quoting agent-shell's own source.
+      (insert "   :shell-prompt \"Claude> \"\n"
+              "   :shell-prompt-regexp \"Claude> \"\n"
+              "\n"
+              "Live in your session.\n")
+      (goto-char (point-min))
+      (search-forward "Live in your session")
+      (should (equal (agent-shell--shell-response-start) response-start)))))
+
+(ert-deftest agent-shell-response-start-above-first-prompt-test ()
+  "Test point in the welcome message still reaches the first response.
+
+Nothing precedes the welcome message, so there is no prompt to search
+back to.  Switching to the viewport from there shows the first
+interaction rather than opening compose."
+  (with-temp-buffer
+    (comint-mode)
+    (setq-local major-mode 'agent-shell-mode)
+    (setq-local comint-prompt-regexp "Claude> ")
+    (let ((inhibit-read-only t)
+          (response-start nil))
+      (insert "Welcome to Claude.\n\n")
+      (goto-char (point-min))
+      (save-excursion
+        (goto-char (point-max))
+        (insert (propertize "Claude> " 'field 'output
+                            'font-lock-face 'comint-highlight-prompt)
+                "hello\n"
+                (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t))
+        (setq response-start (point))
+        (insert "\nhi there\n"))
+  (should (equal (agent-shell--shell-response-start) response-start)))))
 
 (ert-deftest agent-shell-interaction-at-point-includes-after-turn-tail-test ()
   "The latest interaction should expose out-of-turn tail content separately.
@@ -10868,13 +10967,17 @@ Without it point is at the buffer end, where a prompt submitted through
 comint leaves it.
 
 PAGE, when non-nil, is called with the viewport current once the steer's
-answer has streamed in, standing for the user paging from the steer's
-page; whatever it returns comes back under `:paged'.
+answer has streamed in, standing for the user paging from the page the
+steer landed on; whatever it returns comes back under `:paged'.
+
+The answer to the steer is text followed by a tool call, so the page
+carries a fragment across the seam and not only streamed text.
 
 Returns an alist of the page the viewport showed `:live', the page it
 shows once the shell is re-read (`:refreshed', what a buffer switch
 does), the `:position' the live page reported for its header, and
-`:paged'.  Each page is a cons of its prompt and its trimmed response."
+`:paged'.  Each page is the viewport's whole text, untrimmed, so seam
+whitespace counts."
   (let* (;; The shell keeps a prompt at the buffer end for the whole turn
          ;; and the steer renders above it.  Bound on rather than
          ;; inherited, so this holds whichever way the default points.
@@ -10940,15 +11043,16 @@ does), the `:position' the live page reported for its header, and
               ;; The agent answering the steer, still inside the same turn.
               (agent-shell--update-text
                :state state :block-id "answer2" :text "a.el b.el" :create-new t)
+              (agent-shell--update-fragment
+               :state state :block-id "tool-1" :label-left "Command"
+               :label-right "ls" :body "a.el\nb.el" :create-new t)
               (push (cons :position
                           (with-current-buffer viewport-buffer
                             agent-shell-viewport--position-cache))
                     result)
               (push (cons :live
                           (with-current-buffer viewport-buffer
-                            (cons (agent-shell-viewport--prompt)
-                                  (string-trim
-                                   (or (agent-shell-viewport--response) "")))))
+                            (buffer-substring-no-properties (point-min) (point-max))))
                     result)
               (when page
                 (push (cons :paged (with-current-buffer viewport-buffer
@@ -10962,9 +11066,7 @@ does), the `:position' the live page reported for its header, and
               (push (cons :refreshed
                           (with-current-buffer viewport-buffer
                             (agent-shell-viewport-refresh)
-                            (cons (agent-shell-viewport--prompt)
-                                  (string-trim
-                                   (or (agent-shell-viewport--response) "")))))
+                            (buffer-substring-no-properties (point-min) (point-max))))
                     result)
               result)))
       (when (process-live-p fake-process)
@@ -10972,62 +11074,137 @@ does), the `:position' the live page reported for its header, and
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
 
-(ert-deftest agent-shell-experimental--steered-prompt-opens-a-viewport-page-test ()
-  "A steer must leave the viewport on the page a re-read would show.
+(ert-deftest agent-shell-experimental--steered-prompt-stays-on-its-turn-test ()
+  "A steer stays on the page of the turn it joined, live and on re-read.
 
-The steer is a prompt of its own in the shell (see
-`agent-shell-experimental--steered-prompt-is-extractable-test'), so
-anything re-reading the shell -- `agent-shell-viewport-refresh' after a
-buffer switch, paging -- shows the turn's remaining output on a page of
-its own, under the steer.  A viewport streaming live has to land on that
-same page: otherwise the steer reads as more of the previous page until
-the user switches away and back, and what they were reading changes
-under them when they do.
+The shell renders the steer as a prompt of its own (see
+`agent-shell-experimental--steered-prompt-is-extractable-test'), but the
+viewport pages by turn (see `agent-shell--turns'): the steer's line and
+what the agent answers to it read on under the prompt that started the
+turn, where the live mirror already put them.  A re-read -- a buffer
+switch, paging -- has to rebuild the same page character for character,
+or what the user was reading changes under them when they switch away
+and back.
 
-The page has to be numbered as the shell's newest too, wherever the
-shell's own point sits, or the header is a page behind and, worse, the
-page reads as not the latest and the rest of the turn is never mirrored
-into it."
+Whole buffer text rather than trimmed pieces, so the seam between the
+interrupted answer and the steer's line, and the tool call mirrored after
+it, are held to the same shape both ways."
   (dolist (park-point '(nil t))
     (let* ((steered (agent-shell-tests--steer-with-viewport :park-point park-point))
            (live (map-elt steered :live)))
       (should (equal live (map-elt steered :refreshed)))
-      ;; Anchored, so both pages cannot agree on the wrong one.
-      (should (equal (car live) "[steer] just the filenames"))
-      (should (equal (cdr live) "a.el b.el"))
+      (should (string-prefix-p "list the files" live))
+      (should (string-match-p "Listing \n\nClaude> \\[steer\\] just the filenames\n\na\\.el b\\.el" live))
+      (should (string-match-p "Command" live))
       (should (equal (map-elt steered :position)
-                     '((:current . 2) (:total . 2)))))))
+                     '((:current . 1) (:total . 1)))))))
 
 (ert-deftest agent-shell-experimental--steered-prompt-page-is-pageable-test ()
-  "Paging from the steer's page works wherever the shell's point sat.
+  "Paging from a steered turn's page sees one page, wherever the shell's point sat.
 
 The paging commands take the current page from the shell's point
-\(`agent-shell-viewport--position' with `:force-refresh'), not from what
-the viewport shows.  A steer opens its page for a viewport following the
-turn, so it has to leave the shell's point on that page as a prompt
-submitted through comint would; leaving it on the interaction being
-steered has the viewport show page 2 of 2 while paging believes it is on
-page 1: back is refused as the first page, and forward re-renders the
-steer's page instead of entering compose."
+\(`agent-shell-viewport--position' with `:force-refresh'), which a steer
+leaves on the interaction it interrupted.  Since that interaction and the
+steer are one turn, the page is the first and the newest both ways: back
+is refused as the first page, and forward enters compose rather than
+re-rendering."
   (dolist (park-point '(nil t))
     (let ((paged (map-elt
                   (agent-shell-tests--steer-with-viewport
                    :park-point park-point
                    :page (lambda ()
-                           (let ((page (lambda ()
-                                         (cons (agent-shell-viewport--prompt)
-                                               (string-trim
-                                                (or (agent-shell-viewport--response) ""))))))
-                             (agent-shell-viewport-previous-page)
-                             (let ((back (funcall page)))
-                               (agent-shell-viewport-next-page)
-                               (let ((forward (funcall page)))
-                                 (agent-shell-viewport-next-page)
-                                 (list back forward major-mode))))))
+                           (list (condition-case err
+                                     (progn (agent-shell-viewport-previous-page) nil)
+                                   (user-error (cadr err)))
+                                 (progn (agent-shell-viewport-next-page)
+                                        major-mode))))
                   :paged)))
-      (should (equal (nth 0 paged) '("list the files" . "Listing")))
-      (should (equal (nth 1 paged) '("[steer] just the filenames" . "a.el b.el")))
-      (should (eq (nth 2 paged) 'agent-shell-viewport-edit-mode)))))
+      (should (equal (nth 0 paged) "First page"))
+      (should (eq (nth 1 paged) 'agent-shell-viewport-edit-mode)))))
+
+(cl-defun agent-shell-tests--insert-exchange (prompt response &key steered)
+  "Insert an exchange the way the shell renders one, at point.
+
+PROMPT and RESPONSE are its text.  STEERED marks the prompt as one
+steered into a running turn, the way
+`agent-shell-experimental--render-steered-prompt' does."
+  (insert (apply #'propertize "Claude> "
+                 'font-lock-face '(agent-shell-prompt comint-highlight-prompt)
+                 'field 'output
+                 (when steered '(agent-shell-steered-prompt t)))
+          prompt
+          (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t)
+          response))
+
+(defmacro agent-shell-tests--with-turns-shell (&rest body)
+  "Run BODY in a bare shell buffer whose prompts `agent-shell--turns' can read."
+  (declare (indent 0) (debug t))
+  `(with-temp-buffer
+     (setq-local comint-prompt-regexp "Claude> ")
+     (setq-local shell-maker--config
+                 (make-shell-maker-config :name "agent" :prompt "Claude> "
+                                          :prompt-regexp "Claude> "))
+     (setq major-mode 'agent-shell-mode)
+     ,@body))
+
+(ert-deftest agent-shell--turns-groups-steers-into-their-turn-test ()
+  "A steered prompt and its answer fold into the turn it joined.
+
+The shell counts the steer as an exchange of its own; a turn keeps the
+submitted prompt, appends the steer's line and answer to the response,
+and records which exchanges it spans so positions can be mapped both
+ways."
+  (agent-shell-tests--with-turns-shell
+    (agent-shell-tests--insert-exchange "list the files" "\n\nListing \n\n")
+    (agent-shell-tests--insert-exchange "[steer] just the filenames" "\n\na.el b.el\n\n"
+                                        :steered t)
+    (agent-shell-tests--insert-exchange "[steer] sorted" "\n\na.el\nb.el\n\n"
+                                        :steered t)
+    (agent-shell-tests--insert-exchange "thanks" "\n\nSure.")
+    (let ((turns (agent-shell--turns)))
+      (should (= 2 (length turns)))
+      (let ((first (nth 0 turns)))
+        (should (equal (substring-no-properties (map-elt first :prompt)) "list the files"))
+        (should (equal (substring-no-properties (map-elt first :response))
+                       (concat "\n\nListing \n\n"
+                               "Claude> [steer] just the filenames\n\na.el b.el\n\n"
+                               "Claude> [steer] sorted\n\na.el\nb.el\n\n")))
+        (should (equal (map-elt first :exchanges) '(1 . 3)))
+        (should (= (map-elt first :position) (point-min))))
+      (let ((second (nth 1 turns)))
+        (should (equal (substring-no-properties (map-elt second :prompt)) "thanks"))
+        (should (equal (substring-no-properties (map-elt second :response)) "\n\nSure."))
+        (should (equal (map-elt second :exchanges) '(4 . 4)))))))
+
+(ert-deftest agent-shell--turns-without-steers-are-the-exchanges-test ()
+  "With nothing steered, turns and exchanges are the same list."
+  (agent-shell-tests--with-turns-shell
+    (agent-shell-tests--insert-exchange "one" "\n\n1\n\n")
+    (agent-shell-tests--insert-exchange "two" "\n\n2")
+    (should (equal (mapcar (lambda (turn)
+                             (cons (substring-no-properties (map-elt turn :prompt))
+                                   (substring-no-properties (map-elt turn :response))))
+                           (agent-shell--turns))
+                   '(("one" . "\n\n1\n\n") ("two" . "\n\n2"))))
+    (should (equal (mapcar (lambda (turn) (map-elt turn :exchanges))
+                           (agent-shell--turns))
+                   '((1 . 1) (2 . 2))))))
+
+(ert-deftest agent-shell--turn-position-counts-turns-test ()
+  "`agent-shell--turn-position' reports the turn point is in, out of all turns.
+
+Point anywhere in a steer's exchange counts as the turn it joined."
+  (agent-shell-tests--with-turns-shell
+    (agent-shell-tests--insert-exchange "list the files" "\n\nListing \n\n")
+    (agent-shell-tests--insert-exchange "[steer] just the filenames" "\n\na.el b.el\n\n"
+                                        :steered t)
+    (agent-shell-tests--insert-exchange "thanks" "\n\nSure.")
+    (goto-char (point-min))
+    (should (equal (agent-shell--turn-position) '((:current . 1) (:total . 2))))
+    (search-forward "a.el b.el")
+    (should (equal (agent-shell--turn-position) '((:current . 1) (:total . 2))))
+    (search-forward "Sure.")
+    (should (equal (agent-shell--turn-position) '((:current . 2) (:total . 2))))))
 
 (ert-deftest agent-shell-experimental--steered-prompt-emits-input-submitted-test ()
   "A steered prompt announces itself as input the user submitted.

@@ -9318,21 +9318,162 @@ Returns a buffer object or nil."
   "Move point to the last interaction in the shell buffer."
   (when-let* ((shell-buffer (agent-shell--shell-buffer)))
     (with-current-buffer shell-buffer
-      ;; Not `comint-last-input-start' alone: a steered prompt is rendered
-      ;; rather than submitted through comint, so that marker still sits on
-      ;; the interaction the steer interrupted.
-      (goto-char (or (when-let* ((position (shell-maker-history-position)))
-                       (agent-shell--prompt-begin-position-at-index
-                        (map-elt position :total)))
+      ;; The last turn's submitted prompt (see `agent-shell--turns'), not
+      ;; the last prompt: a steer's prompt starts an exchange but not a
+      ;; turn.  `comint-last-input-start' is the fallback for a shell with
+      ;; no readable history.
+      (goto-char (or (map-elt (car (last (agent-shell--turns))) :position)
                      comint-last-input-start)))))
 
-(defun agent-shell--shell-response-start ()
-  "Return where the response of the interaction at point begins.
-Return nil when point is not on an interaction with a response.  The
-position sits right after the `<shell-maker-end-of-prompt>' delimiter, so
-it aligns with the start of the response text copied into the viewport."
+(defun agent-shell--prompt-begin-position ()
+  "Return where the prompt of the interaction at point begins, or nil.
+
+Like `shell-maker--prompt-begin-position', but skips prompt-looking text
+inside a response.  `comint-prompt-regexp' is the agent's prompt string
+unanchored (for example \"Claude> \"), so a tool result echoing that
+string matches it and reports a prompt in the middle of a response.  Only
+prompts the shell rendered carry `comint-highlight-prompt', which is what
+`shell-maker--re-search-forward-prompt' keys off too."
   (save-excursion
-    (when-let* ((begin (ignore-errors (shell-maker--prompt-begin-position)))
+    (let ((begin (ignore-errors (shell-maker--prompt-begin-position))))
+      (while (and begin
+                  (not (agent-shell-chat--prompt-face-p
+                        (get-text-property begin 'font-lock-face))))
+        (goto-char begin)
+        ;; Strictly backwards, or not at all.  `comint-prompt-regexp' can
+        ;; match the empty string -- comint's own default is "^" -- and
+        ;; `re-search-backward' then answers with the position it started
+        ;; from, so without this the walk repeats that position forever.
+        (setq begin (when (and (re-search-backward comint-prompt-regexp nil t)
+                               (< (point) begin))
+                      (point))))
+      begin)))
+
+(defun agent-shell--steered-prompt-p (position)
+  "Return non-nil when the prompt beginning at POSITION was steered into a turn.
+`agent-shell-experimental--render-steered-prompt' marks the prompts it renders."
+  (get-text-property position 'agent-shell-steered-prompt))
+
+(defun agent-shell--turns ()
+  "Return the shell's history as turns, oldest first.
+
+A turn is a prompt the user submitted plus every prompt steered into the
+turn it started, up to the next submitted prompt.  The shell renders a
+steer as a prompt of its own, so `shell-maker--extract-history' and
+`shell-maker-history-position' count it as an exchange; the viewport shows
+the turn as one page, with each steer's line and answer reading on under
+the prompt that started it -- the shape the live mirror already gives it.
+
+Walks the buffer the way `shell-maker-history-position' does, counting an
+exchange wherever a prompt's chunk carries an end-of-prompt marker, so a
+turn's `:exchanges' index into that count.  Prompts and responses are raw:
+the viewport's own trimming keeps display padding.
+
+Each turn is an alist:
+
+  ((:prompt . PROMPT)              ; the submitted prompt, or nil if empty
+   (:response . RESPONSE)          ; its response, then each steer's prompt
+                                   ; line and response, or nil if empty
+   (:position . POSITION)          ; where the submitted prompt begins
+   (:exchanges . (FIRST . LAST)))  ; one-based exchange indices it spans"
+  (let ((prompt-regexp (if shell-maker--config
+                           (shell-maker-prompt-regexp shell-maker--config)
+                         comint-prompt-regexp))
+        (index 0)
+        turns)
+    (save-excursion
+      (goto-char (point-min))
+      ;; `comint-prompt-regexp' can match the empty string -- comint's own
+      ;; default is "^" -- and a search that matches without moving would
+      ;; loop here forever, so such a regexp reads as no prompts at all.
+      (while (and (not (string-match-p prompt-regexp ""))
+                  (shell-maker--re-search-forward-prompt prompt-regexp)
+                  (> (point) (match-beginning 0)))
+        (let* ((prompt-start (match-beginning 0))
+               (command-start (point))
+               (next-prompt (save-excursion
+                              (if (shell-maker--re-search-forward-prompt prompt-regexp)
+                                  (match-beginning 0)
+                                (point-max))))
+               (end-marker (shell-maker--find-marker
+                            "<shell-maker-end-of-prompt>" next-prompt)))
+          (when end-marker
+            (setq index (1+ index))
+            (let ((command (buffer-substring command-start (car end-marker)))
+                  (response (buffer-substring (cdr end-marker) next-prompt)))
+              (if (and turns (agent-shell--steered-prompt-p prompt-start))
+                  (let ((turn (car turns)))
+                    (setf (alist-get :response turn)
+                          (concat (or (alist-get :response turn) "")
+                                  ;; The prompt string as rendered, so the
+                                  ;; page reads as the live mirror did.
+                                  (buffer-substring prompt-start command-start)
+                                  command
+                                  response))
+                    (setcdr (alist-get :exchanges turn) index))
+                (push (list (cons :prompt (unless (string-empty-p command) command))
+                            (cons :response (unless (string-empty-p response) response))
+                            (cons :position prompt-start)
+                            (cons :exchanges (cons index index)))
+                      turns))))
+          ;; Always forward: NEXT-PROMPT is at or past point.
+          (goto-char (max next-prompt (point))))))
+    (nreverse turns)))
+
+(defun agent-shell--turn-at-index (index)
+  "Return the turn at one-based INDEX (see `agent-shell--turns'), or nil."
+  (when (> index 0)
+    (nth (1- index) (agent-shell--turns))))
+
+(defun agent-shell--turn-position ()
+  "Return the shell's position in history as turns.
+
+Like `shell-maker-history-position', an alist with `:current' and
+`:total', but counting turns (see `agent-shell--turns'): point anywhere in
+a steer's exchange is in the turn the steer joined.  Nil with no history."
+  (when-let* ((position (shell-maker-history-position))
+              (turns (agent-shell--turns)))
+    (let* ((exchange (map-elt position :current))
+           (current (or (cl-position-if
+                         (lambda (turn)
+                           (let ((span (map-elt turn :exchanges)))
+                             (<= (car span) exchange (cdr span))))
+                         turns)
+                        (1- (length turns)))))
+      (list (cons :current (1+ current))
+            (cons :total (length turns))))))
+
+(defun agent-shell--turn-begin-position ()
+  "Return where the turn at point begins, or nil.
+
+The prompt the user submitted, not a steer's: with point in a steer's
+exchange, `agent-shell--prompt-begin-position' answers with the steer's
+prompt, so walk back to the prompt that started the turn."
+  (save-excursion
+    (let ((begin (agent-shell--prompt-begin-position)))
+      (while (and begin
+                  (> begin (point-min))
+                  (agent-shell--steered-prompt-p begin))
+        (goto-char (1- begin))
+        ;; Strictly backwards, or not at all, so a search that answers
+        ;; with the same prompt cannot loop.
+        (setq begin (let ((earlier (agent-shell--prompt-begin-position)))
+                      (and earlier (< earlier begin) earlier))))
+      begin)))
+
+(defun agent-shell--shell-response-start ()
+  "Return where the response of the turn at point begins.
+Return nil when point is not on a turn with a response.  The position
+sits right after the first `<shell-maker-end-of-prompt>' delimiter of the
+turn, so it aligns with the start of the response text copied into the
+viewport.  Past a steer, the shell holds the steer's own delimiter text
+and the viewport does not, so offsets from here into the viewport are
+exact up to the first steer and a little long after it."
+  (save-excursion
+    ;; No real prompt at or before point means point sits above the first
+    ;; interaction, in the welcome message, where searching forward from
+    ;; point still reaches the first response.
+    (when-let* ((begin (or (agent-shell--turn-begin-position) (point)))
                 ;; Located by property rather than by text: an agent quoting
                 ;; the delimiter back writes the same characters without it,
                 ;; and the response would then appear to start mid-sentence.
@@ -9401,18 +9542,38 @@ In the form:
               (interaction (with-current-buffer shell-buffer
                              (let* ((on-live-prompt (and comint-last-input-start
                                                          (>= (point) comint-last-input-start)))
-                                    (result (or (shell-maker--command-and-response-at-point :trimmed nil)
-                                                ;; Nothing is under point on the live prompt, and
-                                                ;; `shell-maker-next-command-and-response' going
-                                                ;; backwards from there skips the last response
-                                                ;; when it equals the last output, landing one
-                                                ;; interaction early.
-                                                (if on-live-prompt
-                                                    (car (last (shell-maker--extract-history
-                                                                (shell-maker-prompt-regexp shell-maker--config)
-                                                                :trimmed nil)))
-                                                  (shell-maker-next-command-and-response t :trimmed nil))))
-                                    (latest-p (and result on-live-prompt))
+                                    ;; The turn point is in: the last one
+                                    ;; starting at or before point, or the
+                                    ;; first when point sits above it in the
+                                    ;; welcome message.  A steer's exchange
+                                    ;; is part of the turn it joined.
+                                    (turns (agent-shell--turns))
+                                    (turn (and turns
+                                               (or (cl-find-if (lambda (turn)
+                                                                 (<= (map-elt turn :position) (point)))
+                                                               (reverse turns))
+                                                   (car turns))))
+                                    (result (cond
+                                             (turn
+                                              (cons (map-elt turn :prompt) (map-elt turn :response)))
+                                             ;; No prompt this shell can read (a bare
+                                             ;; buffer), so the exchange is the turn.
+                                             ((shell-maker--command-and-response-at-point :trimmed nil))
+                                             ;; Nothing is under point on the live prompt, and
+                                             ;; `shell-maker-next-command-and-response' going
+                                             ;; backwards from there skips the last response
+                                             ;; when it equals the last output, landing one
+                                             ;; interaction early.
+                                             (on-live-prompt
+                                              (car (last (shell-maker--extract-history
+                                                          (shell-maker-prompt-regexp shell-maker--config)
+                                                          :trimmed nil))))
+                                             (t
+                                              (shell-maker-next-command-and-response t :trimmed nil))))
+                                    (latest-p (and result
+                                                   (if turn
+                                                       (eq turn (car (last turns)))
+                                                     on-live-prompt)))
                                     (after-turn (and latest-p
                                                      (agent-shell--after-turn-tail-before-live-prompt))))
                                (when result

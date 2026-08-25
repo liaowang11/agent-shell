@@ -450,7 +450,12 @@ send it as input."
                                        ;; interaction's response along with
                                        ;; its own marker text.
                                        'font-lock-face '(agent-shell-prompt comint-highlight-prompt)
-                                       'field 'output)
+                                       'field 'output
+                                       ;; What tells this prompt from a
+                                       ;; submitted one when the viewport
+                                       ;; pages by turn (see
+                                       ;; `agent-shell--turns').
+                                       'agent-shell-steered-prompt t)
                            (propertize (agent-shell-experimental--steered-prompt-text prompt)
                                        'font-lock-face 'agent-shell-input))
              :create-new t)
@@ -469,41 +474,13 @@ send it as input."
     (agent-shell--emit-event
      :event 'input-submitted
      :data (list (cons :prompt (substring-no-properties prompt)))))
-  ;; The shell now reads the steer as a prompt of its own, so anything
-  ;; re-reading it -- `agent-shell-viewport-refresh' after a buffer switch,
-  ;; paging -- shows the rest of the turn on a page under the steer.  A
-  ;; viewport following the turn has to move to that page as the steer
-  ;; lands, or the same turn reads as one page until the user switches away
-  ;; and back, and as two afterwards.  This is what a prompt submitted
-  ;; normally does (see `agent-shell--send-prompt'), and the guard is the
-  ;; one `agent-shell--update-text' mirrors on, so a viewport parked on an
-  ;; older page is left where the user put it.
-  (when-let* ((viewport-buffer (agent-shell-viewport--buffer
-                                :shell-buffer (map-elt state :buffer)
-                                :existing-only t))
-              ((with-current-buffer viewport-buffer
-                 (and (derived-mode-p 'agent-shell-viewport-view-mode)
-                      (agent-shell-viewport--showing-latest-p)))))
-    (with-current-buffer (map-elt state :buffer)
-      ;; The viewport takes its page number from the shell's point: the
-      ;; header, the guard that keeps `agent-shell--update-fragment'
-      ;; mirroring into the latest page, and the paging commands all read
-      ;; it there.  For someone working in the viewport that point sits on
-      ;; the interaction they last left the shell on -- the one being
-      ;; steered, a page behind the one opening here -- and rendering above
-      ;; the prompt did not move it.  Leave it at the buffer end, where a
-      ;; prompt submitted through comint leaves it, so every reader agrees
-      ;; the steer's page is the newest; moving it only for the
-      ;; initialization below would have paging still believe it is a
-      ;; page behind, refusing to go back and re-rendering this page
-      ;; instead of entering compose.
-      (goto-char (point-max))
-      (with-current-buffer viewport-buffer
-        ;; Erases the mirror of the prompt line this render just made,
-        ;; which is the point: it belongs to the new page, not under the
-        ;; old one.
-        (agent-shell-viewport--initialize
-         :prompt (agent-shell-experimental--steered-prompt-text prompt)))))
+  ;; No viewport work here: the render above went through
+  ;; `agent-shell--update-text', which mirrored the steer's line into a
+  ;; viewport following the turn, and the viewport pages by turn (see
+  ;; `agent-shell--turns'), so the steer and the rest of the turn read on
+  ;; under the prompt that started it -- live, and again when a buffer
+  ;; switch or paging re-reads the shell.
+  ;;
   ;; Deliberately not "user_message_chunk": that value asks the replay path
   ;; to insert the end-of-prompt marker on the next notification, and one
   ;; has already gone in above.  Through `--note-entry-type', not a bare
