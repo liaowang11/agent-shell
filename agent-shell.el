@@ -9682,6 +9682,30 @@ Returns a buffer object or nil."
       (goto-char (or (map-elt (car (last (agent-shell--turns))) :position)
                      comint-last-input-start)))))
 
+(defun agent-shell--prompt-begin-position ()
+  "Return where the prompt of the interaction at point begins, or nil.
+
+Like `shell-maker--prompt-begin-position', but skips prompt-looking text
+inside a response.  `comint-prompt-regexp' is the agent's prompt string
+unanchored (for example \"Claude> \"), so a tool result echoing that
+string matches it and reports a prompt in the middle of a response.  Only
+prompts the shell rendered carry `comint-highlight-prompt', which is what
+`shell-maker--re-search-forward-prompt' keys off too."
+  (save-excursion
+    (let ((begin (ignore-errors (shell-maker--prompt-begin-position))))
+      (while (and begin
+                  (not (agent-shell-chat--prompt-face-p
+                        (get-text-property begin 'font-lock-face))))
+        (goto-char begin)
+        ;; Strictly backwards, or not at all.  `comint-prompt-regexp' can
+        ;; match the empty string -- comint's own default is "^" -- and
+        ;; `re-search-backward' then answers with the position it started
+        ;; from, so without this the walk repeats that position forever.
+        (setq begin (when (and (re-search-backward comint-prompt-regexp nil t)
+                               (< (point) begin))
+                      (point))))
+      begin)))
+
 (defun agent-shell--steered-prompt-p (position)
   "Return non-nil when the prompt beginning at POSITION was steered into a turn.
 `agent-shell-experimental--render-steered-prompt' marks the prompts it renders."
@@ -9780,17 +9804,17 @@ a steer's exchange is in the turn the steer joined.  Nil with no history."
   "Return where the turn at point begins, or nil.
 
 The prompt the user submitted, not a steer's: with point in a steer's
-exchange, `shell-maker--prompt-begin-position' answers with the steer's
+exchange, `agent-shell--prompt-begin-position' answers with the steer's
 prompt, so walk back to the prompt that started the turn."
   (save-excursion
-    (let ((begin (ignore-errors (shell-maker--prompt-begin-position))))
+    (let ((begin (agent-shell--prompt-begin-position)))
       (while (and begin
                   (> begin (point-min))
                   (agent-shell--steered-prompt-p begin))
         (goto-char (1- begin))
         ;; Strictly backwards, or not at all, so a search that answers
         ;; with the same prompt cannot loop.
-        (setq begin (let ((earlier (ignore-errors (shell-maker--prompt-begin-position))))
+        (setq begin (let ((earlier (agent-shell--prompt-begin-position)))
                       (and earlier (< earlier begin) earlier))))
       begin)))
 
@@ -9803,7 +9827,10 @@ viewport.  Past a steer, the shell holds the steer's own delimiter text
 and the viewport does not, so offsets from here into the viewport are
 exact up to the first steer and a little long after it."
   (save-excursion
-    (when-let* ((begin (agent-shell--turn-begin-position))
+    ;; No real prompt at or before point means point sits above the first
+    ;; interaction, in the welcome message, where searching forward from
+    ;; point still reaches the first response.
+    (when-let* ((begin (or (agent-shell--turn-begin-position) (point)))
                 ;; Located by property rather than by text: an agent quoting
                 ;; the delimiter back writes the same characters without it,
                 ;; and the response would then appear to start mid-sentence.

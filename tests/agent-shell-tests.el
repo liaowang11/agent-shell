@@ -8409,6 +8409,95 @@ itself; otherwise the next section header glues onto the restored prompt:
         (should session-init-called)
         (should-not (map-elt agent-shell--state :pending-restore))))))
 
+(ert-deftest agent-shell-prompt-begin-position-terminates-on-empty-match-test ()
+  "The walk back to a real prompt always makes progress.
+
+`comint-prompt-regexp' can match the empty string -- comint's own default
+is \"^\" -- and `re-search-backward' then returns the position it started
+from.  Without requiring the search to move strictly backwards, a buffer
+with no prompt face walks that same position forever and hangs Emacs."
+  (with-temp-buffer
+    (insert "older prompt\n\nlatest prompt\n")
+    (goto-char (point-max))
+    (let ((latest-prompt-begin (save-excursion (goto-char (point-min))
+                                               (forward-line 2)
+                                               (point))))
+      (cl-letf (((symbol-function 'shell-maker--prompt-begin-position)
+                 (lambda () latest-prompt-begin)))
+        ;; No prompt carries a prompt face, so there is nothing to find and
+        ;; the answer is nil -- reached, rather than looped for.
+        (should-not (with-timeout (5 (ert-fail "walk did not terminate"))
+                      (agent-shell--prompt-begin-position)))))))
+
+(ert-deftest agent-shell-viewport-next-page-skips-prompt-text-in-a-response-test ()
+  "Paging skips prompt text quoted in a response.
+
+`comint-prompt-regexp' is the agent's prompt string unanchored, so a tool
+result echoing \"Claude> \" matches it.  Both directions must skip that text,
+render the adjacent real interaction, and move the shell point to its prompt."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (first-prompt nil)
+        (second-prompt nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (comint-mode)
+            (setq-local major-mode 'agent-shell-mode)
+            (setq-local shell-maker--config
+                        (make-shell-maker-config
+                         :name "agent"
+                         :prompt "Claude> "
+                         :prompt-regexp "Claude> "))
+            (setq-local comint-use-prompt-regexp t)
+            (setq-local comint-prompt-regexp "Claude> ")
+            (setq first-prompt (point))
+            (insert (propertize "Claude> "
+                                'font-lock-face 'comint-highlight-prompt)
+                    "first question"
+                    (propertize "<shell-maker-end-of-prompt>"
+                                'shell-maker--marker t)
+                    "\n"
+                    "first answer\n"
+                    "   :shell-prompt \"Claude> \"\n"
+                    "more response\n\n")
+            (setq second-prompt (point))
+            (insert (propertize "Claude> "
+                                'font-lock-face 'comint-highlight-prompt)
+                    "show me the config"
+                    (propertize "<shell-maker-end-of-prompt>"
+                                'shell-maker--marker t)
+                    "\n"
+                    "second answer\n")
+            (goto-char second-prompt))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport--initialize
+               :prompt "show me the config<shell-maker-end-of-prompt>\n"
+               :response "second answer\n")
+              (let ((previous (agent-shell-viewport-next-page :backwards t)))
+                (should (string-match-p "first question" (car previous)))
+                (should (string-match-p "first question" (buffer-string))))
+              (with-current-buffer shell-buffer
+                (should (equal (point) first-prompt))
+                (should-not (equal (point) second-prompt)))
+              (let ((next (agent-shell-viewport-next-page)))
+                (should (string-match-p "show me the config" (car next)))
+                (should (string-match-p "show me the config" (buffer-string))))
+              (with-current-buffer shell-buffer
+                (should (equal (point) second-prompt))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell-viewport-next-page-navigates-by-history-index-test ()
   "Test backward paging selects the preceding real prompt by history index."
   (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
@@ -8501,6 +8590,62 @@ interaction (e.g. \"1/2\" after switching to the latest interaction)."
                         'agent-shell-viewport-prompt))
             (should (eq (get-text-property prompt-start 'font-lock-face)
                         'agent-shell-viewport-prompt))))))))
+(ert-deftest agent-shell-response-start-ignores-prompt-text-in-response-test ()
+  "Test a response quoting the agent's own prompt is not read as a prompt.
+
+`comint-prompt-regexp' is the agent's prompt string unanchored (for
+example \"Claude> \"), so a tool result echoing that string matches it.
+`shell-maker--prompt-begin-position' matched such text and reported a
+prompt in the middle of a response, leaving
+`agent-shell--shell-response-start' with no end-of-prompt marker ahead of
+it.  A nil response start tells `agent-shell-other-buffer' point is on
+the live prompt, so switching from a completed interaction opened the
+viewport's compose buffer instead of its view."
+  (with-temp-buffer
+    (comint-mode)
+    (setq-local major-mode 'agent-shell-mode)
+    (setq-local comint-prompt-regexp "Claude> ")
+    (let ((inhibit-read-only t)
+          (response-start nil))
+      (insert (propertize "Claude> " 'field 'output
+                          'font-lock-face 'comint-highlight-prompt)
+              "show me the config\n")
+      (insert (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t))
+      (setq response-start (point))
+      (insert "\n")
+      ;; A tool result quoting agent-shell's own source.
+      (insert "   :shell-prompt \"Claude> \"\n"
+              "   :shell-prompt-regexp \"Claude> \"\n"
+              "\n"
+              "Live in your session.\n")
+      (goto-char (point-min))
+      (search-forward "Live in your session")
+      (should (equal (agent-shell--shell-response-start) response-start)))))
+
+(ert-deftest agent-shell-response-start-above-first-prompt-test ()
+  "Test point in the welcome message still reaches the first response.
+
+Nothing precedes the welcome message, so there is no prompt to search
+back to.  Switching to the viewport from there shows the first
+interaction rather than opening compose."
+  (with-temp-buffer
+    (comint-mode)
+    (setq-local major-mode 'agent-shell-mode)
+    (setq-local comint-prompt-regexp "Claude> ")
+    (let ((inhibit-read-only t)
+          (response-start nil))
+      (insert "Welcome to Claude.\n\n")
+      (goto-char (point-min))
+      (save-excursion
+        (goto-char (point-max))
+        (insert (propertize "Claude> " 'field 'output
+                            'font-lock-face 'comint-highlight-prompt)
+                "hello\n"
+                (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t))
+        (setq response-start (point))
+        (insert "\nhi there\n"))
+  (should (equal (agent-shell--shell-response-start) response-start)))))
+
 (ert-deftest agent-shell-interaction-at-point-includes-after-turn-tail-test ()
   "The latest interaction should expose out-of-turn tail content separately.
 
