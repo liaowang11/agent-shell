@@ -8943,13 +8943,53 @@ Returns a buffer object or nil."
     (with-current-buffer shell-buffer
       (goto-char comint-last-input-start))))
 
+(defun agent-shell--prompt-begin-position ()
+  "Return where the prompt of the interaction at point begins, or nil.
+
+Like `shell-maker--prompt-begin-position', but skips prompt-looking text
+inside a response.  `comint-prompt-regexp' is the agent's prompt string
+unanchored (for example \"Claude> \"), so a tool result echoing that
+string matches it and reports a prompt in the middle of a response.  Only
+prompts the shell rendered carry `comint-highlight-prompt', which is what
+`shell-maker--re-search-forward-prompt' keys off too."
+  (save-excursion
+    (let ((begin (ignore-errors (shell-maker--prompt-begin-position))))
+      (while (and begin
+                  (not (agent-shell-chat--prompt-face-p
+                        (get-text-property begin 'font-lock-face))))
+        (goto-char begin)
+        ;; Strictly backwards, or not at all.  `comint-prompt-regexp' can
+        ;; match the empty string -- comint's own default is "^" -- and
+        ;; `re-search-backward' then answers with the position it started
+        ;; from, so without this the walk repeats that position forever.
+        (setq begin (when (and (re-search-backward comint-prompt-regexp nil t)
+                               (< (point) begin))
+                      (point))))
+      begin)))
+
+(defun agent-shell--prompt-begin-position-at-index (index)
+  "Return the real prompt position at one-based history INDEX, or nil."
+  (when (> index 0)
+    (save-excursion
+      (goto-char (point-min))
+      (let (position)
+        (dotimes (_ index)
+          (setq position
+                (when (shell-maker--re-search-forward-prompt
+                       comint-prompt-regexp)
+                  (match-beginning 0))))
+        position))))
+
 (defun agent-shell--shell-response-start ()
   "Return where the response of the interaction at point begins.
 Return nil when point is not on an interaction with a response.  The
 position sits right after the `<shell-maker-end-of-prompt>' delimiter, so
 it aligns with the start of the response text copied into the viewport."
   (save-excursion
-    (when-let* ((begin (ignore-errors (shell-maker--prompt-begin-position)))
+    ;; No real prompt at or before point means point sits above the first
+    ;; interaction, in the welcome message, where searching forward from
+    ;; point still reaches the first response.
+    (when-let* ((begin (or (agent-shell--prompt-begin-position) (point)))
                 ;; Located by property rather than by text: an agent quoting
                 ;; the delimiter back writes the same characters without it,
                 ;; and the response would then appear to start mid-sentence.
