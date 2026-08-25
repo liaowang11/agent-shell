@@ -49,6 +49,7 @@
 (declare-function agent-shell--get-region "agent-shell")
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
 (declare-function agent-shell--echo "agent-shell")
+(declare-function agent-shell--prompt-begin-position-at-index "agent-shell")
 (declare-function agent-shell--prompt-queue-replace "agent-shell-prompt-queue")
 (declare-function agent-shell--prompt-queue-paused-p "agent-shell-prompt-queue")
 (declare-function agent-shell--prompt-queue-steer-at "agent-shell-prompt-queue")
@@ -256,6 +257,18 @@ Returns an alist with insertion details or nil otherwise:
         (:start . ,insert-start)
         (:end . ,insert-end)))))
 
+(defun agent-shell-viewport--reset-compose-state ()
+  "Forget what this compose buffer was in the middle of.
+
+The peeked location, the history ring position and the saved draft belong
+to the prompt being composed, so sending one clears all three together.
+Called with the compose buffer current, from every send path -- a path
+that reset only some of them would carry a stale peek or ring index into
+the next draft."
+  (setq agent-shell-viewport--compose-snapshot nil)
+  (setq agent-shell-viewport--ring-index nil)
+  (setq agent-shell-viewport--page-cursor nil))
+
 (defun agent-shell-viewport-compose-send (&optional keep-composing)
   "Send the viewport composed prompt to the agent shell.
 
@@ -275,9 +288,7 @@ queued right away, regardless of `agent-shell-viewport-dismiss-on-send'."
   ;; must keep the draft rather than clear it.
   (if (eq agent-shell-viewport--compose-disposition 'steer)
       (agent-shell-viewport-compose-steer keep-composing)
-    (setq agent-shell-viewport--compose-snapshot nil)
-    (setq agent-shell-viewport--ring-index nil)
-    (setq agent-shell-viewport--page-cursor nil)
+    (agent-shell-viewport--reset-compose-state)
     (cond
      (keep-composing
       (agent-shell-viewport--compose-deliver))
@@ -433,9 +444,7 @@ than queueing a second copy of it."
       (user-error "Nothing to send"))
     (setq agent-shell-viewport--edit-pending-index nil
           agent-shell-viewport--edit-pending-prompt nil)
-    (setq agent-shell-viewport--compose-snapshot nil)
-    (setq agent-shell-viewport--ring-index nil)
-    (setq agent-shell-viewport--page-cursor nil)
+    (agent-shell-viewport--reset-compose-state)
     (with-current-buffer shell-buffer
       (if edit-index
           (agent-shell--prompt-queue-replace
@@ -485,9 +494,7 @@ entry; a decline restores the edited draft as that single queued entry."
         (edit-prompt agent-shell-viewport--edit-pending-prompt))
     (when (string-empty-p prompt)
       (user-error "Nothing to send"))
-    (setq agent-shell-viewport--compose-snapshot nil)
-    (setq agent-shell-viewport--ring-index nil)
-    (setq agent-shell-viewport--page-cursor nil)
+    (agent-shell-viewport--reset-compose-state)
     (setq agent-shell-viewport--steer-pending t
           buffer-read-only t)
     (condition-case err
@@ -1293,14 +1300,29 @@ Called from the compose page itself, there is no next page to show."
       (user-error "First page"))
      (t
       (when-let* ((next (with-current-buffer shell-buffer
-                          ;; Navigate relative to the interaction containing
-                          ;; point, not wherever point happens to sit within
-                          ;; it.  Without this, switching to the viewport
-                          ;; with point mid-interaction makes the first
-                          ;; backward step land on the current interaction's
-                          ;; prompt instead of the previous interaction.
-                          (goto-char (shell-maker--prompt-begin-position))
-                          (shell-maker-next-command-and-response backwards :trimmed nil))))
+                          ;; Index-based, rather than a relative
+                          ;; comint-previous-prompt/next-prompt step, so a
+                          ;; tool result that echoes the prompt string
+                          ;; inside a response is never mistaken for a real
+                          ;; prompt (comint-prompt-regexp is unanchored).
+                          ;; `target' is already known in-range by the
+                          ;; surrounding cond, so no boundary error remains
+                          ;; to raise here.
+                          (let* ((target (+ (map-elt pos :current)
+                                            (if backwards -1 1)))
+                                 (entry (seq-elt
+                                         (shell-maker--extract-history
+                                          (shell-maker-prompt-regexp
+                                           shell-maker--config)
+                                          :trimmed nil)
+                                         (1- target)))
+                                 (prompt-position
+                                  (agent-shell--prompt-begin-position-at-index
+                                   target)))
+                            (unless prompt-position
+                              (error "Page %d not found" target))
+                            (goto-char prompt-position)
+                            entry))))
         (agent-shell-viewport--initialize
          :prompt (car next) :response (cdr next))
         (goto-char (if start-at-top
@@ -1636,17 +1658,7 @@ alone fires a prompt at a working agent."
                      (agent-shell-viewport--make-transient-group
                       agent-shell-viewport-view-mode-map
                       `(((:function . agent-shell-viewport-reply)
-                         (:description . ,(if (agent-shell-viewport--busy-p)
-                                              ;; Names where the reply will
-                                              ;; land: the compose buffer
-                                              ;; this opens sends with the
-                                              ;; same disposition.
-                                              (format
-                                               "%s reply…"
-                                               (capitalize
-                                                (agent-shell-viewport--compose-disposition-label
-                                                 agent-shell-viewport--compose-disposition)))
-                                            "Reply…")))
+                         (:description . ,(agent-shell-viewport--reply-description)))
                         ((:function . agent-shell-viewport-quote-reply)
                          (:description . "Quote reply…"))
                         ((:function . agent-shell-viewport-reply-yes)
@@ -1840,6 +1852,19 @@ be a guess this header states as fact."
       "queue")
      (t "send"))))
 
+(defun agent-shell-viewport--reply-description ()
+  "Return the menu wording for replying from this viewport.
+
+While a turn runs, names where the reply will land -- the compose buffer
+this opens sends with the same disposition, so promising \"Reply\" when it
+will queue reads as a different action than the one that happens.  Shared
+by the graphical and text headers, which render the same entry."
+  (if (agent-shell-viewport--busy-p)
+      (format "%s reply…"
+              (capitalize (agent-shell-viewport--compose-disposition-label
+                           agent-shell-viewport--compose-disposition)))
+    "Reply…"))
+
 (defun agent-shell-viewport--update-header ()
   "Update header and mode line based on `agent-shell-header-style'.
 
@@ -1899,17 +1924,7 @@ on current major mode."
                        `((:key . ,(key-description (where-is-internal
                                                     'agent-shell-viewport-reply
                                                     agent-shell-viewport-view-mode-map t)))
-                         (:description . ,(if (agent-shell-viewport--busy-p)
-                                              ;; Names where the reply will
-                                              ;; land: the compose buffer
-                                              ;; this opens sends with the
-                                              ;; same disposition.
-                                              (format
-                                               "%s reply…"
-                                               (capitalize
-                                                (agent-shell-viewport--compose-disposition-label
-                                                 agent-shell-viewport--compose-disposition)))
-                                            "Reply…"))))
+                         (:description . ,(agent-shell-viewport--reply-description))))
                       (when (agent-shell-viewport--busy-p)
                         (list
                          `((:key . ,(key-description (where-is-internal
