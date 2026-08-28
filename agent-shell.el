@@ -1233,7 +1233,8 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
                            (cons :context-used 0)
                            (cons :context-size 0)
                            (cons :cost-amount 0.0)
-                           (cons :cost-currency nil)))))
+                           (cons :cost-currency nil)
+                           (cons :model-usage nil)))))
 
 (defvar-local agent-shell--state
     (agent-shell--make-state))
@@ -8798,7 +8799,9 @@ reads the buffer's prompt capabilities."
                    (agent-shell--collapse-expanded-activity-group (agent-shell--state))
                    ;; Extract usage information from response
                    (when (map-elt acp-response 'usage)
-                     (agent-shell--save-usage :state (agent-shell--state) :acp-usage (map-elt acp-response 'usage)))
+                     (agent-shell--save-usage :state (agent-shell--state)
+                                               :acp-usage (map-elt acp-response 'usage)
+                                               :acp-meta (map-elt acp-response '_meta)))
                    (let ((success (equal (map-elt acp-response 'stopReason)
                                          "end_turn")))
                      ;; Display usage box at end of turn if enabled and data available

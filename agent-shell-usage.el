@@ -61,9 +61,10 @@ Only appears when the ACP server provides usage information."
                  (const :tag "Detailed" detailed))
   :group 'agent-shell)
 
-(cl-defun agent-shell--save-usage (&key state acp-usage)
-  "Update usage STATE from PromptResponse ACP-USAGE field.
-Extracts cumulative token counts from the response."
+(cl-defun agent-shell--save-usage (&key state acp-usage acp-meta)
+  "Update usage STATE from PromptResponse ACP-USAGE and ACP-META fields.
+Extracts cumulative token counts from the response, plus the
+per-model breakdown at ACP-META's `quota.model_usage', when present."
   (let ((usage-state (map-elt state :usage)))
     (when-let* ((total (map-elt acp-usage 'totalTokens)))
       (map-put! usage-state :total-tokens total))
@@ -77,7 +78,17 @@ Extracts cumulative token counts from the response."
       (map-put! usage-state :cached-read-tokens cached-read))
     (when-let* ((cached-write (map-elt acp-usage 'cachedWriteTokens)))
       (map-put! usage-state :cached-write-tokens cached-write))
+    (when-let* ((model-usage (map-nested-elt acp-meta '(quota model_usage))))
+      (map-put! usage-state :model-usage
+                (mapcar #'agent-shell--parse-model-usage-entry model-usage)))
     (map-put! state :usage usage-state)))
+
+(defun agent-shell--parse-model-usage-entry (entry)
+  "Convert one `_meta.quota.model_usage' ENTRY into an internal plist.
+ENTRY is `((model . NAME) (token_count . ((totalTokens . N) ...)))'."
+  (let ((token-count (map-elt entry 'token_count)))
+    (list :model (map-elt entry 'model)
+          :total-tokens (or (map-elt token-count 'totalTokens) 0))))
 
 (cl-defun agent-shell--update-usage-from-notification (&key state acp-update)
   "Update usage STATE from session/update ACP-UPDATE.
@@ -168,7 +179,20 @@ When MULTILINE is non-nil, format as right-aligned labeled rows."
             "$")
           (if (and (map-elt usage :cost-amount) (> (map-elt usage :cost-amount) 0))
               (format "%.2f" (map-elt usage :cost-amount))
-            "0.00"))))
+            "0.00")))
+        ;; Only worth a line when more than one model contributed to the
+        ;; session -- with a single model it would just repeat `tokens'.
+        (models
+         (when-let* ((rows (map-elt usage :model-usage))
+                     ((> (length rows) 1)))
+           (string-join
+            (mapcar (lambda (row)
+                      (format "%s %s"
+                              (map-elt row :model)
+                              (agent-shell--format-number-compact
+                               (map-elt row :total-tokens))))
+                    rows)
+            " · "))))
     (if multiline
         (concat
          (propertize " Context: "
@@ -179,6 +203,12 @@ When MULTILINE is non-nil, format as right-aligned labeled rows."
                      'face 'agent-shell-secondary
                      'font-lock-face 'agent-shell-secondary)
          tokens total "\n"
+         (when models
+           (concat
+            (propertize "  Models: "
+                        'face 'agent-shell-secondary
+                        'font-lock-face 'agent-shell-secondary)
+            models "\n"))
          (propertize "    Cost: "
                      'face 'agent-shell-secondary
                      'font-lock-face 'agent-shell-secondary)
