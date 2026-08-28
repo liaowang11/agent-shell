@@ -1901,21 +1901,17 @@ compose buffer keeps its draft in place and stays in edit mode."
 (ert-deftest agent-shell-viewport-compose-send-and-dismiss-test ()
   "Composed prompts are sent, cleared, and dismissed or kept.
 
-`agent-shell-viewport--compose-queue' hands the draft onward and clears
-the compose buffer; `agent-shell-viewport-compose-send-and-dismiss'
-additionally dismisses the window.  An empty draft signals an error.
-
-Both seams are stubbed, since where the draft goes depends on whether a
-turn is running: mid-turn through `agent-shell--busy-submit', otherwise
-straight to the shell."
+`agent-shell-viewport--compose-deliver' hands the draft to
+`agent-shell--prompt-send' and clears the compose buffer;
+`agent-shell-viewport-compose-send-and-dismiss' additionally dismisses
+the window.  An empty draft signals an error."
   (let ((agent-shell-header-style 'graphical)
         queued dismissed)
     (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
                (lambda (&rest _) (current-buffer)))
-              ((symbol-function 'agent-shell--busy-submit)
-               (lambda (&rest args) (setq queued (plist-get args :prompt))))
-              ((symbol-function 'agent-shell--insert-to-shell-buffer)
-               (lambda (&rest args) (setq queued (plist-get args :text))))
+              ((symbol-function 'agent-shell--prompt-send)
+               (cl-function
+                (lambda (&key prompt &allow-other-keys) (setq queued prompt))))
               ((symbol-function 'agent-shell-viewport--dismiss)
                (lambda (&rest _) (setq dismissed t)))
               ((symbol-function 'agent-shell-viewport--position)
@@ -1935,7 +1931,7 @@ straight to the shell."
       (with-temp-buffer
         (agent-shell-viewport-edit-mode)
         (insert "another prompt")
-        (agent-shell-viewport--compose-queue)
+        (agent-shell-viewport--compose-deliver)
         (should (equal queued "another prompt"))
         (should (string-empty-p (string-trim (buffer-string))))
         (should-not dismissed))
@@ -1945,6 +1941,62 @@ straight to the shell."
         (agent-shell-viewport-edit-mode)
         (should-error (agent-shell-viewport-compose-send-and-dismiss))
         (should-not queued)))))
+
+(ert-deftest agent-shell-viewport-compose-send-override-takes-the-other-route-test ()
+  "The compose override really reaches the override function.
+
+\[agent-shell-viewport-compose-send-override] works by rebinding
+`agent-shell-busy-submit-default-function' around an ordinary send, so it
+only does anything if the send path actually reads that variable.  A
+dispatch that decided between queueing and steering some other way would
+leave this command a no-op that looks bound and does nothing.
+
+A draft carrying its own disposition is not overridden: the command that
+opened it named what it does, and that outranks both the setting and this."
+  (let ((agent-shell-header-style 'graphical)
+        ;; Skips the "Starting agent, please wait" guard, which is not what
+        ;; this covers.
+        (agent-shell-session-strategy 'new-deferred)
+        (agent-shell-busy-submit-default-function #'agent-shell-busy-submit-queue)
+        (agent-shell-busy-submit-override-function #'agent-shell-busy-submit-steer)
+        taken)
+    (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'agent-shell--prompt-queue-migrate) #'ignore)
+              ((symbol-function 'agent-shell--prompt-submittable-p)
+               (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--prompt-steerable-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell--prompt-steer-or-queue)
+               (lambda (&rest _) (setq taken 'steered)))
+              ((symbol-function 'agent-shell--prompt-queue-enqueue)
+               (lambda (&rest _) (setq taken 'queued)))
+              ((symbol-function 'agent-shell-viewport--dismiss) #'ignore)
+              ((symbol-function 'agent-shell-viewport--position)
+               (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell-viewport--update-header)
+               (lambda (&rest _) nil)))
+      ;; The plain send follows the setting.
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (insert "my prompt")
+        (agent-shell-viewport-compose-send t)
+        (should (eq taken 'queued)))
+      ;; The override takes the other one.
+      (setq taken nil)
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (insert "my prompt")
+        (agent-shell-viewport-compose-send-override t)
+        (should (eq taken 'steered)))
+      ;; A draft that named its own delivery keeps it.
+      (setq taken nil)
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (setq agent-shell-viewport--compose-disposition 'queue)
+        (insert "my prompt")
+        (agent-shell-viewport-compose-send-override t)
+        (should (eq taken 'queued))))))
 
 (ert-deftest agent-shell--format-diff-as-text-test ()
   "Test `agent-shell--format-diff-as-text' function."
@@ -4209,6 +4261,7 @@ so the command must not append a second time."
           (agent-shell-prefer-viewport-interaction nil)
           read-args
           queued-prompt
+          queued-disposition
           queued-buffer)
       (unwind-protect
           (cl-letf (((symbol-function 'agent-shell--shell-buffer)
@@ -4227,13 +4280,17 @@ so the command must not append a second time."
                      (lambda (prompt &optional initial-input _history _default-value _inherit-input-method)
                        (setq read-args (list prompt initial-input))
                        (concat initial-input "\nextra prompt")))
-                    ((symbol-function 'agent-shell-prompt-queue)
-                     (lambda (prompt)
-                       (setq queued-prompt prompt
-                             queued-buffer (current-buffer)))))
+                    ((symbol-function 'agent-shell--prompt-send)
+                     (cl-function
+                      (lambda (&key prompt disposition &allow-other-keys)
+                        (setq queued-prompt prompt
+                              queued-disposition disposition
+                              queued-buffer (current-buffer))))))
             (agent-shell-prompt-queue-dwim)
             (should (equal read-args '("Enqueue prompt: " "context from source\n\n")))
             (should (equal queued-prompt "context from source\n\n\nextra prompt"))
+            ;; Named its behavior, so it queues whatever the setting says.
+            (should (eq queued-disposition 'queue))
             (should (eq queued-buffer shell-buffer)))
         (kill-buffer shell-buffer)))))
 
@@ -4336,7 +4393,7 @@ so the command must not append a second time."
                     ((symbol-function 'read-string)
                      (lambda (&rest _)
                        "final prompt"))
-                    ((symbol-function 'agent-shell-prompt-queue)
+                    ((symbol-function 'agent-shell--prompt-send)
                      (lambda (&rest _)
                        (setq queued-buffer (current-buffer)))))
             (agent-shell-prompt-queue-dwim '(4))
@@ -8964,6 +9021,30 @@ user's own typing rather than a delete and re-insert."
             :busy t)
            '(:handed-on "send me" :cleared t))))
 
+(ert-deftest agent-shell-submit-does-not-fire-into-a-paused-queue-test ()
+  "Submitting while the queue is paused hands the text on rather than sending it.
+
+A steer answered with `startedNewTurn' leaves a turn running that no
+`session/prompt' owns, so `shell-maker-busy' reports nothing while the
+agent works.  Gating on that alone would call `shell-maker-submit' and
+fire a prompt straight at a working agent, which is exactly what the
+pause exists to stop."
+  (should (equal
+           (agent-shell-tests--with-persistent-prompt-shell
+            (lambda ()
+              (insert "typed while paused")
+              (let (handed-on submitted)
+                (cl-letf (((symbol-function 'agent-shell--prompt-queue-paused-p)
+                           (lambda (&rest _) 'detached-turn))
+                          ((symbol-function 'shell-maker-submit)
+                           (lambda (&rest _) (setq submitted t))))
+                  (let ((agent-shell-busy-submit-default-function
+                         (lambda (prompt) (setq handed-on prompt))))
+                    (agent-shell-submit)))
+                (list :handed-on handed-on :submitted submitted)))
+            :busy nil)
+           '(:handed-on "typed while paused" :submitted nil))))
+
 (ert-deftest agent-shell--live-input-prompt-p-zero-length-test ()
   "A collapsed prompt span is not a prompt.
 
@@ -9925,6 +10006,9 @@ non-nil when point came back to where the draft was being typed."
          (buffer (generate-new-buffer " *agent-shell-steer-render-test*"))
          (fake-process (start-process "fake-agent" buffer "cat")))
     (set-process-query-on-exit-flag fake-process nil)
+    ;; The default sentinel reports the exit into the buffer, whose comint
+    ;; output is read-only, and the failing sentinel aborts the whole run.
+    (set-process-sentinel fake-process #'ignore)
     (unwind-protect
         (with-current-buffer buffer
           (comint-mode)
@@ -9979,15 +10063,222 @@ hides that."
   (dolist (idle '(nil t))
     (let ((rendered (agent-shell-tests--render-steered-prompt "just the filenames"
                                                               :idle idle)))
-    (should (equal (map-elt rendered :text)
-                   (concat "Claude> list the files<shell-maker-end-of-prompt>\n"
-                           "Listing \n\n"
-                           "Claude> [steer] just the filenames"
-                           "<shell-maker-end-of-prompt>\n"
+      (should (equal (map-elt rendered :text)
+                     (concat "Claude> list the files<shell-maker-end-of-prompt>\n"
+                             "Listing \n\n"
+                             "Claude> [steer] just the filenames"
+                             "<shell-maker-end-of-prompt>\n"
                              "Claude> ")))
       ;; Not "user_message_chunk": that asks the notification dispatch to
       ;; insert an end-of-prompt marker of its own on the next update.
       (should-not (equal (map-elt rendered :last-entry-type) "user_message_chunk")))))
+
+(ert-deftest agent-shell-experimental--steered-prompt-is-extractable-test ()
+  "A steered prompt reads as a prompt to `shell-maker--extract-history'.
+
+Extraction finds prompts with `shell-maker--re-search-forward-prompt',
+which requires the literal `comint-highlight-prompt' face via `memq'.
+Inheriting it through `agent-shell-prompt' does not count, so a steer
+faced with `agent-shell-prompt' alone is invisible there: its prompt, its
+response and its raw `<shell-maker-end-of-prompt>' text are all swallowed
+into the preceding interaction's response instead of forming one of their
+own.  Same face list a restored prompt carries for the same reason."
+  (let* (;; Bound on rather than inherited, so this covers the persistent
+         ;; prompt regardless of which way the default points: the shell
+         ;; keeps a prompt at the buffer end for the whole turn, and the
+         ;; steer renders above it.
+         (agent-shell-persistent-prompt-enabled t)
+         (buffer (generate-new-buffer " *agent-shell-steer-extract-test*"))
+         (fake-process (start-process "fake-agent" buffer "cat")))
+    (set-process-query-on-exit-flag fake-process nil)
+    ;; The default sentinel reports the exit into read-only comint output,
+    ;; and the failing sentinel aborts the whole run.
+    (set-process-sentinel fake-process #'ignore)
+    (unwind-protect
+        (with-current-buffer buffer
+          (comint-mode)
+          (setq-local comint-prompt-regexp "Claude> ")
+          (setq-local comint-use-prompt-regexp t)
+          (setq-local shell-maker--config
+                      (make-shell-maker-config
+                       :name "agent"
+                       :prompt "Claude> "
+                       :prompt-regexp "Claude> "))
+          (let ((state (list (cons :buffer (current-buffer))
+                             (cons :chunked-group-count 0)
+                             (cons :last-entry-type "agent_message_chunk")
+                             (cons :event-subscriptions nil)
+                             (cons :agent-config '((:shell-prompt . "Claude> "))))))
+            (setq-local agent-shell--state state)
+            (setq major-mode 'agent-shell-mode)
+            (cl-letf (((symbol-function 'shell-maker--process) (lambda () fake-process))
+                      ((symbol-function 'shell-maker-busy) (lambda (&rest _) t)))
+              ;; The turn so far: a prompt the user submitted, faced the way
+              ;; the shell faces its own, closed by a real marker.
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert (propertize
+                         "Claude> "
+                         'font-lock-face '(agent-shell-prompt comint-highlight-prompt)
+                         'field 'output)
+                        "list the files"))
+              (set-marker (process-mark fake-process) (point-max))
+              (shell-maker-insert-end-of-prompt-marker)
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert "\nListing "))
+              ;; The prompt the shell keeps at the buffer end for the turn.
+              (shell-maker--output-filter fake-process "\nClaude> ")
+              (agent-shell-experimental--render-steered-prompt
+               :state state :prompt "just the filenames")
+              ;; The agent answers the steer, still inside the same turn, so
+              ;; it streams in above that live prompt.
+              (let ((live (and comint-last-prompt (car comint-last-prompt)))
+                    (inhibit-read-only t))
+                (save-excursion
+                  (goto-char (if live (marker-position live) (point-max)))
+                  (insert "a.el b.el\n")))
+              (should (equal (mapcar (lambda (exchange)
+                                       (cons (substring-no-properties (car exchange))
+                                             (substring-no-properties (cdr exchange))))
+                                     (shell-maker--extract-history "Claude> "))
+                             '(("list the files" . "Listing")
+                               ("[steer] just the filenames" . "a.el b.el")))))))
+      (when (process-live-p fake-process)
+        (delete-process fake-process))
+      (kill-buffer buffer))))
+
+(cl-defun agent-shell-tests--steer-with-viewport (&key park-point)
+  "Land a steer mid-turn with a viewport following the turn.
+
+PARK-POINT leaves the shell's own point inside the interaction being
+steered, which is where a viewport user's shell point sits: they left
+the shell on the interaction they were reading, and a steer does not
+move it.  Without it point stays at the buffer end, where a prompt
+submitted through comint leaves it.
+
+Returns an alist of the page the viewport showed `:live', the page it
+shows once the shell is re-read (`:refreshed', what a buffer switch
+does), and the `:position' the live page reported for its header.  Each
+page is a cons of its prompt and its trimmed response."
+  (let* (;; The shell keeps a prompt at the buffer end for the whole turn
+         ;; and the steer renders above it.  Bound on rather than
+         ;; inherited, so this holds whichever way the default points.
+         (agent-shell-persistent-prompt-enabled t)
+         (shell-buffer (generate-new-buffer " *agent-shell-steer-viewport-test*"))
+         (viewport-buffer (get-buffer-create
+                           (concat (buffer-name shell-buffer)
+                                   agent-shell-viewport--suffix)))
+         (fake-process (start-process "fake-agent" shell-buffer "cat"))
+         (result nil))
+    (set-process-query-on-exit-flag fake-process nil)
+    ;; The default sentinel reports the exit into read-only comint output,
+    ;; and the failing sentinel aborts the whole run.
+    (set-process-sentinel fake-process #'ignore)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda () nil))
+                  ((symbol-function 'shell-maker--process) (lambda () fake-process))
+                  ((symbol-function 'shell-maker-busy) (lambda (&rest _) t)))
+          (with-current-buffer shell-buffer
+            (comint-mode)
+            (setq-local comint-prompt-regexp "Claude> ")
+            (setq-local shell-maker--config
+                        (make-shell-maker-config
+                         :name "agent"
+                         :prompt "Claude> "
+                         :prompt-regexp "Claude> "))
+            (setq major-mode 'agent-shell-mode)
+            (let ((state (list (cons :buffer shell-buffer)
+                               (cons :chunked-group-count 0)
+                               (cons :request-count 1)
+                               (cons :last-entry-type "agent_message_chunk")
+                               (cons :event-subscriptions nil)
+                               (cons :agent-config '((:shell-prompt . "Claude> "))))))
+              (setq-local agent-shell--state state)
+              ;; The prompt the user submitted, faced the way the shell faces
+              ;; its own, closed by a real marker.
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert (propertize
+                         "Claude> "
+                         'font-lock-face '(agent-shell-prompt comint-highlight-prompt)
+                         'field 'output)
+                        "list the files"))
+              (set-marker (process-mark fake-process) (point-max))
+              (shell-maker-insert-end-of-prompt-marker)
+              ;; The viewport, in view mode on that interaction, which is
+              ;; what puts it in the way of the turn's live updates.
+              (with-current-buffer viewport-buffer
+                (agent-shell-viewport-view-mode)
+                (agent-shell-viewport--initialize :prompt "list the files"))
+              ;; The prompt the shell keeps at the buffer end for the turn.
+              (shell-maker--output-filter fake-process "\nClaude> ")
+              ;; The turn answering above it, mirrored into the viewport as
+              ;; it streams.
+              (agent-shell--update-text
+               :state state :block-id "answer" :text "Listing " :create-new t)
+              (when park-point
+                (goto-char (point-min))
+                (search-forward "Listing "))
+              (agent-shell-experimental--render-steered-prompt
+               :state state :prompt "just the filenames")
+              ;; The agent answering the steer, still inside the same turn.
+              (agent-shell--update-text
+               :state state :block-id "answer2" :text "a.el b.el" :create-new t)
+              (push (cons :position
+                          (with-current-buffer viewport-buffer
+                            agent-shell-viewport--position-cache))
+                    result)
+              (push (cons :live
+                          (with-current-buffer viewport-buffer
+                            (cons (agent-shell-viewport--prompt)
+                                  (string-trim
+                                   (or (agent-shell-viewport--response) "")))))
+                    result)
+              ;; Switching to the shell and back re-reads the interaction at
+              ;; point, which is the steer's now that the turn renders under
+              ;; it.  Point sits in the output the user was reading.
+              (goto-char (point-max))
+              (search-backward "a.el b.el")
+              (push (cons :refreshed
+                          (with-current-buffer viewport-buffer
+                            (agent-shell-viewport-refresh)
+                            (cons (agent-shell-viewport--prompt)
+                                  (string-trim
+                                   (or (agent-shell-viewport--response) "")))))
+                    result)
+              result)))
+      (when (process-live-p fake-process)
+        (delete-process fake-process))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-experimental--steered-prompt-opens-a-viewport-page-test ()
+  "A steer must leave the viewport on the page a re-read would show.
+
+The steer is a prompt of its own in the shell (see
+`agent-shell-experimental--steered-prompt-is-extractable-test'), so
+anything re-reading the shell -- `agent-shell-viewport-refresh' after a
+buffer switch, paging -- shows the turn's remaining output on a page of
+its own, under the steer.  A viewport streaming live has to land on that
+same page: otherwise the steer reads as more of the previous page until
+the user switches away and back, and what they were reading changes
+under them when they do.
+
+The page has to be numbered as the shell's newest too, wherever the
+shell's own point sits, or the header is a page behind and, worse, the
+page reads as not the latest and the rest of the turn is never mirrored
+into it."
+  (dolist (park-point '(nil t))
+    (let* ((steered (agent-shell-tests--steer-with-viewport :park-point park-point))
+           (live (map-elt steered :live)))
+      (should (equal live (map-elt steered :refreshed)))
+      ;; Anchored, so both pages cannot agree on the wrong one.
+      (should (equal (car live) "[steer] just the filenames"))
+      (should (equal (cdr live) "a.el b.el"))
+      (should (equal (map-elt steered :position)
+                     '((:current . 2) (:total . 2)))))))
 
 (ert-deftest agent-shell-experimental--steered-prompt-emits-input-submitted-test ()
   "A steered prompt announces itself as input the user submitted.
@@ -10026,6 +10317,392 @@ shell, so item navigation finds none of them here."
                ((symbol-function 'agent-shell-next-permission-button) #'ignore)
                ((symbol-function 'agent-shell-previous-permission-button) #'ignore))
        ,@body)))
+
+(cl-defun agent-shell-tests--prompt-send (&key disposition setting steerable
+                                               busy paused)
+  "Run `agent-shell--prompt-send' through its guards and report the path taken.
+
+DISPOSITION is the caller's explicit choice.  SETTING is `steer' or
+`queue', naming which of the two shipped functions
+`agent-shell-busy-submit-default-function' holds.  STEERABLE, BUSY and
+PAUSED are what `agent-shell--prompt-steerable-p', `shell-maker-busy' and
+`agent-shell--prompt-queue-paused-p' report.
+
+Runs the real `agent-shell--busy-submit' and the real
+`agent-shell-busy-submit-steer', so the setting reaches the dispatch the
+way a user's customization does.
+
+Returns `steered' (handed to the running turn, no fallback),
+`steered-or-queued' (handed over, queued if the agent will not take it),
+`queued' or `submitted'."
+  (let ((agent-shell-busy-submit-default-function
+         (pcase setting
+           ('steer #'agent-shell-busy-submit-steer)
+           ('queue #'agent-shell-busy-submit-queue)
+           (_ setting)))
+        taken)
+    (cl-letf (((symbol-function 'agent-shell--prompt-queue-migrate) #'ignore)
+              ((symbol-function 'agent-shell--prompt-steerable-p)
+               (lambda (&rest _) steerable))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) busy))
+              ((symbol-function 'agent-shell--prompt-queue-paused-p)
+               (lambda (&rest _) paused))
+              ((symbol-function 'agent-shell--prompt-steer)
+               (lambda (&rest _) (setq taken 'steered)))
+              ((symbol-function 'agent-shell--prompt-steer-or-queue)
+               (lambda (&rest _) (setq taken 'steered-or-queued)))
+              ((symbol-function 'agent-shell--prompt-queue-enqueue)
+               (lambda (&rest _) (setq taken 'queued)))
+              ((symbol-function 'agent-shell--insert-to-shell-buffer)
+               (lambda (&rest _) (setq taken 'submitted))))
+      (agent-shell--prompt-send :prompt "hi" :disposition disposition))
+    taken))
+
+(ert-deftest agent-shell--prompt-send-dispatch-test ()
+  "Test `agent-shell--prompt-send' picks a path from disposition and setting."
+  ;; An explicit disposition outranks the setting, both ways round, so a
+  ;; binding never depends on how the setting happens to be set.
+  (should (eq (agent-shell-tests--prompt-send
+               :disposition 'steer :setting 'queue :steerable t :busy t)
+              'steered))
+  (should (eq (agent-shell-tests--prompt-send
+               :disposition 'queue :setting 'steer :steerable t :busy t)
+              'queued))
+  ;; Explicit steer does not need the forgiving predicate: it errors from
+  ;; inside rather than quietly queueing.
+  (should (eq (agent-shell-tests--prompt-send
+               :disposition 'steer :setting 'queue :steerable nil :busy t)
+              'steered))
+  ;; Following the setting takes the forgiving path, which queues rather
+  ;; than interrupting when the agent will not take the prompt.
+  (should (eq (agent-shell-tests--prompt-send :setting 'steer :steerable t :busy t)
+              'steered-or-queued))
+  ;; An agent that cannot be steered, or a shell blocked on a permission
+  ;; answer, never reaches the steering path at all.
+  (should (eq (agent-shell-tests--prompt-send :setting 'steer :steerable nil :busy t)
+              'queued))
+  (should (eq (agent-shell-tests--prompt-send :setting 'queue :steerable t :busy t)
+              'queued))
+  ;; Nothing running and nothing paused: send it.
+  (should (eq (agent-shell-tests--prompt-send :setting 'steer :steerable nil :busy nil)
+              'submitted))
+  ;; A paused queue means an untracked turn is still going even though the
+  ;; shell looks idle, so submitting would fire into a working agent.
+  (should (eq (agent-shell-tests--prompt-send
+               :setting 'steer :steerable nil :busy nil :paused 'detached-turn)
+              'queued)))
+
+(ert-deftest agent-shell--prompt-send-calls-a-custom-busy-function-test ()
+  "A plain send mid-turn runs whatever function the setting holds.
+
+`agent-shell-busy-submit-default-function' takes any function, not only
+the two shipped ones, so the dispatch has to call it rather than test it
+against a known symbol.  Reading it as \"steer or else queue\" would drop
+a custom function's prompt into the queue without ever running it."
+  (let (seen)
+    (let ((agent-shell-busy-submit-default-function
+           (lambda (prompt) (setq seen prompt))))
+      (cl-letf (((symbol-function 'agent-shell--prompt-queue-migrate) #'ignore)
+                ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+                ((symbol-function 'agent-shell--prompt-queue-paused-p)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'agent-shell--prompt-queue-enqueue)
+                 (lambda (&rest _) (setq seen 'queued)))
+                ((symbol-function 'agent-shell--insert-to-shell-buffer)
+                 (lambda (&rest _) (setq seen 'submitted))))
+        (agent-shell--prompt-send :prompt "hi")))
+    (should (equal seen "hi"))))
+
+(cl-defun agent-shell-tests--steer-or-queue (&key throws busy)
+  "Run `agent-shell--prompt-steer-or-queue' and report what became of the prompt.
+
+THROWS makes the send signal synchronously, as a dead client does, rather
+than answering with an outcome.  BUSY is what `shell-maker-busy' reports
+once the answer is handled.
+
+Returns an alist of the queued prompt, whether the queue was drained, and
+any error that escaped."
+  (let (queued drained escaped)
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda (&rest _) (list (cons :prompt-queue-paused nil)
+                                       (cons :session (list (cons :id "sess-1"))))))
+              ((symbol-function 'agent-shell--echo) #'ignore)
+              ((symbol-function 'agent-shell-interrupt) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) busy))
+              ((symbol-function 'agent-shell--expand-truncated-regions)
+               (lambda (text) text))
+              ((symbol-function 'agent-shell--prompt-content-blocks)
+               (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+              ((symbol-function 'agent-shell--prompt-queue-enqueue)
+               (cl-function (lambda (&key prompt &allow-other-keys) (setq queued prompt))))
+              ((symbol-function 'agent-shell--prompt-queue-process-next)
+               (lambda (&rest _) (setq drained t)))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (if throws
+                     (error "Process not running")
+                   (funcall (plist-get args :on-success)
+                            (list (cons 'outcome "failed")))))))
+      (condition-case error
+          (agent-shell--prompt-steer-or-queue :prompt "steer me")
+        (error (setq escaped (error-message-string error)))))
+    (list (cons :queued queued) (cons :drained drained) (cons :escaped escaped))))
+
+(ert-deftest agent-shell--prompt-steer-that-never-went-out-still-queues-test ()
+  "A send that signals synchronously must not take the prompt with it.
+
+`agent-shell--send-request' can signal before the request leaves: a dead
+client, or `acp-send-request' restarting one that fails to start.  The
+prompt never reached the agent, so a plain send -- which promises the
+prompt is never dropped -- has to fall back to the queue rather than let
+the error escape with the prompt still in it."
+  (let ((outcome (agent-shell-tests--steer-or-queue :throws t :busy t)))
+    (should (equal (map-elt outcome :queued) "steer me"))
+    (should-not (map-elt outcome :escaped))))
+
+(ert-deftest agent-shell--prompt-steer-strict-still-signals-a-failed-send-test ()
+  "Without a fallback the same failure is reported rather than swallowed.
+
+`agent-shell-prompt-steer' passes no ON-DECLINED, so it has nowhere to
+put the prompt and the caller must see why the send failed."
+  (let (escaped)
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda (&rest _) (list (cons :prompt-queue-paused nil)
+                                       (cons :session (list (cons :id "sess-1"))))))
+              ((symbol-function 'agent-shell--expand-truncated-regions)
+               (lambda (text) text))
+              ((symbol-function 'agent-shell--prompt-content-blocks)
+               (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest _) (error "Process not running"))))
+      (condition-case error
+          (agent-shell-experimental--send-steering
+           :state (agent-shell--state) :prompt "steer me")
+        (error (setq escaped (error-message-string error)))))
+    (should (equal escaped "Process not running"))))
+
+(ert-deftest agent-shell--prompt-steer-declined-drains-an-idle-queue-test ()
+  "A prompt queued by a declined steer is sent, not left for a manual resume.
+
+The tracked turn can end while the steer is in flight, where the queue
+hook that would normally drain it saw the pause and did nothing.  By the
+time the decline arrives the shell is idle with nothing else coming, so
+the prompt would sit pending until `agent-shell-prompt-queue-resume'."
+  (let ((outcome (agent-shell-tests--steer-or-queue :busy nil)))
+    (should (equal (map-elt outcome :queued) "steer me"))
+    (should (map-elt outcome :drained)))
+  ;; Still running: the turn's own completion drains the queue, and
+  ;; submitting now would fire a prompt at a working agent.
+  (let ((outcome (agent-shell-tests--steer-or-queue :busy t)))
+    (should (equal (map-elt outcome :queued) "steer me"))
+    (should-not (map-elt outcome :drained))))
+
+(ert-deftest agent-shell--prompt-steer-or-queue-queues-a-declined-steer-test ()
+  "Test the forgiving path keeps a declined prompt instead of interrupting."
+  (let (queued interrupted)
+    (cl-letf (((symbol-function 'agent-shell--state) (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--echo) #'ignore)
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-interrupt)
+               (lambda (&rest _) (setq interrupted t)))
+              ((symbol-function 'agent-shell--prompt-queue-enqueue)
+               (cl-function (lambda (&key prompt &allow-other-keys)
+                              (setq queued prompt))))
+              ((symbol-function 'agent-shell-experimental--send-steering)
+               (cl-function
+                (lambda (&key on-declined &allow-other-keys)
+                  (funcall on-declined "failed" 'declined)))))
+      (agent-shell--prompt-steer-or-queue :prompt "hi"))
+    (should (equal queued "hi"))
+    ;; Unlike `agent-shell-prompt-steer', a plain send has somewhere else to
+    ;; put the prompt, so there is no reason to cancel the running turn.
+    (should-not interrupted)))
+
+(cl-defun agent-shell-tests--steer-pause (&key outcome request-failed)
+  "Steer a prompt, answer with OUTCOME, and return the pause left behind.
+
+REQUEST-FAILED answers the request with an error instead."
+  (let ((state (list (cons :client nil)
+                     (cons :session (list (cons :id "sess-1")))
+                     (cons :request-count 0)
+                     (cons :last-entry-type nil)
+                     (cons :pending-prompts nil))))
+    (cl-letf (((symbol-function 'agent-shell--state) (lambda (&rest _) state))
+              ((symbol-function 'agent-shell--expand-truncated-regions)
+               (lambda (text) text))
+              ((symbol-function 'agent-shell--prompt-content-blocks)
+               (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+              ((symbol-function 'agent-shell-interrupt) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'agent-shell--insert-to-shell-buffer) #'ignore)
+              ((symbol-function 'agent-shell-experimental--render-steered-prompt)
+               #'ignore)
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 ;; The pause has to be in place before any answer arrives,
+                 ;; or a turn ending mid-request drains the queue into it.
+                 (should (eq (map-elt state :prompt-queue-paused) 'steering))
+                 (if request-failed
+                     (funcall (plist-get args :on-failure)
+                              '((message . "nope")) "raw")
+                   (funcall (plist-get args :on-success)
+                            (list (cons 'outcome outcome)))))))
+      (agent-shell-experimental--send-steering :state state :prompt "hi"))
+    (map-elt state :prompt-queue-paused)))
+
+(ert-deftest agent-shell-experimental--send-steering-settles-the-pause-test ()
+  "Test the steer outcome decides whether queued prompts may move again."
+  ;; The prompt joined the tracked turn, so that turn still reports its own
+  ;; end and the queue can go back to waiting on it.
+  (should-not (agent-shell-tests--steer-pause :outcome "injected"))
+  ;; Held: this turn is owned by no `session/prompt', so nothing marks the
+  ;; shell busy and nothing signals when it ends.  Only the user resumes.
+  (should (eq (agent-shell-tests--steer-pause :outcome "startedNewTurn")
+              'detached-turn))
+  ;; Nothing was consumed, so there is nothing to hold the queue back for.
+  (should-not (agent-shell-tests--steer-pause :outcome "failed"))
+  (should-not (agent-shell-tests--steer-pause :request-failed t))
+  ;; The agent handed the prompt back and it was submitted as its own turn.
+  (should-not (agent-shell-tests--steer-pause :outcome "promptRequired")))
+
+(ert-deftest agent-shell--prompt-queue-process-next-respects-the-pause-test ()
+  "Test a paused queue does not drain into a turn nothing here can see."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :pending-prompts (list "a" "b"))
+                      (cons :prompt-queue-paused 'detached-turn)))
+    (let (sent)
+      (cl-letf (((symbol-function 'agent-shell--insert-to-shell-buffer)
+                 (cl-function (lambda (&key text &allow-other-keys)
+                                (push text sent)))))
+        (agent-shell--prompt-queue-process-next)
+        (should-not sent)
+        (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b")))
+        ;; Released, so the next one goes out.
+        (map-put! agent-shell--state :prompt-queue-paused nil)
+        (agent-shell--prompt-queue-process-next)
+        (should (equal sent '("a")))
+        (should (equal (map-elt agent-shell--state :pending-prompts) '("b")))))))
+
+(ert-deftest agent-shell-prompt-queue-resume-clears-a-held-pause-test ()
+  "Test resuming releases a detached turn's hold but not a steer in flight."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :pending-prompts (list "a"))
+                      (cons :prompt-queue-paused 'steering)))
+    (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--prompt-queue-process-next) #'ignore))
+      ;; A steer that has not answered yet settles the pause itself, and
+      ;; clearing it here would race that answer into an untracked turn.
+      (should (equal (condition-case error
+                         (agent-shell-prompt-queue-resume)
+                       (user-error (error-message-string error)))
+                     "Steer still pending"))
+      (should (eq (map-elt agent-shell--state :prompt-queue-paused) 'steering))
+      (map-put! agent-shell--state :prompt-queue-paused 'detached-turn)
+      (agent-shell-prompt-queue-resume)
+      (should-not (map-elt agent-shell--state :prompt-queue-paused)))))
+
+(ert-deftest agent-shell--prompt-queue-take-and-insert-test ()
+  "Test claiming a pending prompt and putting it back at its position."
+  (with-temp-buffer
+    (setq-local agent-shell--state (list (cons :pending-prompts (list "a" "b" "c"))))
+    (should (equal (agent-shell--prompt-queue-take-at :index 1 :expected "b") "b"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "c")))
+    ;; Back where it was, so a declined steer does not reorder the queue.
+    (agent-shell--prompt-queue-insert-at :index 1 :prompt "b")
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b" "c")))
+    ;; A queue that shifted under us keeps its prompt rather than losing the
+    ;; wrong one.
+    (should-not (agent-shell--prompt-queue-take-at :index 1 :expected "moved"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b" "c")))
+    (should-not (agent-shell--prompt-queue-take-at :index 9 :expected "b"))
+    ;; Out-of-range insertion clamps rather than erroring, since other queue
+    ;; edits can have shrunk it meanwhile.
+    (agent-shell--prompt-queue-insert-at :index 99 :prompt "z")
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b" "c" "z")))))
+
+(cl-defun agent-shell-tests--queue-steer-at (&key declined)
+  "Steer the pending prompt at index 1, and return the queue left behind.
+
+DECLINED answers the steer with a decline rather than delivery."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :pending-prompts (list "a" "b" "c"))
+                      (cons :prompt-queue-paused nil)))
+    (cl-letf (((symbol-function 'agent-shell--echo) #'ignore)
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell--prompt-steerable-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell--prompt-steer)
+               (cl-function
+                (lambda (&key on-delivered on-declined &allow-other-keys)
+                  ;; Claimed before the agent is asked, so a turn ending
+                  ;; meanwhile cannot also submit it.
+                  (should (equal (map-elt agent-shell--state :pending-prompts)
+                                 '("a" "c")))
+                  (if declined
+                      (funcall on-declined "failed" 'declined)
+                    (funcall on-delivered 'injected))))))
+      (agent-shell--prompt-queue-steer-at :index 1 :prompt "b" :expected "b"))
+    (map-elt agent-shell--state :pending-prompts)))
+
+(ert-deftest agent-shell--prompt-queue-steer-at-test ()
+  "Test a queued prompt is neither lost nor run twice when steered."
+  ;; Taken by the agent, so the queue's copy goes.
+  (should (equal (agent-shell-tests--queue-steer-at) '("a" "c")))
+  ;; Declined, so it goes back where it was rather than being dropped.
+  (should (equal (agent-shell-tests--queue-steer-at :declined t) '("a" "b" "c"))))
+
+(ert-deftest agent-shell--prompt-queue-steer-at-leaves-a-shifted-queue-alone-test ()
+  "Test a queue that changed under us is not steered from."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :pending-prompts (list "a" "b"))
+                      (cons :prompt-queue-paused nil)))
+    (should-error (agent-shell--prompt-queue-steer-at
+                   :index 1 :prompt "b" :expected "moved")
+                  :type 'user-error)
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b")))))
+
+(ert-deftest agent-shell-viewport--compose-disposition-label-test ()
+  "Test the edit header names what the send key will actually do."
+  (dolist (case '((steer   t   "steer")
+                  ;; Sending will error rather than change method, so the
+                  ;; header says so instead of promising a queue.
+                  (steer   nil "steer unavailable")
+                  (queue   t   "queue")
+                  (queue   nil "queue")))
+    (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'agent-shell--prompt-steerable-p)
+               (lambda (&rest _) (nth 1 case))))
+      (should (equal (agent-shell-viewport--compose-disposition-label (nth 0 case))
+                     (nth 2 case)))))
+  ;; With no disposition of its own the draft follows the setting, and a
+  ;; plain send really does queue when a steer cannot be made.  A custom
+  ;; function is named \"send\": the header cannot know what it does, and
+  ;; saying \"queue\" would state a guess as fact.
+  (dolist (case `((,#'agent-shell-busy-submit-steer t   "steer")
+                  (,#'agent-shell-busy-submit-steer nil "queue")
+                  (,#'agent-shell-busy-submit-queue t   "queue")
+                  (,(lambda (_prompt) nil)          t   "send")))
+    (let ((agent-shell-busy-submit-default-function (nth 0 case)))
+      (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+                 (lambda (&rest _) (current-buffer)))
+                ((symbol-function 'agent-shell--prompt-steerable-p)
+                 (lambda (&rest _) (nth 1 case))))
+        (should (equal (agent-shell-viewport--compose-disposition-label nil)
+                       (nth 2 case)))))))
 
 (ert-deftest agent-shell-next-item-walks-into-and-out-of-a-table ()
   "Next item enters a table at its first cell, walks it, then moves on."

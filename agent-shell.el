@@ -1266,6 +1266,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :sleep-token nil)
         (cons :out-of-turn-timer nil)
         (cons :active-requests nil)
+        (cons :prompt-queue-paused nil)
         (cons :pending-prompts nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
@@ -1277,6 +1278,19 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
                            (cons :context-size 0)
                            (cons :cost-amount 0.0)
                            (cons :cost-currency nil)))))
+
+(defun agent-shell--ensure-state-key (state key)
+  "Make sure STATE carries KEY, adding it with a nil value when it does not.
+
+`map-put!' refuses to add a key an alist does not already have, so a
+shell built before KEY existed -- a live session across a package
+upgrade -- would fail on the first write to it.  `nconc' extends the
+alist in place, which keeps every reference to STATE seeing the addition.
+
+Return STATE."
+  (unless (assq key state)
+    (nconc state (list (cons key nil))))
+  state)
 
 (defvar-local agent-shell--state
     (agent-shell--make-state))
@@ -1337,14 +1351,18 @@ instead of being echoed into the transcript and rejected later.
 
 Submitting mid-turn hands the text to
 `agent-shell-busy-submit-default-function' and clears the input, which
-queues by default and drains when the turn ends.  Whether there is a
-prompt to submit from mid-turn is up to
+steers by default, so a turn going the wrong way can be corrected
+without waiting for it.  \"Mid-turn\" is
+`agent-shell--prompt-submittable-p' rather than `shell-maker-busy': a
+paused queue means an untracked turn is still running while the shell
+looks idle, and submitting then would fire a prompt at a working agent.
+Whether there is a prompt to submit from mid-turn is up to
 `agent-shell-persistent-prompt-enabled', but the routing does not depend
 on it: the same setting governs the viewport's compose buffer, which is
 there either way.
 
 With \\[universal-argument] prefix ARG, submit through
-`agent-shell-busy-submit-override-function' instead, which steers by
+`agent-shell-busy-submit-override-function' instead, which queues by
 default.  \\[agent-shell-submit-override] is bound to the same thing.
 
 This owns the `agent-shell-submit' name because shell-maker's
@@ -1356,11 +1374,11 @@ per-start aliasing is disabled (see the `:alias-commands nil' call in
   (unless (or (map-nested-elt agent-shell--state '(:session :id))
               (eq agent-shell-session-strategy 'new-deferred))
     (user-error "Starting agent, please wait"))
-  (if (shell-maker-busy)
-      (when-let* ((prompt (agent-shell--prompt-input)))
-        (agent-shell--busy-submit :prompt prompt :override arg)
-        (agent-shell--clear-prompt-input))
-    (shell-maker-submit)))
+  (if (agent-shell--prompt-submittable-p)
+      (shell-maker-submit)
+    (when-let* ((prompt (agent-shell--prompt-input)))
+      (agent-shell--busy-submit :prompt prompt :override arg)
+      (agent-shell--clear-prompt-input))))
 
 (defun agent-shell-submit-override ()
   "Submit the current input through the override route.
@@ -1396,14 +1414,14 @@ with no turn to queue behind or steer into, both simply submit."
       (agent-shell--insert-to-shell-buffer :text text
                                            :shell-buffer shell-buffer))))
 
-(cl-defun agent-shell--display-viewport-when-ready (&key shell-buffer append override edit)
+(cl-defun agent-shell--display-viewport-when-ready (&key shell-buffer append override edit disposition)
   "Show the viewport for SHELL-BUFFER, deferring until its session is ready.
 
 When SHELL-BUFFER uses the `prompt' session strategy and has no session id
 yet, wait for the `session-selected' event before showing the viewport.
 Otherwise the session picker `completing-read' races a visible compose
-buffer, which is confusing.  APPEND, OVERRIDE and EDIT are forwarded to
-`agent-shell-viewport--show-buffer'."
+buffer, which is confusing.  APPEND, OVERRIDE, EDIT and DISPOSITION are
+forwarded to `agent-shell-viewport--show-buffer'."
   (if (and (eq (buffer-local-value 'agent-shell-session-strategy shell-buffer) 'prompt)
            (not (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
                                 '(:session :id))))
@@ -1413,9 +1431,11 @@ buffer, which is confusing.  APPEND, OVERRIDE and EDIT are forwarded to
        :on-event (agent-shell--preserving-display-override
                   (lambda (_event)
                     (agent-shell-viewport--show-buffer
-                     :append append :override override :edit edit :shell-buffer shell-buffer))))
+                     :append append :override override :edit edit
+                     :disposition disposition :shell-buffer shell-buffer))))
     (agent-shell-viewport--show-buffer
-     :append append :override override :edit edit :shell-buffer shell-buffer)))
+     :append append :override override :edit edit
+     :disposition disposition :shell-buffer shell-buffer)))
 
 (cl-defun agent-shell--dwim (&key config new-shell switch-to-shell)
   "Start or reuse an agent shell with DWIM behavior.
@@ -6989,27 +7009,33 @@ through to `acp-send-request'."
   ;; Without this, map-put! fails on mid-session package updates.
   (unless (assq :active-requests state)
     (nconc state (list (cons :active-requests nil))))
-  (map-put! state :active-requests
-            (cons request (map-elt state :active-requests)))
-  (acp-send-request
-   :client client
-   :request request
-   :buffer buffer
-   :on-success (lambda (acp-response)
-                 (map-put! state :active-requests
-                           (seq-remove (lambda (r)
-                                         (equal r request))
-                                       (map-elt state :active-requests)))
-                 (when on-success
-                   (funcall on-success acp-response)))
-   :on-failure (lambda (acp-error raw-message)
-                 (map-put! state :active-requests
-                           (seq-remove (lambda (r)
-                                         (equal r request))
-                                       (map-elt state :active-requests)))
-                 (when on-failure
-                   (funcall on-failure acp-error raw-message)))
-   :sync sync))
+  (let ((remove-request
+         (lambda ()
+           (map-put! state :active-requests
+                     (seq-remove (lambda (r)
+                                   (equal r request))
+                                 (map-elt state :active-requests))))))
+    (map-put! state :active-requests
+              (cons request (map-elt state :active-requests)))
+    ;; A request that never went out must not stay listed as in flight, or
+    ;; the shell reads as busy for the rest of the session.
+    (condition-case err
+        (acp-send-request
+         :client client
+         :request request
+         :buffer buffer
+         :on-success (lambda (acp-response)
+                       (funcall remove-request)
+                       (when on-success
+                         (funcall on-success acp-response)))
+         :on-failure (lambda (acp-error raw-message)
+                       (funcall remove-request)
+                       (when on-failure
+                         (funcall on-failure acp-error raw-message)))
+         :sync sync)
+      (error
+       (funcall remove-request)
+       (signal (car err) (cdr err))))))
 
 (cl-defun agent-shell--initiate-handshake (&key shell-buffer on-initiated)
   "Initiate ACP handshake with SHELL-BUFFER.
@@ -10338,8 +10364,8 @@ When PICK-SHELL is non-nil, prompt for which shell buffer to use."
                              (agent-shell-cwd)))))
     (if (with-current-buffer shell-buffer (shell-maker-busy))
         (with-current-buffer shell-buffer
-          (agent-shell-prompt-queue
-           (agent-shell--prompt-queue-read :initial (concat text "\n\n"))))
+          (agent-shell--prompt-send
+           :prompt (agent-shell--prompt-queue-read :initial (concat text "\n\n"))))
       (agent-shell-insert :text text :shell-buffer shell-buffer))))
 
 (defun agent-shell-send-region-to ()
@@ -10352,7 +10378,11 @@ When PICK-SHELL is non-nil, prompt for which shell buffer to use."
 
 With \\[universal-argument] prefix ARG, force start a new shell.
 
-With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an existing shell."
+With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an existing shell.
+
+On a busy shell this follows `agent-shell-busy-submit-default-function'
+rather than hard-queueing, so the region in front of you can redirect
+work already under way."
   (interactive "P")
   (cond
    ;; `agent-shell--dwim' already carries the context to the chosen shell
@@ -10367,25 +10397,31 @@ With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an
            (text (agent-shell--context :shell-buffer shell-buffer)))
       (if (with-current-buffer shell-buffer (shell-maker-busy))
           (with-current-buffer shell-buffer
-            (agent-shell-prompt-queue
-             (agent-shell--prompt-queue-read :initial (concat text "\n\n"))))
+            (agent-shell--prompt-send
+             :prompt (agent-shell--prompt-queue-read :initial (concat text "\n\n"))))
         (agent-shell-insert :text text :shell-buffer shell-buffer))))))
 
-(cl-defun agent-shell-prompt-queue-dwim (&optional arg)
-  "Queue a prompt with DWIM context for an existing shell.
+(cl-defun agent-shell--prompt-dwim (&key disposition label pick-shell)
+  "Read a prompt with DWIM context and send it with DISPOSITION.
 
-When called with prefix ARG, prompt to choose an existing shell.
+DISPOSITION is `queue', `steer', or nil to follow
+`agent-shell-busy-submit-default-function' (see
+`agent-shell--prompt-send').  LABEL
+names the action when asking which shell to use.  PICK-SHELL, when
+non-nil, prompts for that shell rather than using the project's.
 
-Prefills the minibuffer with `agent-shell--context' when available, but does
-not send until the minibuffer input is confirmed.
+Prefills the minibuffer with `agent-shell--context' when available, but
+does not send until the input is confirmed.
 
-When `agent-shell-prefer-viewport-interaction' is non-nil, opens the viewport
-compose buffer with context prefilled instead of using the minibuffer."
-  (interactive "P")
+When `agent-shell-prefer-viewport-interaction' is non-nil, opens the
+viewport compose buffer with the context prefilled instead.  DISPOSITION
+travels with that buffer, so its send key still does what the calling
+command's name said, however
+`agent-shell-busy-submit-default-function' is set."
   (let ((shell-buffer
-         (if arg
+         (if pick-shell
              (get-buffer
-              (completing-read "Queue prompt to shell: "
+              (completing-read (format "%s prompt to shell: " label)
                                (mapcar #'buffer-name (or (agent-shell-buffers)
                                                          (user-error "No shells available")))
                                nil t))
@@ -10394,18 +10430,57 @@ compose buffer with context prefilled instead of using the minibuffer."
         (agent-shell--display-viewport-when-ready
          :shell-buffer shell-buffer
          :append (or (agent-shell--context :shell-buffer shell-buffer) "")
-         :edit t)
-      (let* ((context (when-let ((text (agent-shell--context :shell-buffer shell-buffer)))
+         :edit t
+         :disposition disposition)
+      (let* ((context (when-let* ((text (agent-shell--context :shell-buffer shell-buffer)))
                         (concat text "\n\n")))
              (prompt (with-current-buffer shell-buffer
                        (or (map-nested-elt (agent-shell--state) '(:agent-config :shell-prompt))
-                           "Enqueue prompt: ")))
+                           (format "%s prompt: " label))))
              (request (minibuffer-with-setup-hook
                           (lambda ()
                             (agent-shell-completion--setup-minibuffer shell-buffer))
                         (read-string prompt context))))
         (with-current-buffer shell-buffer
-          (agent-shell-prompt-queue request))))))
+          (agent-shell--prompt-send :prompt request :disposition disposition))))))
+
+(cl-defun agent-shell-prompt-send-dwim (&optional arg)
+  "Send a prompt with DWIM context to an existing shell.
+
+`agent-shell-busy-submit-default-function' decides whether a prompt sent
+while a turn is running joins that turn or waits for it.  Use
+`agent-shell-prompt-queue-dwim' or `agent-shell-prompt-steer-dwim' to
+pick one outright.
+
+When called with prefix ARG, prompt to choose an existing shell.  See
+`agent-shell--prompt-dwim' for how the prompt is read."
+  (interactive "P")
+  (agent-shell--prompt-dwim :label "Send" :pick-shell arg))
+
+(cl-defun agent-shell-prompt-queue-dwim (&optional arg)
+  "Queue a prompt with DWIM context for an existing shell.
+
+The prompt waits for a running turn to end, whatever
+`agent-shell-busy-submit-default-function' says.  With no turn running,
+submit it immediately.
+
+When called with prefix ARG, prompt to choose an existing shell.  See
+`agent-shell--prompt-dwim' for how the prompt is read."
+  (interactive "P")
+  (agent-shell--prompt-dwim :disposition 'queue :label "Queue" :pick-shell arg))
+
+(cl-defun agent-shell-prompt-steer-dwim (&optional arg)
+  "Steer a prompt with DWIM context into the turn already running.
+
+The prompt joins a running turn, whatever
+`agent-shell-busy-submit-default-function' says, so the region or error
+at hand can redirect work already under way.
+An agent that cannot take a steered prompt causes a `user-error'.
+
+When called with prefix ARG, prompt to choose an existing shell.  See
+`agent-shell--prompt-dwim' for how the prompt is read."
+  (interactive "P")
+  (agent-shell--prompt-dwim :disposition 'steer :label "Steer" :pick-shell arg))
 
 (cl-defun agent-shell--get-region-context (&key deactivate no-error agent-cwd)
   "Get region as insertable text, ready for sending to agent.
