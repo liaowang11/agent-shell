@@ -804,6 +804,14 @@ Content a subagent produces is tagged with that subagent's name, so its tool cal
 
 This rides claude-agent-acp's JetBrains AIR extension, which the agent gates on the client asking for it by name at initialization.  Agent Shell asks for both halves, =nativeSubagentSessions= and =asyncTasks=, and only for agents whose configuration opts in.  Other agents are told nothing about the extension and keep their existing behavior.
 
+*** Forking from a message
+
+=M-x agent-shell-fork= starts a new session from the current one, carrying its history up to the latest turn.  =M-x agent-shell-fork-at-point= stops that history right after the agent message point is on, so the new session never sees the turns you meant to leave behind.  Both work from the shell buffer and the viewport.
+
+Put point on a rendered agent message first; the message identity Agent Shell needs is stamped on the message when it renders.
+
+The fork point rides the same AIR extension.  An agent that never advertised it would ignore the fork point and hand back a session forked from the latest turn instead, which looks like it worked and only shows up several turns later when the agent still remembers the discarded tail, so =agent-shell-fork-at-point= refuses rather than forking the wrong thing.  Use =agent-shell-fork= when the latest turn is what you want.
+
 *** Per-model token usage
 
 A session that runs subagents can spend on more than one model: the root session on one, its subagents on another.  When an agent reports a per-model breakdown and more than one model contributed, the usage display gains a =Models:= row splitting the turn's tokens by model.  Sessions on a single model are unchanged.
@@ -1252,6 +1260,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-droid-start-agent                           | Start an interactive Factory Droid agent shell.                               |
 |                                                       | agent-shell-fakes-load-session                          | Load and replay a recorded ACP session from TRAFFIC-FILE, popping to it.      |
 |                                                       | agent-shell-fork                                        | Fork the current session into a new shell.                                    |
+|                                                       | agent-shell-fork-at-point                               | Fork the current session up to the agent message at point.                    |
 |                                                       | agent-shell-github-start-copilot                        | Start an interactive GitHub Copilot agent shell.                              |
 |                                                       | agent-shell-google-start-gemini                         | Start an interactive Gemini CLI agent shell.                                  |
 |                                                       | agent-shell-goose-start-agent                           | Start an interactive Goose agent shell.                                       |
