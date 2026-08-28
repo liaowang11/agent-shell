@@ -31,6 +31,7 @@
 (require 'shell-maker)
 (require 'acp)
 
+(declare-function agent-shell--air-client-capabilities-meta "agent-shell")
 (declare-function agent-shell--indent-string "agent-shell")
 (declare-function agent-shell-welcome-message "agent-shell")
 (declare-function agent-shell--interpolate-gradient "agent-shell")
@@ -76,6 +77,9 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    ;; omp relays task subagents in the subagents RFD form once it has the
    ;; RFD; an older omp answers with AIR's `subagent_spawned' draft.
    :client-capabilities '((subagents . ()))
+   ;; omp gates background tasks, the session index and the fork point
+   ;; on the client naming them here, as claude-agent-acp does.
+   :initialize-meta (agent-shell--air-client-capabilities-meta)
    :client-maker (lambda (buffer)
                    (agent-shell-omp-make-client :buffer buffer))
    :install-instructions "See https://github.com/can1357/oh-my-pi omp (Oh My Pi) installation."))
