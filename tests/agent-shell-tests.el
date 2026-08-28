@@ -2078,6 +2078,51 @@ them again: the question already did."
         (should (eq processed answer))
         (should (equal displayed (unless answer '(:skip-summary t))))))))
 
+(ert-deftest agent-shell--send-command-cancel-skips-question-while-paused-test ()
+  "Test a cancelled turn does not ask to continue a paused queue.
+
+A paused queue sends nothing (see `agent-shell--prompt-queue-paused-p'),
+so answering yes would do nothing.  Show the queue's commands instead."
+  (let ((captured-on-success nil)
+        (processed nil)
+        (displayed nil)
+        (asked nil)
+        (agent-shell--state (list (cons :buffer (current-buffer))
+                                  (cons :event-subscriptions nil)
+                                  (cons :client 'test-client)
+                                  (cons :session (list (cons :id "test-session") (cons :title nil)))
+                                  (cons :last-entry-type nil)
+                                  (cons :tool-calls nil)
+                                  (cons :pending-prompts (list "sorted by size"))
+                                  (cons :prompt-queue-paused 'steering)
+                                  (cons :usage (list (cons :total-tokens 0)))
+                                  (cons :idle-timer nil)))
+        (agent-shell-show-busy-indicator nil)
+        (agent-shell-show-usage-at-turn-end nil))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq captured-on-success (plist-get args :on-success))))
+              ((symbol-function 'agent-shell--finish-output)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--prompt-queue-display)
+               (lambda (&rest args) (setq displayed (or args t))))
+              ((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (setq asked t)))
+              ((symbol-function 'agent-shell--prompt-queue-process-next)
+               (lambda (&rest _) (setq processed t))))
+      (agent-shell--send-command
+       :prompt "Hello"
+       :shell-buffer (current-buffer))
+      (should captured-on-success)
+      (funcall captured-on-success '((stopReason . "cancelled")))
+      (should-not asked)
+      (should-not processed)
+      (should (eq displayed t)))))
+
 (ert-deftest agent-shell--send-command-emits-input-submitted-with-prompt-test ()
   "Test `input-submitted' carries the expanded prompt text."
   (let ((received-events nil)
@@ -2232,7 +2277,7 @@ back does.  With no interaction to show, compose stays as it is."
 discarded draft, a prompt sent into a busy shell and an edited pending
 prompt must be cleared first, or the next `agent-shell-viewport-reply'
 restores them."
-  (dolist (leave '(cancel busy edit-pending))
+  (dolist (leave '(cancel hold edit-pending))
     (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
           (agent-shell-prefer-viewport-interaction t)
           (agent-shell-viewport-dismiss-on-send nil))
@@ -2248,9 +2293,9 @@ restores them."
                        (lambda () 1))
                       ((symbol-function 'y-or-n-p)
                        (lambda (_) t))
-                      ((symbol-function 'agent-shell-viewport--busy-p)
+                      ((symbol-function 'agent-shell-viewport--hold-p)
                        (lambda (&rest _) t))
-                      ((symbol-function 'agent-shell--busy-submit)
+                      ((symbol-function 'agent-shell--prompt-send)
                        (lambda (&rest _) nil))
                       ((symbol-function 'agent-shell--prompt-queue-replace)
                        (lambda (&rest _) nil))
@@ -2262,7 +2307,7 @@ restores them."
               (insert "draft text")
               (pcase leave
                 ('cancel (agent-shell-viewport-compose-cancel))
-                ('busy (agent-shell-viewport-compose-send-and-wait-for-response))
+                ('hold (agent-shell-viewport-compose-send-and-wait-for-response))
                 ('edit-pending
                  (setq agent-shell-viewport--edit-pending-index 0
                        agent-shell-viewport--edit-pending-prompt "old")
@@ -2274,21 +2319,17 @@ restores them."
 (ert-deftest agent-shell-viewport-compose-send-and-dismiss-test ()
   "Composed prompts are sent, cleared, and dismissed or kept.
 
-`agent-shell-viewport--compose-queue' hands the draft onward and clears
-the compose buffer; `agent-shell-viewport-compose-send-and-dismiss'
-additionally dismisses the window.  An empty draft signals an error.
-
-Both seams are stubbed, since where the draft goes depends on whether a
-turn is running: mid-turn through `agent-shell--busy-submit', otherwise
-straight to the shell."
+`agent-shell-viewport--compose-deliver' hands the draft to
+`agent-shell--prompt-send' and clears the compose buffer;
+`agent-shell-viewport-compose-send-and-dismiss' additionally dismisses
+the window.  An empty draft signals an error."
   (let ((agent-shell-header-style 'graphical)
         queued dismissed)
     (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
                (lambda (&rest _) (current-buffer)))
-              ((symbol-function 'agent-shell--busy-submit)
-               (lambda (&rest args) (setq queued (plist-get args :prompt))))
-              ((symbol-function 'agent-shell--insert-to-shell-buffer)
-               (lambda (&rest args) (setq queued (plist-get args :text))))
+              ((symbol-function 'agent-shell--prompt-send)
+               (cl-function
+                (lambda (&key prompt &allow-other-keys) (setq queued prompt))))
               ((symbol-function 'agent-shell-viewport--dismiss)
                (lambda (&rest _) (setq dismissed t)))
               ((symbol-function 'agent-shell-viewport--position)
@@ -2308,7 +2349,7 @@ straight to the shell."
       (with-temp-buffer
         (agent-shell-viewport-edit-mode)
         (insert "another prompt")
-        (agent-shell-viewport--compose-queue)
+        (agent-shell-viewport--compose-deliver)
         (should (equal queued "another prompt"))
         (should (string-empty-p (string-trim (buffer-string))))
         (should-not dismissed))
@@ -2318,6 +2359,64 @@ straight to the shell."
         (agent-shell-viewport-edit-mode)
         (should-error (agent-shell-viewport-compose-send-and-dismiss))
         (should-not queued)))))
+
+(ert-deftest agent-shell-viewport-compose-send-override-takes-the-other-route-test ()
+  "The compose override really reaches the override function.
+
+\[agent-shell-viewport-compose-send-override] works by rebinding
+`agent-shell-busy-submit-default-function' around an ordinary send, so it
+only does anything if the send path actually reads that variable.  A
+dispatch that decided between queueing and steering some other way would
+leave this command a no-op that looks bound and does nothing.
+
+A draft carrying its own disposition is not overridden: the command that
+opened it named what it does, and that outranks both the setting and this."
+  (let ((agent-shell-header-style 'graphical)
+        ;; Skips the "Starting agent, please wait" guard, which is not what
+        ;; this covers.
+        (agent-shell-session-strategy 'new-deferred)
+        (agent-shell-busy-submit-default-function #'agent-shell-busy-submit-queue)
+        (agent-shell-busy-submit-override-function #'agent-shell-busy-submit-steer)
+        taken)
+    (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'agent-shell--prompt-queue-migrate) #'ignore)
+              ((symbol-function 'agent-shell--prompt-submittable-p)
+               (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--prompt-steerable-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell--prompt-steer-confirmed-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell--prompt-steer-or-queue)
+               (lambda (&rest _) (setq taken 'steered)))
+              ((symbol-function 'agent-shell--prompt-queue-enqueue)
+               (lambda (&rest _) (setq taken 'queued)))
+              ((symbol-function 'agent-shell-viewport--dismiss) #'ignore)
+              ((symbol-function 'agent-shell-viewport--position)
+               (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell-viewport--update-header)
+               (lambda (&rest _) nil)))
+      ;; The plain send follows the setting.
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (insert "my prompt")
+        (agent-shell-viewport-compose-send t)
+        (should (eq taken 'queued)))
+      ;; The override takes the other one.
+      (setq taken nil)
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (insert "my prompt")
+        (agent-shell-viewport-compose-send-override t)
+        (should (eq taken 'steered)))
+      ;; A draft that named its own delivery keeps it.
+      (setq taken nil)
+      (with-temp-buffer
+        (agent-shell-viewport-edit-mode)
+        (setq agent-shell-viewport--compose-disposition 'queue)
+        (insert "my prompt")
+        (agent-shell-viewport-compose-send-override t)
+        (should (eq taken 'queued))))))
 
 (ert-deftest agent-shell--format-diff-as-text-test ()
   "Test `agent-shell--format-diff-as-text' function."
@@ -2774,12 +2873,14 @@ An agent asked about `<shell-maker-end-of-prompt>' writes those
 characters back without the `shell-maker--marker' property, and reading
 them as the delimiter would report the response starting mid-sentence."
   (with-temp-buffer
-    (insert "Claude> ask\nplain <shell-maker-end-of-prompt> text\n")
+    (insert (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt)
+            "ask\nplain <shell-maker-end-of-prompt> text\n")
     (cl-letf (((symbol-function 'shell-maker--prompt-begin-position)
                (lambda () (point-min))))
       (should-not (agent-shell--shell-response-start))))
   (with-temp-buffer
-    (insert "Claude> ask\n"
+    (insert (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt)
+            "ask\n"
             (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t)
             "\nthe reply\n")
     (cl-letf (((symbol-function 'shell-maker--prompt-begin-position)
@@ -5164,6 +5265,7 @@ so the command must not append a second time."
           (agent-shell-prefer-viewport-interaction nil)
           read-args
           queued-prompt
+          queued-disposition
           queued-buffer)
       (unwind-protect
           (cl-letf (((symbol-function 'agent-shell--shell-buffer)
@@ -5182,13 +5284,17 @@ so the command must not append a second time."
                      (lambda (prompt &optional initial-input _history _default-value _inherit-input-method)
                        (setq read-args (list prompt initial-input))
                        (concat initial-input "\nextra prompt")))
-                    ((symbol-function 'agent-shell-prompt-queue)
-                     (lambda (prompt)
-                       (setq queued-prompt prompt
-                             queued-buffer (current-buffer)))))
+                    ((symbol-function 'agent-shell--prompt-send)
+                     (cl-function
+                      (lambda (&key prompt disposition &allow-other-keys)
+                        (setq queued-prompt prompt
+                              queued-disposition disposition
+                              queued-buffer (current-buffer))))))
             (agent-shell-prompt-queue-dwim)
             (should (equal read-args '("Enqueue prompt: " "context from source\n\n")))
             (should (equal queued-prompt "context from source\n\n\nextra prompt"))
+            ;; Named its behavior, so it queues whatever the setting says.
+            (should (eq queued-disposition 'queue))
             (should (eq queued-buffer shell-buffer)))
         (kill-buffer shell-buffer)))))
 
@@ -5291,7 +5397,7 @@ so the command must not append a second time."
                     ((symbol-function 'read-string)
                      (lambda (&rest _)
                        "final prompt"))
-                    ((symbol-function 'agent-shell-prompt-queue)
+                    ((symbol-function 'agent-shell--prompt-send)
                      (lambda (&rest _)
                        (setq queued-buffer (current-buffer)))))
             (agent-shell-prompt-queue-dwim '(4))
@@ -7100,12 +7206,12 @@ taller than a line."
                        (lambda (&rest _) shell-buffer))
                       ((symbol-function 'agent-shell-viewport--position)
                        (lambda (&rest _) '((:current . 2) (:total . 2))))
-                      ((symbol-function 'shell-maker--prompt-begin-position)
-                       (lambda () latest-prompt-begin))
-                      ((symbol-function 'shell-maker-next-command-and-response)
-                       (lambda (backwards &rest _)
-                         (should backwards)
-                         '("older prompt" . "older response")))
+                      ((symbol-function 'agent-shell--turn-at-index)
+                       (lambda (index)
+                         (should (equal index 1))
+                         (list (cons :prompt "older prompt")
+                               (cons :response "older response")
+                               (cons :position latest-prompt-begin))))
                       ((symbol-function 'agent-shell-viewport--initialize)
                        (lambda (&rest args)
                          (setq initialized args)
@@ -7129,34 +7235,26 @@ taller than a line."
 
 Paging forward never enters compose: a repeated key would otherwise land
 in the draft and type into it."
-  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
-        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
-        (switched-to-edit nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (agent-shell-viewport-view-mode)))
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
-                       (lambda (&rest _) t))
-                      ((symbol-function 'agent-shell-viewport--shell-buffer)
-                       (lambda (&rest _) shell-buffer))
-                      ((symbol-function 'agent-shell-viewport--position)
-                       (lambda (&rest _) '((:current . 2) (:total . 2))))
-                      ((symbol-function 'agent-shell-viewport-edit-mode)
-                       (lambda () (setq switched-to-edit t)))
-                      ((symbol-function 'agent-shell-viewport--initialize)
-                       (lambda (&rest _) nil))
-                      ((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (should (equal (cadr (should-error (agent-shell-viewport-next-page)
-                                                 :type 'user-error))
-                             "Last page"))
-              (should-not switched-to-edit))))
-      (kill-buffer viewport-buffer)
-      (kill-buffer shell-buffer))))
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 4 4 (lambda ()
+                        (should (equal (cadr (should-error
+                                              (agent-shell-viewport-next-page)
+                                              :type 'user-error))
+                                       "Last page"))))))
+    (should-not (map-elt result :entered-compose))
+    (should-not (map-elt result :index))))
+
+(ert-deftest agent-shell-viewport-next-item-stays-at-end-of-last-page-test ()
+  "Test `agent-shell-viewport-next-item' at the end of the last page stays put.
+
+It falls through to the next page when it runs out of items, which must
+not carry it into compose."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 4 4 (lambda ()
+                        (goto-char (point-max))
+                        (agent-shell-viewport-next-item)
+                        (should (eobp))))))
+    (should-not (map-elt result :entered-compose))))
 
 (ert-deftest agent-shell-viewport-next-page-from-compose-errors-test ()
   "Test `agent-shell-viewport-next-page' signals a user-error from compose.
@@ -7189,6 +7287,123 @@ nothing to page forward to."
                        (lambda (&rest _) '((:current . 1) (:total . 3)))))
               (should-error (agent-shell-viewport-previous-page) :type 'user-error))))
       (kill-buffer viewport-buffer))))
+
+(defun agent-shell-viewport-tests--with-pages (current total body)
+  "Run BODY in a view-mode viewport starting at page CURRENT of TOTAL.
+BODY is called with no arguments.  History entries are named
+\"page one\", \"page two\", ...  Navigating updates the stubbed position
+the way real navigation does, so BODY can page more than once.  Returns
+an alist of :index (the page `agent-shell--turn-at-index' was asked for
+last), :initialized (the keyword plist passed to
+`agent-shell-viewport--initialize'), :cursor (the resulting
+`agent-shell-viewport--page-cursor') and :entered-compose (whether the
+compose page was opened)."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (requested-index nil)
+        (initialized nil)
+        (entered-compose nil)
+        (pages '(("page one" . "one")
+                 ("page two" . "two")
+                 ("page three" . "three")
+                 ("page four" . "four"))))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) `((:current . ,current) (:total . ,total))))
+                      ((symbol-function 'agent-shell--turn-at-index)
+                       (lambda (index)
+                         (setq requested-index index)
+                         ;; Landing on a page is what moves the position.
+                         (setq current index)
+                         (let ((page (nth (1- index) pages)))
+                           (list (cons :prompt (car page))
+                                 (cons :response (cdr page))
+                                 (cons :position 1)))))
+                      ((symbol-function 'agent-shell-viewport-edit-mode)
+                       (lambda () (setq entered-compose t)))
+                      ((symbol-function 'agent-shell-viewport--initialize)
+                       (lambda (&rest args)
+                         (setq initialized args)))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (funcall body)
+              `((:index . ,requested-index)
+                (:initialized . ,initialized)
+                (:cursor . ,agent-shell-viewport--page-cursor)
+                (:entered-compose . ,entered-compose)))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-next-page-jumps-n-pages-test ()
+  "Test `agent-shell-viewport-next-page' jumps N pages.
+
+On page 1 of 4, N=2 shows page 3.  A numeric prefix argument is the
+same N."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 1 4 (lambda () (agent-shell-viewport-next-page :n 2)))))
+    (should (equal (map-elt result :index) 3))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page three" :response "three")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 3)))
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 1 4 (lambda ()
+                        (let ((current-prefix-arg 2))
+                          (call-interactively #'agent-shell-viewport-next-page))))))
+    (should (equal (map-elt result :index) 3))
+    (should (equal (map-elt (map-elt result :cursor) :index) 3))))
+
+(ert-deftest agent-shell-viewport-previous-page-jumps-n-pages-test ()
+  "Test `agent-shell-viewport-previous-page' jumps N pages.
+
+On page 4 of 4, N=2 shows page 2.  A numeric prefix argument is the
+same N."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 4 4 (lambda () (agent-shell-viewport-previous-page 2)))))
+    (should (equal (map-elt result :index) 2))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page two" :response "two")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 2)))
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 4 4 (lambda ()
+                        (let ((current-prefix-arg 2))
+                          (call-interactively #'agent-shell-viewport-previous-page))))))
+    (should (equal (map-elt result :index) 2))))
+
+(ert-deftest agent-shell-viewport-next-page-n-clamps-to-last-page-test ()
+  "Test jumping forward past the last page lands on the last page.
+
+On page 2 of 4, N=3 has no fifth page, so it shows page 4 rather than
+entering compose -- an overshooting count must not land in the draft."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 2 4 (lambda () (agent-shell-viewport-next-page :n 3)))))
+    (should-not (map-elt result :entered-compose))
+    (should (equal (map-elt result :index) 4))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page four" :response "four")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 4))))
+
+(ert-deftest agent-shell-viewport-previous-page-n-clamps-to-first-page-test ()
+  "Test jumping backward past the first page lands on page 1.
+
+On page 3 of 4, N=5 has no page before 1, so it shows page 1 rather
+than erroring.  Already being on page 1 still errors (see
+`agent-shell-viewport-previous-page-first-page-error-test')."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 3 4 (lambda () (agent-shell-viewport-previous-page 5)))))
+    (should (equal (map-elt result :index) 1))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page one" :response "one")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 1))))
 
 (defun agent-shell-viewport-tests--insert-interaction (prompt response)
   "Insert a real PROMPT/RESPONSE interaction at point, comint style.
@@ -7228,145 +7443,138 @@ Return the buffer position where the prompt began."
       (goto-char (point-max)))
     buffer))
 
+(defun agent-shell-viewport-tests--leave-compose (cursor body)
+  "Run BODY on the compose page of 3 history pages with page CURSOR.
+BODY is called with no arguments after \"my draft\" is typed.  Returns
+an alist of :indexes (every page `agent-shell--turn-at-index' was asked
+for), :initialized (the last keyword plist passed to
+`agent-shell-viewport--initialize'), :mode, :point, :cursor and
+:snapshot."
+  (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
+                       '(("only question" . "only answer"))))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (indexes nil)
+        (initialized nil))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) '((:current . 3) (:total . 3))))
+                    ((symbol-function 'agent-shell--turn-at-index)
+                     (lambda (index)
+                       (push index indexes)
+                       (list (cons :prompt (format "page %d" index))
+                             (cons :response (make-string 20 ?x))
+                             (cons :position 1))))
+                    ((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest args)
+                       (setq initialized args)
+                       (let ((inhibit-read-only t))
+                         (erase-buffer)
+                         (insert (plist-get args :prompt) "\n"
+                                 (plist-get args :response))))))
+            (agent-shell-viewport-edit-mode)
+            (setq agent-shell-viewport--page-cursor cursor)
+            (insert "my draft")
+            (funcall body)
+            `((:indexes . ,(nreverse indexes))
+              (:initialized . ,initialized)
+              (:mode . ,major-mode)
+              (:point . ,(point))
+              (:cursor . ,agent-shell-viewport--page-cursor)
+              (:snapshot . ,agent-shell-viewport--compose-snapshot))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell-viewport-previous-page-from-compose-returns-to-remembered-page-test ()
   "Test `agent-shell-viewport-previous-page' returns to the recorded page.
 
 Leaving the compose page must land back where the user was reading, not
-always on the newest interaction.  `agent-shell-viewport-view-last' and
-`agent-shell-viewport-next-page' are stubbed to a tiny current-page state
-machine, since driving the real comint/shell-maker narrowing they use
-needs a live process -- see `agent-shell-viewport-tests--make-shell-buffer'."
-  (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
-                       '(("only question" . "only answer"))))
-        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
-        (current 3)
-        (viewed-last nil)
-        (jumps nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (agent-shell-viewport-edit-mode)))
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
-                       (lambda (&rest _) shell-buffer))
-                      ((symbol-function 'agent-shell-viewport--position)
-                       (lambda (&rest _) `((:current . ,current) (:total . 3))))
-                      ((symbol-function 'agent-shell-viewport-view-last)
-                       (lambda () (setq viewed-last t current 3)))
-                      ((symbol-function 'agent-shell-viewport-next-page)
-                       (lambda (&rest args)
-                         (should (plist-get args :backwards))
-                         (push (plist-get args :n) jumps)
-                         (setq current (- current (plist-get args :n)))))
-                      ((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (setq agent-shell-viewport--page-cursor '((:index . 2) (:point . 1)))
-              (insert "my draft")
-              (agent-shell-viewport-previous-page)
-              (should viewed-last)
-              ;; One jump, not a step per page.
-              (should (equal jumps '(1)))
-              (should (equal current 2))
-              (should (equal agent-shell-viewport--compose-snapshot
-                             '((:content . "my draft") (:location . 9)))))))
-      (kill-buffer viewport-buffer)
-      (kill-buffer shell-buffer))))
+always on the newest interaction, and must render only that page rather
+than walking back from the newest one."
+  (let ((result (agent-shell-viewport-tests--leave-compose
+                 '((:index . 2) (:point . 5))
+                 #'agent-shell-viewport-previous-page)))
+    (should (equal (map-elt result :indexes) '(2)))
+    (should (equal (plist-get (map-elt result :initialized) :prompt) "page 2"))
+    (should (eq (map-elt result :mode) 'agent-shell-viewport-view-mode))
+    (should (equal (map-elt result :point) 5))
+    (should (equal (map-elt result :cursor) '((:index . 2) (:point . 5))))
+    (should (equal (map-elt result :snapshot)
+                   '((:content . "my draft") (:location . 9))))))
 
 (ert-deftest agent-shell-viewport-previous-page-from-compose-jumps-n-pages-test ()
   "Test a prefix argument from compose steps back from the recorded page.
 
 Returning to the recorded page is the first step, so N=2 from compose
-shows the page before it -- the same as returning and pressing back
-once.  A negative N has no page after compose to go to."
-  (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
-                       '(("only question" . "only answer"))))
-        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
-        (current 3)
-        (jumps nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (agent-shell-viewport-edit-mode)))
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
-                       (lambda (&rest _) shell-buffer))
-                      ((symbol-function 'agent-shell-viewport--position)
-                       (lambda (&rest _) `((:current . ,current) (:total . 3))))
-                      ((symbol-function 'agent-shell-viewport-view-last)
-                       (lambda () (setq current 3)))
-                      ((symbol-function 'agent-shell-viewport-next-page)
-                       (lambda (&rest args)
-                         (push (plist-get args :n) jumps)
-                         (setq current (- current (plist-get args :n)))))
-                      ((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (setq agent-shell-viewport--page-cursor '((:index . 2) (:point . 1)))
-              (insert "my draft")
-              (should-error (agent-shell-viewport-previous-page -1)
-                            :type 'user-error)
-              (should-not jumps)
-              (let ((current-prefix-arg 2))
-                (call-interactively #'agent-shell-viewport-previous-page))
-              (should (equal jumps '(2)))
-              (should (equal current 1)))))
-      (kill-buffer viewport-buffer)
-      (kill-buffer shell-buffer))))
+shows the page before it -- the same as returning and pressing back once."
+  (let ((result (agent-shell-viewport-tests--leave-compose
+                 '((:index . 2) (:point . 5))
+                 (lambda ()
+                   (let ((current-prefix-arg 2))
+                     (call-interactively #'agent-shell-viewport-previous-page))))))
+    (should (equal (map-elt result :indexes) '(1)))
+    (should (equal (map-elt result :point) 1))
+    (should (equal (map-elt result :cursor) '((:index . 1) (:point . 1)))))
+  (let ((result (agent-shell-viewport-tests--leave-compose
+                 '((:index . 2) (:point . 5))
+                 (lambda () (agent-shell-viewport-previous-page 5)))))
+    (should (equal (map-elt result :indexes) '(1)))))
 
 (ert-deftest agent-shell-viewport-previous-page-from-compose-falls-back-to-last-page-test ()
   "Test `agent-shell-viewport-previous-page' goes to the newest page absent a cursor."
-  (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
-                       '(("only question" . "only answer"))))
-        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
-        (viewed-last nil)
-        (backward-steps 0))
-    (unwind-protect
-        (progn
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (agent-shell-viewport-edit-mode)))
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
-                       (lambda (&rest _) shell-buffer))
-                      ((symbol-function 'agent-shell-viewport-view-last)
-                       (lambda () (setq viewed-last t)))
-                      ((symbol-function 'agent-shell-viewport-next-page)
-                       (lambda (&rest _) (setq backward-steps (1+ backward-steps))))
-                      ((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (should-not agent-shell-viewport--page-cursor)
-              (agent-shell-viewport-previous-page)
-              (should viewed-last)
-              (should (equal backward-steps 0)))))
-      (kill-buffer viewport-buffer)
-      (kill-buffer shell-buffer))))
+  (let ((result (agent-shell-viewport-tests--leave-compose
+                 nil #'agent-shell-viewport-previous-page)))
+    (should (equal (map-elt result :indexes) '(3)))
+    (should (equal (map-elt result :point) 1))
+    (should (eq (map-elt result :mode) 'agent-shell-viewport-view-mode))))
+
+(ert-deftest agent-shell-viewport-previous-page-from-compose-refuses-forward-test ()
+  "Test a negative N from compose errors: there is no page after compose."
+  (let ((result (agent-shell-viewport-tests--leave-compose
+                 '((:index . 2) (:point . 5))
+                 (lambda ()
+                   (should-error (agent-shell-viewport-previous-page -1)
+                                 :type 'user-error)))))
+    (should-not (map-elt result :indexes))
+    (should (eq (map-elt result :mode) 'agent-shell-viewport-edit-mode))))
 
 (ert-deftest agent-shell-goto-last-interaction-past-steered-prompt-test ()
-  "Test `agent-shell-goto-last-interaction' lands on the newest page.
+  "Test `agent-shell-goto-last-interaction' lands on the newest turn's prompt.
 
-A steered prompt is rendered by the client rather than submitted through
-comint, so `comint-last-input-start' still marks the interaction it
-steered.  Going by that marker opens page 2 of 3, and leaving the compose
-page then returns there instead of to the newest page."
+A steered prompt is an exchange of its own to the shell but part of the
+turn it joined to the viewport (see `agent-shell--turns'), so the newest
+page starts at the prompt the user submitted, not at the steer.  Landing
+on the steer instead would have `agent-shell-interaction-at-point' read
+that same turn, but leave the shell's point where paging reads it as the
+newest exchange rather than the newest turn."
   (let ((shell-buffer (agent-shell-viewport-tests--make-shell-buffer
                        '(("first" . "one")
                          ("second" . "two")
-                         ("[steer] third" . "three")))))
+                         ("[steer] third" . "three"))))
+        second-start)
     (unwind-protect
         (with-current-buffer shell-buffer
-          (setq comint-last-input-start
-                (copy-marker (agent-shell--prompt-begin-position-at-index 2)))
+          (goto-char (point-min))
+          (search-forward "Claude> second")
+          (setq second-start (match-beginning 0))
+          (search-forward "Claude> [steer] third")
+          (put-text-property (match-beginning 0) (+ (match-beginning 0) (length "Claude> "))
+                             'agent-shell-steered-prompt t)
+          (setq comint-last-input-start (copy-marker second-start))
+          (goto-char (point-max))
           (cl-letf (((symbol-function 'agent-shell--shell-buffer)
                      (lambda (&rest _) shell-buffer)))
             (agent-shell-goto-last-interaction))
-          (should (equal (point)
-                         (agent-shell--prompt-begin-position-at-index 3)))
+          (should (equal (point) second-start))
+          (should (equal (agent-shell--turn-position)
+                         '((:current . 2) (:total . 2))))
+          ;; The shell itself still counts the steer.
           (should (equal (shell-maker-history-position)
-                         '((:current . 3) (:total . 3)))))
+                         '((:current . 2) (:total . 3)))))
       (kill-buffer shell-buffer))))
 
 (ert-deftest agent-shell-viewport-previous-page-from-compose-requires-history-test ()
@@ -8580,13 +8788,8 @@ of the restore."
         (should session-init-called)
         (should-not (map-elt agent-shell--state :pending-restore))))))
 
-(ert-deftest agent-shell-viewport-next-page-navigates-from-current-prompt-begin-test ()
-  "Test `agent-shell-viewport-next-page' navigates from the current prompt.
-
-When the shell point sits mid-interaction (e.g. after switching to the
-viewport without repositioning), navigation must start from the current
-interaction's prompt begin, otherwise a backward step lands on the
-current interaction instead of the previous one."
+(ert-deftest agent-shell-viewport-next-page-navigates-by-history-index-test ()
+  "Test backward paging selects the preceding real prompt by history index."
   (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
         (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
         (navigated-from nil)
@@ -8594,10 +8797,11 @@ current interaction instead of the previous one."
     (unwind-protect
         (progn
           (with-current-buffer shell-buffer
-            (insert "line one\nprompt two line\nresponse line three\nmore content")
-            (goto-char (point-min))
-            (forward-line 1)
+            (insert "line one\n")
             (setq prompt-begin (point))
+            (insert (propertize "prompt two line"
+                                'font-lock-face 'comint-highlight-prompt)
+                    "\nresponse line three\nmore content")
             ;; Point sits mid/after the interaction, not at the prompt begin.
             (goto-char (point-max)))
           (with-current-buffer viewport-buffer
@@ -8611,14 +8815,13 @@ current interaction instead of the previous one."
                        (lambda (&rest _) shell-buffer))
                       ((symbol-function 'agent-shell-viewport--position)
                        (lambda (&rest _) '((:current . 2) (:total . 2))))
-                      ((symbol-function 'shell-maker--prompt-begin-position)
-                       (lambda () prompt-begin))
-                      ((symbol-function 'comint-previous-prompt)
-                       (lambda (&rest _) (forward-line -1)))
-                      ((symbol-function 'shell-maker-next-command-and-response)
-                       (lambda (_backwards &rest _)
-                         (setq navigated-from (point))
-                         '("prompt two" . "response")))
+                      ((symbol-function 'agent-shell--turn-at-index)
+                       (lambda (index)
+                         (should (equal index 1))
+                         (setq navigated-from prompt-begin)
+                         (list (cons :prompt "previous prompt")
+                               (cons :response "previous response")
+                               (cons :position prompt-begin))))
                       ((symbol-function 'agent-shell-viewport--initialize)
                        (lambda (&rest _) nil))
                       ((symbol-function 'agent-shell-viewport--update-header)
@@ -8627,209 +8830,6 @@ current interaction instead of the previous one."
               (should (equal navigated-from prompt-begin)))))
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
-
-(cl-defun agent-shell-viewport-tests--with-page-steps
-    (&key entries position snapshot body)
-  "Run BODY in a view-mode viewport that can step through ENTRIES.
-Each step hands out the next of ENTRIES, a list of (prompt . response),
-and returns nil once they run out, the way
-`shell-maker-next-command-and-response' does at the end of history.
-POSITION is the stubbed `agent-shell-viewport--position' alist, and
-SNAPSHOT the compose snapshot parked before BODY runs.  Returns an alist
-of :steps (how many steps were taken), :directions (the BACKWARDS
-argument each step saw), :initialized (the keyword plist passed to
-`agent-shell-viewport--initialize'), :entered-edit (whether the compose
-page was opened) and :snapshot-after (the snapshot left behind)."
-  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
-        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
-        (remaining entries)
-        (directions nil)
-        (steps 0)
-        (initialized nil)
-        (entered-edit nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer shell-buffer
-            (insert "page one\npage two\npage three\npage four\n")
-            ;; Mid-buffer, so the stubbed comint prompt motion below has
-            ;; somewhere to move in either direction.
-            (goto-char (point-min))
-            (forward-line 2))
-          (with-current-buffer viewport-buffer
-            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (agent-shell-viewport-view-mode)))
-          (with-current-buffer viewport-buffer
-            (setq-local agent-shell-viewport--compose-snapshot snapshot)
-            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
-                       (lambda (&rest _) nil))
-                      ((symbol-function 'agent-shell-viewport--shell-buffer)
-                       (lambda (&rest _) shell-buffer))
-                      ((symbol-function 'agent-shell-viewport--position)
-                       (lambda (&rest _)
-                         (or position '((:current . 2) (:total . 4)))))
-                      ((symbol-function 'shell-maker--prompt-begin-position)
-                       (lambda () (line-beginning-position)))
-                      ((symbol-function 'comint-next-prompt)
-                       (lambda (&rest _) (forward-line 1)))
-                      ((symbol-function 'comint-previous-prompt)
-                       (lambda (&rest _) (forward-line -1)))
-                      ((symbol-function 'shell-maker-next-command-and-response)
-                       (lambda (step-backwards &rest _)
-                         (push step-backwards directions)
-                         (when remaining
-                           (setq steps (1+ steps))
-                           (pop remaining))))
-                      ((symbol-function 'agent-shell-viewport-edit-mode)
-                       (lambda ()
-                         (setq entered-edit t)
-                         ;; Real edit mode makes the buffer writable, which
-                         ;; the snapshot restore below relies on.
-                         (setq-local buffer-read-only nil)))
-                      ((symbol-function 'agent-shell-viewport--initialize)
-                       (lambda (&rest args) (setq initialized args)))
-                      ((symbol-function 'agent-shell-viewport--update-header)
-                       (lambda () nil)))
-              (funcall body)
-              `((:steps . ,steps)
-                (:directions . ,(nreverse directions))
-                (:initialized . ,initialized)
-                (:entered-edit . ,entered-edit)
-                (:snapshot-after . ,agent-shell-viewport--compose-snapshot)))))
-      (kill-buffer viewport-buffer)
-      (kill-buffer shell-buffer))))
-
-(ert-deftest agent-shell-viewport-next-page-jumps-n-pages-test ()
-  "Test `agent-shell-viewport-next-page' moves N interactions.
-
-N=2 takes two forward steps and shows the interaction reached last, not
-the one after a single step."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :body (lambda () (agent-shell-viewport-next-page :n 2)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :directions) '(nil nil)))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page four" :response "four")))))
-
-(ert-deftest agent-shell-viewport-previous-page-jumps-n-pages-test ()
-  "Test `agent-shell-viewport-previous-page' moves N interactions back.
-
-N=2 takes two backward steps.  A numeric prefix argument supplies the
-same N."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page two" . "two") ("page one" . "one"))
-                 :body (lambda () (agent-shell-viewport-previous-page 2)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :directions) '(t t)))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page one" :response "one"))))
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page two" . "two") ("page one" . "one"))
-                 :body (lambda ()
-                         (let ((current-prefix-arg 2))
-                           (call-interactively
-                            #'agent-shell-viewport-previous-page))))))
-    (should (equal (map-elt result :steps) 2))))
-
-(ert-deftest agent-shell-viewport-next-page-without-n-moves-one-page-test ()
-  "Test paging with no prefix argument still moves a single interaction."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :body (lambda () (agent-shell-viewport-next-page)))))
-    (should (equal (map-elt result :steps) 1))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page three" :response "three")))))
-
-(ert-deftest agent-shell-viewport-next-page-n-clamps-to-last-page-test ()
-  "Test a prefix jump running past the newest interaction stops on it.
-
-From page 2 of 4, C-u 3 has no fifth page, so it shows page 4 and leaves
-the parked draft alone -- an overshooting count must not land in it."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :snapshot '((:content . "draft") (:location . 1))
-                 :body (lambda ()
-                         (agent-shell-viewport-next-page :n 3)
-                         (should (equal (map-elt agent-shell-viewport--page-cursor
-                                                 :index)
-                                        4))))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page four" :response "four")))
-    (should-not (map-elt result :entered-edit))
-    (should (map-elt result :snapshot-after))))
-
-(ert-deftest agent-shell-viewport-next-page-n-from-last-page-errors-test ()
-  "Test a prefix jump from the newest interaction stays put.
-
-Already being on the last page, any N is refused the way a plain step
-is, and the parked draft stays parked."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three"))
-                 :position '((:current . 4) (:total . 4))
-                 :snapshot '((:content . "draft") (:location . 1))
-                 :body (lambda ()
-                         (should-error (agent-shell-viewport-next-page :n 3)
-                                       :type 'user-error)))))
-    (should (equal (map-elt result :steps) 0))
-    (should-not (map-elt result :entered-edit))
-    (should (map-elt result :snapshot-after))))
-
-(ert-deftest agent-shell-viewport-next-item-stays-at-end-of-last-page-test ()
-  "Test `agent-shell-viewport-next-item' at the end of the last page stays put.
-
-It falls through to the next page when it runs out of items, which must
-not carry it into compose."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :position '((:current . 4) (:total . 4))
-                 :body (lambda ()
-                         (goto-char (point-max))
-                         (agent-shell-viewport-next-item)
-                         (should (eobp))))))
-    (should (equal (map-elt result :steps) 0))
-    (should-not (map-elt result :entered-edit))))
-
-(ert-deftest agent-shell-viewport-next-page-negative-n-moves-backwards-test ()
-  "Test a negative N reverses `agent-shell-viewport-next-page'.
-
-Emacs motion commands read a negative prefix argument as the same
-motion the other way, so C-u -2 f steps back twice."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page one" . "one") ("page zero" . "zero"))
-                 :body (lambda () (agent-shell-viewport-next-page :n -2)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :directions) '(t t)))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page zero" :response "zero")))))
-
-(ert-deftest agent-shell-viewport-previous-page-negative-n-moves-forwards-test ()
-  "Test a negative N reverses `agent-shell-viewport-previous-page'.
-
-C-u -2 b steps forward twice, mirroring the forward command."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three") ("page four" . "four"))
-                 :body (lambda () (agent-shell-viewport-previous-page -2)))))
-    (should (equal (map-elt result :steps) 2))
-    (should (equal (map-elt result :directions) '(nil nil)))
-    (should (equal (map-elt result :initialized)
-                   '(:prompt "page four" :response "four")))))
-
-(ert-deftest agent-shell-viewport-next-page-zero-n-does-nothing-test ()
-  "Test a zero N leaves the viewport where it is.
-
-Sitting on the newest interaction with a draft parked, C-u 0 f must not
-step, re-render, or consume the snapshot the way a plain step would."
-  (let ((result (agent-shell-viewport-tests--with-page-steps
-                 :entries '(("page three" . "three"))
-                 :position '((:current . 4) (:total . 4))
-                 :snapshot '((:content . "draft") (:location . 1))
-                 :body (lambda () (agent-shell-viewport-next-page :n 0)))))
-    (should (equal (map-elt result :steps) 0))
-    (should-not (map-elt result :initialized))
-    (should-not (map-elt result :entered-edit))
-    (should (equal (map-elt result :snapshot-after)
-                   '((:content . "draft") (:location . 1))))))
 
 (ert-deftest agent-shell-viewport-initialize-rerenders-header-position-test ()
   "Test `agent-shell-viewport--initialize' re-renders the header position.
@@ -8849,7 +8849,7 @@ interaction (e.g. \"1/2\" after switching to the latest interaction)."
           (setq agent-shell-viewport--position-cache '((:current . 1) (:total . 2)))
           (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
                      (lambda (&rest _) shell-buffer))
-                    ((symbol-function 'shell-maker-history-position)
+                    ((symbol-function 'agent-shell--turn-position)
                      (lambda () '((:current . 2) (:total . 2))))
                     ((symbol-function 'agent-shell-viewport--update-header)
                      (lambda ()
@@ -9387,34 +9387,45 @@ button, so \"e\" edits while point sits on the Remove button."
         (kill-buffer vp)))))
 
 (ert-deftest agent-shell-viewport-compose-send-edit-replaces-test ()
-  "Test compose-send replaces the pending request when editing, not enqueue."
-  (let ((shell-buffer (generate-new-buffer " *test-shell*"))
-        replaced queued)
-    (unwind-protect
-        (with-temp-buffer
-          (insert "b-edited")
-          (setq agent-shell-viewport--edit-pending-index 1
-                agent-shell-viewport--edit-pending-prompt "b")
-          (cl-letf (((symbol-function 'derived-mode-p)
-                     (lambda (&rest _) t))
-                    ((symbol-function 'agent-shell-viewport--shell-buffer)
-                     (lambda (&rest _) shell-buffer))
-                    ((symbol-function 'agent-shell--prompt-queue-replace)
-                     (lambda (&rest args) (setq replaced args)))
-                    ((symbol-function 'agent-shell-prompt-queue)
-                     (lambda (&rest _) (setq queued t)))
-                    ((symbol-function 'agent-shell-viewport--busy-p)
-                     (lambda (&rest _) t))
-                    ((symbol-function 'kill-buffer) #'ignore)
-                    ((symbol-function 'pop-to-buffer) #'ignore))
-            (agent-shell-viewport-compose-send-and-kill)
-            (should (equal (plist-get replaced :index) 1))
-            (should (equal (plist-get replaced :expected) "b"))
-            (should (equal (plist-get replaced :prompt) "b-edited"))
-            (should-not queued)
-            (should-not agent-shell-viewport--edit-pending-index)
-            (should-not agent-shell-viewport--edit-pending-prompt)))
-      (kill-buffer shell-buffer))))
+  "Test every compose send path replaces the pending prompt being edited.
+
+Sending the edit as a new prompt instead would leave the original queued
+as well, so both versions would run."
+  (dolist (send '(agent-shell-viewport-compose-send-and-kill
+                  agent-shell-viewport--compose-deliver
+                  agent-shell-viewport-compose-send-and-dismiss))
+    (let ((shell-buffer (generate-new-buffer " *test-shell*"))
+          replaced sent)
+      (unwind-protect
+          (with-temp-buffer
+            (insert "b-edited")
+            (setq agent-shell-viewport--edit-pending-index 1
+                  agent-shell-viewport--edit-pending-prompt "b")
+            (cl-letf (((symbol-function 'derived-mode-p)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell--prompt-queue-replace)
+                       (lambda (&rest args) (setq replaced args)))
+                      ((symbol-function 'agent-shell--prompt-send)
+                       (lambda (&rest _) (setq sent t)))
+                      ((symbol-function 'agent-shell--insert-to-shell-buffer)
+                       (lambda (&rest _) (setq sent t)))
+                      ((symbol-function 'agent-shell-viewport--hold-p)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell-viewport--initialize) #'ignore)
+                      ((symbol-function 'agent-shell-viewport--dismiss) #'ignore)
+                      ((symbol-function 'kill-buffer) #'ignore)
+                      ((symbol-function 'pop-to-buffer) #'ignore))
+              (funcall send)
+              (should (equal (list send (plist-get replaced :index)
+                                   (plist-get replaced :expected)
+                                   (plist-get replaced :prompt))
+                             (list send 1 "b" "b-edited")))
+              (should-not sent)
+              (should-not agent-shell-viewport--edit-pending-index)
+              (should-not agent-shell-viewport--edit-pending-prompt)))
+        (kill-buffer shell-buffer)))))
 
 ;;; Tests for agent-shell--activity-group-id
 
@@ -10389,6 +10400,47 @@ prompt the user was typing into while the agent started."
         (should-error (agent-shell-interrupt t) :type 'user-error)
         (should-not shut-down)))))
 
+(ert-deftest agent-shell-interrupt-releases-a-detached-turn-hold-test ()
+  "Interrupting cancels a detached turn, so its queue hold goes too.
+
+The hold exists only because that turn runs with the shell looking idle.
+Left in place after the cancel, every later plain send would queue
+without notice until a manual resume."
+  (dolist (case '((detached-turn nil)
+                  ;; A steer in flight settles the pause itself.
+                  (steering steering)))
+    (with-temp-buffer
+      (setq major-mode 'agent-shell-mode)
+      (setq-local agent-shell--state (agent-shell--make-state :buffer (current-buffer)))
+      (map-put! agent-shell--state :session (list (cons :id "sess-1")))
+      (map-put! agent-shell--state :prompt-queue-paused (nth 0 case))
+      (cl-letf (((symbol-function 'acp-send-notification) #'ignore)
+                ((symbol-function 'agent-shell-elicitation--cancel-pending) #'ignore))
+        (agent-shell-interrupt t))
+      (should (eq (map-elt agent-shell--state :prompt-queue-paused) (nth 1 case))))))
+
+(ert-deftest agent-shell-viewport-interrupt-reaches-a-detached-turn-test ()
+  "The viewport interrupts a detached turn though the shell is not busy."
+  (let ((shell-buffer (generate-new-buffer " *test-shell*"))
+        interrupted)
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq-local agent-shell--state
+                        (list (cons :prompt-queue-paused 'detached-turn))))
+          (with-temp-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--ensure-buffer) #'ignore)
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--busy-p) #'ignore)
+                      ((symbol-function 'agent-shell-interrupt-confirmed-p)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell-interrupt)
+                       (lambda (&rest _) (setq interrupted t))))
+              (ignore-errors (agent-shell-viewport-interrupt))))
+          (should interrupted))
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell-quote-region-quotes-into-live-prompt-test ()
   "Quoting a region mid-turn goes to the prompt, not the minibuffer.
 
@@ -10542,6 +10594,63 @@ is left as it was."
                       transcript))))
    :busy t))
 
+(ert-deftest agent-shell-quote-region-without-prompt-follows-send-setting-test ()
+  "With no prompt to quote into, the quote is sent the way a prompt is.
+
+It goes through `agent-shell--prompt-send' with no disposition, so a busy
+shell steers or queues as `agent-shell-busy-submit-default-function'
+says, rather than always queueing."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (let (sent queued-directly)
+      (cl-letf (((symbol-function 'agent-shell--prompt-queue-read)
+                 (lambda (&rest args) (plist-get args :initial)))
+                ((symbol-function 'agent-shell--prompt-send)
+                 (cl-function
+                  (lambda (&key prompt disposition &allow-other-keys)
+                    (setq sent (list prompt disposition)))))
+                ((symbol-function 'agent-shell-prompt-queue)
+                 (lambda (&rest _) (setq queued-directly t)))
+                ((symbol-function 'agent-shell--can-insert-into-prompt-p) #'ignore)
+                ((symbol-function 'agent-shell--get-region)
+                 (lambda (&rest _) '((:content . "picked lines"))))
+                ((symbol-function 'agent-shell--typing-at-prompt-p) #'ignore)
+                ((symbol-function 'shell-maker-point-at-last-prompt-p) #'ignore)
+                ((symbol-function 'region-active-p) (lambda () t)))
+        (agent-shell-quote-region))
+      (should-not queued-directly)
+      (should (equal sent (list (concat "\n\n" (agent-shell--block-quote "picked lines") "\n\n")
+                                nil))))))
+
+(ert-deftest agent-shell-insert-shell-command-output-without-prompt-follows-send-setting-test ()
+  "With no prompt to insert into, command output is sent the way a prompt is."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (let ((shell-buffer (current-buffer))
+          sent queued-directly)
+      (cl-letf (((symbol-function 'agent-shell--prompt-queue-read)
+                 (lambda (&rest args) (plist-get args :initial)))
+                ((symbol-function 'agent-shell--prompt-send)
+                 (cl-function
+                  (lambda (&key prompt disposition &allow-other-keys)
+                    (setq sent (list prompt disposition)))))
+                ((symbol-function 'agent-shell-prompt-queue)
+                 (lambda (&rest _) (setq queued-directly t)))
+                ((symbol-function 'agent-shell--can-insert-into-prompt-p) #'ignore)
+                ((symbol-function 'read-string) (lambda (&rest _) "echo hello"))
+                ((symbol-function 'agent-shell--current-shell)
+                 (lambda (&rest _) shell-buffer))
+                ((symbol-function 'agent-shell--build-command-for-execution)
+                 #'identity)
+                ((symbol-function 'agent-shell--display-buffer) #'ignore))
+        (agent-shell-insert-shell-command-output)
+        (with-timeout (5 (ert-fail "Command output never arrived"))
+          (while (not (or sent queued-directly))
+            (accept-process-output nil 0.05))))
+      (should-not queued-directly)
+      (should (string-match-p "```shell\n\\$ echo hello\n\nhello" (car sent)))
+      (should-not (cadr sent)))))
+
 (ert-deftest agent-shell-insert-shell-command-output-into-viewport-test ()
   "Command output run from a viewport is appended to its compose buffer.
 
@@ -10659,6 +10768,30 @@ user's own typing rather than a delete and re-insert."
                       :cleared (string-suffix-p "Claude> " (buffer-string)))))
             :busy t)
            '(:handed-on "send me" :cleared t))))
+
+(ert-deftest agent-shell-submit-does-not-fire-into-a-paused-queue-test ()
+  "Submitting while the queue is paused hands the text on rather than sending it.
+
+A steer answered with `startedNewTurn' leaves a turn running that no
+`session/prompt' owns, so `shell-maker-busy' reports nothing while the
+agent works.  Gating on that alone would call `shell-maker-submit' and
+fire a prompt straight at a working agent, which is exactly what the
+pause exists to stop."
+  (should (equal
+           (agent-shell-tests--with-persistent-prompt-shell
+            (lambda ()
+              (insert "typed while paused")
+              (let (handed-on submitted)
+                (cl-letf (((symbol-function 'agent-shell--prompt-queue-paused-p)
+                           (lambda (&rest _) 'detached-turn))
+                          ((symbol-function 'shell-maker-submit)
+                           (lambda (&rest _) (setq submitted t))))
+                  (let ((agent-shell-busy-submit-default-function
+                         (lambda (prompt) (setq handed-on prompt))))
+                    (agent-shell-submit)))
+                (list :handed-on handed-on :submitted submitted)))
+            :busy nil)
+           '(:handed-on "typed while paused" :submitted nil))))
 
 (ert-deftest agent-shell--live-input-prompt-p-zero-length-test ()
   "A collapsed prompt span is not a prompt.
@@ -11906,6 +12039,55 @@ refused, leaving the text recoverable from `minibuffer-history' alone."
                      (user-error (error-message-string error)))
                    "This agent does not support steering"))))
 
+(ert-deftest agent-shell-prompt-steer-confirms-a-blocked-shell-before-reading-test ()
+  "The blocked-shell question is asked before the prompt is composed.
+
+Same reason as the capability guard above: refusing after the prompt is
+typed leaves the text recoverable from `minibuffer-history' alone."
+  (let ((asked-before-read nil)
+        (read-called nil))
+    (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-steering-supported-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-status) (lambda (&rest _) 'blocked))
+              ((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (setq asked-before-read (not read-called)) nil))
+              ((symbol-function 'agent-shell--prompt-queue-read)
+               (lambda (&rest _) (setq read-called t) "prompt")))
+      (should (equal (condition-case error
+                         (agent-shell-prompt-steer)
+                       (user-error (error-message-string error)))
+                     "Steering cancelled"))
+      (should asked-before-read)
+      (should-not read-called))))
+
+(ert-deftest agent-shell-prompt-steer-asks-a-blocked-shell-only-once-test ()
+  "Confirming before the read must not be re-asked by the send.
+
+The command answers the question, so `agent-shell--prompt-steer' is told
+it is already confirmed; without that the user is asked twice for one
+steer."
+  (let ((asked 0))
+    (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-steering-supported-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-status) (lambda (&rest _) 'blocked))
+              ((symbol-function 'agent-shell--prompt-queue-migrate) #'ignore)
+              ((symbol-function 'agent-shell--prompt-queue-paused-p) #'ignore)
+              ((symbol-function 'agent-shell--state) (lambda (&rest _) nil))
+              ((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (setq asked (1+ asked)) t))
+              ((symbol-function 'agent-shell--prompt-queue-read)
+               (lambda (&rest _) "just the filenames"))
+              ((symbol-function 'agent-shell-experimental--send-steering)
+               (lambda (&rest _) 'steered)))
+      (should (eq (agent-shell-prompt-steer) 'steered))
+      (should (equal asked 1)))))
+
 (cl-defun agent-shell-tests--steer-outcome (&key outcome busy request-failed)
   "Steer a prompt, answer with OUTCOME, and return what became of it.
 
@@ -12009,6 +12191,9 @@ non-nil when point came back to where the draft was being typed."
          (buffer (generate-new-buffer " *agent-shell-steer-render-test*"))
          (fake-process (start-process "fake-agent" buffer "cat")))
     (set-process-query-on-exit-flag fake-process nil)
+    ;; The default sentinel reports the exit into the buffer, whose comint
+    ;; output is read-only, and the failing sentinel aborts the whole run.
+    (set-process-sentinel fake-process #'ignore)
     (unwind-protect
         (with-current-buffer buffer
           (comint-mode)
@@ -12017,6 +12202,8 @@ non-nil when point came back to where the draft was being typed."
                              (cons :chunked-group-count 0)
                              (cons :last-entry-type "agent_message_chunk")
                              (cons :event-subscriptions nil)
+                             (cons :activity-group-count 0)
+                             (cons :tool-calls nil)
                              (cons :agent-config '((:shell-prompt . "Claude> "))))))
             ;; Rendering a steered prompt emits `input-submitted', which is
             ;; dispatched through the shell buffer's own state, so stand
@@ -12063,11 +12250,11 @@ hides that."
   (dolist (idle '(nil t))
     (let ((rendered (agent-shell-tests--render-steered-prompt "just the filenames"
                                                               :idle idle)))
-    (should (equal (map-elt rendered :text)
-                   (concat "Claude> list the files<shell-maker-end-of-prompt>\n"
-                           "Listing \n\n"
-                           "Claude> [steer] just the filenames"
-                           "<shell-maker-end-of-prompt>\n"
+      (should (equal (map-elt rendered :text)
+                     (concat "Claude> list the files<shell-maker-end-of-prompt>\n"
+                             "Listing \n\n"
+                             "Claude> [steer] just the filenames"
+                             "<shell-maker-end-of-prompt>\n"
                              "Claude> ")))
       ;; Not "user_message_chunk": that asks the notification dispatch to
       ;; insert an end-of-prompt marker of its own on the next update.
@@ -12082,6 +12269,364 @@ hides that."
     (should (eq (get-text-property (string-match "@/tmp/example.png" text)
                                    'display text)
                 'preview))))
+
+(ert-deftest agent-shell-experimental--steered-prompt-is-extractable-test ()
+  "A steered prompt reads as a prompt to `shell-maker--extract-history'.
+
+Extraction finds prompts with `shell-maker--re-search-forward-prompt',
+which requires the literal `comint-highlight-prompt' face via `memq'.
+Inheriting it through `agent-shell-prompt' does not count, so a steer
+faced with `agent-shell-prompt' alone is invisible there: its prompt, its
+response and its raw `<shell-maker-end-of-prompt>' text are all swallowed
+into the preceding interaction's response instead of forming one of their
+own.  Same face list a restored prompt carries for the same reason."
+  (let* (;; Bound on rather than inherited, so this covers the persistent
+         ;; prompt regardless of which way the default points: the shell
+         ;; keeps a prompt at the buffer end for the whole turn, and the
+         ;; steer renders above it.
+         (agent-shell-persistent-prompt-enabled t)
+         (buffer (generate-new-buffer " *agent-shell-steer-extract-test*"))
+         (fake-process (start-process "fake-agent" buffer "cat")))
+    (set-process-query-on-exit-flag fake-process nil)
+    ;; The default sentinel reports the exit into read-only comint output,
+    ;; and the failing sentinel aborts the whole run.
+    (set-process-sentinel fake-process #'ignore)
+    (unwind-protect
+        (with-current-buffer buffer
+          (comint-mode)
+          (setq-local comint-prompt-regexp "Claude> ")
+          (setq-local comint-use-prompt-regexp t)
+          (setq-local shell-maker--config
+                      (make-shell-maker-config
+                       :name "agent"
+                       :prompt "Claude> "
+                       :prompt-regexp "Claude> "))
+          (let ((state (list (cons :buffer (current-buffer))
+                             (cons :chunked-group-count 0)
+                             (cons :last-entry-type "agent_message_chunk")
+                             (cons :event-subscriptions nil)
+                             (cons :agent-config '((:shell-prompt . "Claude> "))))))
+            (setq-local agent-shell--state state)
+            (setq major-mode 'agent-shell-mode)
+            (cl-letf (((symbol-function 'shell-maker--process) (lambda () fake-process))
+                      ((symbol-function 'shell-maker-busy) (lambda (&rest _) t)))
+              ;; The turn so far: a prompt the user submitted, faced the way
+              ;; the shell faces its own, closed by a real marker.
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert (propertize
+                         "Claude> "
+                         'font-lock-face '(agent-shell-prompt comint-highlight-prompt)
+                         'field 'output)
+                        "list the files"))
+              (set-marker (process-mark fake-process) (point-max))
+              (shell-maker-insert-end-of-prompt-marker)
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert "\nListing "))
+              ;; The prompt the shell keeps at the buffer end for the turn.
+              (shell-maker--output-filter fake-process "\nClaude> ")
+              (agent-shell-experimental--render-steered-prompt
+               :state state :prompt "just the filenames")
+              ;; The agent answers the steer, still inside the same turn, so
+              ;; it streams in above that live prompt.
+              (let ((live (and comint-last-prompt (car comint-last-prompt)))
+                    (inhibit-read-only t))
+                (save-excursion
+                  (goto-char (if live (marker-position live) (point-max)))
+                  (insert "a.el b.el\n")))
+              (should (equal (mapcar (lambda (exchange)
+                                       (cons (substring-no-properties (car exchange))
+                                             (substring-no-properties (cdr exchange))))
+                                     (shell-maker--extract-history "Claude> "))
+                             '(("list the files" . "Listing")
+                               ("[steer] just the filenames" . "a.el b.el")))))))
+      (when (process-live-p fake-process)
+        (delete-process fake-process))
+      (kill-buffer buffer))))
+
+(cl-defun agent-shell-tests--steer-with-viewport (&key park-point page)
+  "Land a steer mid-turn with a viewport following the turn.
+
+PARK-POINT leaves the shell's own point inside the interaction being
+steered before the steer lands, which is where a viewport user's shell
+point sits: they left the shell on the interaction they were reading.
+Without it point is at the buffer end, where a prompt submitted through
+comint leaves it.
+
+PAGE, when non-nil, is called with the viewport current once the steer's
+answer has streamed in, standing for the user paging from the page the
+steer landed on; whatever it returns comes back under `:paged'.
+
+The answer to the steer is text followed by a tool call, so the page
+carries a fragment across the seam and not only streamed text.
+
+Returns an alist of the page the viewport showed `:live', the page it
+shows once the shell is re-read (`:refreshed', what a buffer switch
+does), the `:position' the live page reported for its header, and
+`:paged'.  Each page is the viewport's whole text, untrimmed, so seam
+whitespace counts."
+  (let* (;; The shell keeps a prompt at the buffer end for the whole turn
+         ;; and the steer renders above it.  Bound on rather than
+         ;; inherited, so this holds whichever way the default points.
+         (agent-shell-persistent-prompt-enabled t)
+         (shell-buffer (generate-new-buffer " *agent-shell-steer-viewport-test*"))
+         (viewport-buffer (get-buffer-create
+                           (concat (buffer-name shell-buffer)
+                                   agent-shell-viewport--suffix)))
+         (fake-process (start-process "fake-agent" shell-buffer "cat"))
+         (result nil))
+    (set-process-query-on-exit-flag fake-process nil)
+    ;; The default sentinel reports the exit into read-only comint output,
+    ;; and the failing sentinel aborts the whole run.
+    (set-process-sentinel fake-process #'ignore)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda () nil))
+                  ((symbol-function 'shell-maker--process) (lambda () fake-process))
+                  ((symbol-function 'shell-maker-busy) (lambda (&rest _) t)))
+          (with-current-buffer shell-buffer
+            (comint-mode)
+            (setq-local comint-prompt-regexp "Claude> ")
+            (setq-local shell-maker--config
+                        (make-shell-maker-config
+                         :name "agent"
+                         :prompt "Claude> "
+                         :prompt-regexp "Claude> "))
+            (setq major-mode 'agent-shell-mode)
+            (let ((state (list (cons :buffer shell-buffer)
+                               (cons :chunked-group-count 0)
+                               (cons :request-count 1)
+                               (cons :last-entry-type "agent_message_chunk")
+                               (cons :event-subscriptions nil)
+                               (cons :agent-config '((:shell-prompt . "Claude> "))))))
+              (setq-local agent-shell--state state)
+              ;; The prompt the user submitted, faced the way the shell faces
+              ;; its own, closed by a real marker.
+              (let ((inhibit-read-only t))
+                (goto-char (point-max))
+                (insert (propertize
+                         "Claude> "
+                         'font-lock-face '(agent-shell-prompt comint-highlight-prompt)
+                         'field 'output)
+                        "list the files"))
+              (set-marker (process-mark fake-process) (point-max))
+              (shell-maker-insert-end-of-prompt-marker)
+              ;; The viewport, in view mode on that interaction, which is
+              ;; what puts it in the way of the turn's live updates.
+              (with-current-buffer viewport-buffer
+                (agent-shell-viewport-view-mode)
+                (agent-shell-viewport--initialize :prompt "list the files"))
+              ;; The prompt the shell keeps at the buffer end for the turn.
+              (shell-maker--output-filter fake-process "\nClaude> ")
+              ;; The turn answering above it, mirrored into the viewport as
+              ;; it streams.
+              (agent-shell--update-text
+               :state state :block-id "answer" :text "Listing " :create-new t)
+              (when park-point
+                (goto-char (point-min))
+                (search-forward "Listing "))
+              (agent-shell-experimental--render-steered-prompt
+               :state state :prompt "just the filenames")
+              ;; The agent answering the steer, still inside the same turn.
+              (agent-shell--update-text
+               :state state :block-id "answer2" :text "a.el b.el" :create-new t)
+              (agent-shell--update-fragment
+               :state state :block-id "tool-1" :label-left "Command"
+               :label-right "ls" :body "a.el\nb.el" :create-new t)
+              (push (cons :position
+                          (with-current-buffer viewport-buffer
+                            agent-shell-viewport--position-cache))
+                    result)
+              (push (cons :live
+                          (with-current-buffer viewport-buffer
+                            (buffer-substring-no-properties (point-min) (point-max))))
+                    result)
+              (when page
+                (push (cons :paged (with-current-buffer viewport-buffer
+                                     (funcall page)))
+                      result))
+              ;; Switching to the shell and back re-reads the interaction at
+              ;; point, which is the steer's now that the turn renders under
+              ;; it.  Point sits in the output the user was reading.
+              (goto-char (point-max))
+              (search-backward "a.el b.el")
+              (push (cons :refreshed
+                          (with-current-buffer viewport-buffer
+                            (agent-shell-viewport-refresh)
+                            (buffer-substring-no-properties (point-min) (point-max))))
+                    result)
+              result)))
+      (when (process-live-p fake-process)
+        (delete-process fake-process))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-experimental--steered-prompt-stays-on-its-turn-test ()
+  "A steer stays on the page of the turn it joined, live and on re-read.
+
+The shell renders the steer as a prompt of its own (see
+`agent-shell-experimental--steered-prompt-is-extractable-test'), but the
+viewport pages by turn (see `agent-shell--turns'): the steer's line and
+what the agent answers to it read on under the prompt that started the
+turn, where the live mirror already put them.  A re-read -- a buffer
+switch, paging -- has to rebuild the same page character for character,
+or what the user was reading changes under them when they switch away
+and back.
+
+Whole buffer text rather than trimmed pieces, so the seam between the
+interrupted answer and the steer's line, and the tool call mirrored after
+it, are held to the same shape both ways."
+  (dolist (park-point '(nil t))
+    (let* ((steered (agent-shell-tests--steer-with-viewport :park-point park-point))
+           (live (map-elt steered :live)))
+      (should (equal live (map-elt steered :refreshed)))
+      (should (string-prefix-p "list the files" live))
+      (should (string-match-p "Listing \n\nClaude> \\[steer\\] just the filenames\n\na\\.el b\\.el" live))
+      (should (string-match-p "Command" live))
+      (should (equal (map-elt steered :position)
+                     '((:current . 1) (:total . 1)))))))
+
+(ert-deftest agent-shell-experimental--steered-prompt-page-is-pageable-test ()
+  "Paging from a steered turn's page sees one page, wherever the shell's point sat.
+
+The paging commands take the current page from the shell's point
+\(`agent-shell-viewport--position' with `:force-refresh'), which a steer
+leaves on the interaction it interrupted.  Since that interaction and the
+steer are one turn, the page is the first and the newest both ways: back
+is refused as the first page, and forward as the last page."
+  (dolist (park-point '(nil t))
+    (let ((paged (map-elt
+                  (agent-shell-tests--steer-with-viewport
+                   :park-point park-point
+                   :page (lambda ()
+                           (list (condition-case err
+                                     (progn (agent-shell-viewport-previous-page) nil)
+                                   (user-error (cadr err)))
+                                 (condition-case err
+                                     (progn (agent-shell-viewport-next-page) nil)
+                                   (user-error (cadr err))))))
+                  :paged)))
+      (should (equal (nth 0 paged) "First page"))
+      (should (equal (nth 1 paged) "Last page")))))
+
+(cl-defun agent-shell-tests--insert-exchange (prompt response &key steered)
+  "Insert an exchange the way the shell renders one, at point.
+
+PROMPT and RESPONSE are its text.  STEERED marks the prompt as one
+steered into a running turn, the way
+`agent-shell-experimental--render-steered-prompt' does."
+  (insert (apply #'propertize "Claude> "
+                 'font-lock-face '(agent-shell-prompt comint-highlight-prompt)
+                 'field 'output
+                 (when steered '(agent-shell-steered-prompt t)))
+          prompt
+          (propertize "<shell-maker-end-of-prompt>" 'shell-maker--marker t)
+          response))
+
+(defmacro agent-shell-tests--with-turns-shell (&rest body)
+  "Run BODY in a bare shell buffer whose prompts `agent-shell--turns' can read."
+  (declare (indent 0) (debug t))
+  `(with-temp-buffer
+     (setq-local comint-prompt-regexp "Claude> ")
+     (setq-local shell-maker--config
+                 (make-shell-maker-config :name "agent" :prompt "Claude> "
+                                          :prompt-regexp "Claude> "))
+     (setq major-mode 'agent-shell-mode)
+     ,@body))
+
+(ert-deftest agent-shell--turns-groups-steers-into-their-turn-test ()
+  "A steered prompt and its answer fold into the turn it joined.
+
+The shell counts the steer as an exchange of its own; a turn keeps the
+submitted prompt, appends the steer's line and answer to the response,
+and records which exchanges it spans so positions can be mapped both
+ways."
+  (agent-shell-tests--with-turns-shell
+    (agent-shell-tests--insert-exchange "list the files" "\n\nListing \n\n")
+    (agent-shell-tests--insert-exchange "[steer] just the filenames" "\n\na.el b.el\n\n"
+                                        :steered t)
+    (agent-shell-tests--insert-exchange "[steer] sorted" "\n\na.el\nb.el\n\n"
+                                        :steered t)
+    (agent-shell-tests--insert-exchange "thanks" "\n\nSure.")
+    (let ((turns (agent-shell--turns)))
+      (should (= 2 (length turns)))
+      (let ((first (nth 0 turns)))
+        (should (equal (substring-no-properties (map-elt first :prompt)) "list the files"))
+        (should (equal (substring-no-properties (map-elt first :response))
+                       (concat "\n\nListing \n\n"
+                               "Claude> [steer] just the filenames\n\na.el b.el\n\n"
+                               "Claude> [steer] sorted\n\na.el\nb.el\n\n")))
+        (should (equal (map-elt first :exchanges) '(1 . 3)))
+        (should (= (map-elt first :position) (point-min))))
+      (let ((second (nth 1 turns)))
+        (should (equal (substring-no-properties (map-elt second :prompt)) "thanks"))
+        (should (equal (substring-no-properties (map-elt second :response)) "\n\nSure."))
+        (should (equal (map-elt second :exchanges) '(4 . 4)))))))
+
+(ert-deftest agent-shell--turns-without-steers-are-the-exchanges-test ()
+  "With nothing steered, turns and exchanges are the same list."
+  (agent-shell-tests--with-turns-shell
+    (agent-shell-tests--insert-exchange "one" "\n\n1\n\n")
+    (agent-shell-tests--insert-exchange "two" "\n\n2")
+    (should (equal (mapcar (lambda (turn)
+                             (cons (substring-no-properties (map-elt turn :prompt))
+                                   (substring-no-properties (map-elt turn :response))))
+                           (agent-shell--turns))
+                   '(("one" . "\n\n1\n\n") ("two" . "\n\n2"))))
+    (should (equal (mapcar (lambda (turn) (map-elt turn :exchanges))
+                           (agent-shell--turns))
+                   '((1 . 1) (2 . 2))))))
+
+(ert-deftest agent-shell--turn-position-counts-turns-test ()
+  "`agent-shell--turn-position' reports the turn point is in, out of all turns.
+
+Point anywhere in a steer's exchange counts as the turn it joined."
+  (agent-shell-tests--with-turns-shell
+    (agent-shell-tests--insert-exchange "list the files" "\n\nListing \n\n")
+    (agent-shell-tests--insert-exchange "[steer] just the filenames" "\n\na.el b.el\n\n"
+                                        :steered t)
+    (agent-shell-tests--insert-exchange "thanks" "\n\nSure.")
+    (goto-char (point-min))
+    (should (equal (agent-shell--turn-position) '((:current . 1) (:total . 2))))
+    (search-forward "a.el b.el")
+    (should (equal (agent-shell--turn-position) '((:current . 1) (:total . 2))))
+    (search-forward "Sure.")
+    (should (equal (agent-shell--turn-position) '((:current . 2) (:total . 2))))))
+
+(ert-deftest agent-shell--turn-spans-copy-no-text-test ()
+  "`agent-shell--turn-spans' finds the turns without copying their text.
+
+Counting turns, as `agent-shell--turn-position' does on every viewport
+page change, must not copy a long shell's whole history."
+  (agent-shell-tests--with-turns-shell
+    (agent-shell-tests--insert-exchange "list the files" "\n\nListing \n\n")
+    (agent-shell-tests--insert-exchange "[steer] just the filenames" "\n\na.el b.el\n\n"
+                                        :steered t)
+    (agent-shell-tests--insert-exchange "thanks" "\n\nSure.")
+    (let ((spans (agent-shell--turn-spans)))
+      (should (equal (mapcar (lambda (span) (map-elt span :exchanges)) spans)
+                     '((1 . 2) (3 . 3))))
+      (should (equal (mapcar (lambda (span) (map-elt span :position)) spans)
+                     (mapcar (lambda (turn) (map-elt turn :position))
+                             (agent-shell--turns))))
+      (dolist (span spans)
+        (should-not (assq :prompt span))
+        (should-not (assq :response span))))))
+
+(ert-deftest agent-shell--turn-at-index-matches-turns-test ()
+  "`agent-shell--turn-at-index' returns the turn `agent-shell--turns' lists."
+  (agent-shell-tests--with-turns-shell
+    (agent-shell-tests--insert-exchange "list the files" "\n\nListing \n\n")
+    (agent-shell-tests--insert-exchange "[steer] just the filenames" "\n\na.el b.el\n\n"
+                                        :steered t)
+    (agent-shell-tests--insert-exchange "thanks" "")
+    (let ((turns (agent-shell--turns)))
+      (should (equal (agent-shell--turn-at-index 1) (nth 0 turns)))
+      (should (equal (agent-shell--turn-at-index 2) (nth 1 turns)))
+      (should-not (map-elt (agent-shell--turn-at-index 2) :response))
+      (should-not (agent-shell--turn-at-index 3))
+      (should-not (agent-shell--turn-at-index 0)))))
 
 (ert-deftest agent-shell-experimental--steered-prompt-emits-input-submitted-test ()
   "A steered prompt announces itself as input the user submitted.
@@ -12120,6 +12665,633 @@ shell, so item navigation finds none of them here."
                ((symbol-function 'agent-shell-next-permission-button) #'ignore)
                ((symbol-function 'agent-shell-previous-permission-button) #'ignore))
        ,@body)))
+
+(cl-defun agent-shell-tests--prompt-send (&key disposition setting steerable
+                                               busy paused)
+  "Run `agent-shell--prompt-send' through its guards and report the path taken.
+
+DISPOSITION is the caller's explicit choice.  SETTING is `steer' or
+`queue', naming which of the two shipped functions
+`agent-shell-busy-submit-default-function' holds.  STEERABLE, BUSY and
+PAUSED are what `agent-shell--prompt-steerable-p', `shell-maker-busy' and
+`agent-shell--prompt-queue-paused-p' report.
+
+Runs the real `agent-shell--busy-submit' and the real
+`agent-shell-busy-submit-steer', so the setting reaches the dispatch the
+way a user's customization does.
+
+Returns `steered' (handed to the running turn, no fallback),
+`steered-or-queued' (handed over, queued if the agent will not take it),
+`queued' or `submitted'."
+  (let ((agent-shell-busy-submit-default-function
+         (pcase setting
+           ('steer #'agent-shell-busy-submit-steer)
+           ('queue #'agent-shell-busy-submit-queue)
+           (_ setting)))
+        taken)
+    (cl-letf (((symbol-function 'agent-shell--prompt-queue-migrate) #'ignore)
+              ((symbol-function 'agent-shell--prompt-steerable-p)
+               (lambda (&rest _) steerable))
+              ((symbol-function 'agent-shell--prompt-steer-confirmed-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) busy))
+              ((symbol-function 'agent-shell--prompt-queue-paused-p)
+               (lambda (&rest _) paused))
+              ((symbol-function 'agent-shell--prompt-steer)
+               (lambda (&rest _) (setq taken 'steered)))
+              ((symbol-function 'agent-shell--prompt-steer-or-queue)
+               (lambda (&rest _) (setq taken 'steered-or-queued)))
+              ((symbol-function 'agent-shell--prompt-queue-enqueue)
+               (lambda (&rest _) (setq taken 'queued)))
+              ((symbol-function 'agent-shell--insert-to-shell-buffer)
+               (lambda (&rest _) (setq taken 'submitted))))
+      (agent-shell--prompt-send :prompt "hi" :disposition disposition))
+    taken))
+
+(ert-deftest agent-shell--prompt-send-dispatch-test ()
+  "Test `agent-shell--prompt-send' picks a path from disposition and setting."
+  ;; An explicit disposition outranks the setting, both ways round, so a
+  ;; binding never depends on how the setting happens to be set.
+  (should (eq (agent-shell-tests--prompt-send
+               :disposition 'steer :setting 'queue :steerable t :busy t)
+              'steered))
+  (should (eq (agent-shell-tests--prompt-send
+               :disposition 'queue :setting 'steer :steerable t :busy t)
+              'queued))
+  ;; Explicit steer does not need the forgiving predicate: it errors from
+  ;; inside rather than quietly queueing.
+  (should (eq (agent-shell-tests--prompt-send
+               :disposition 'steer :setting 'queue :steerable nil :busy t)
+              'steered))
+  ;; Following the setting takes the forgiving path, which queues rather
+  ;; than interrupting when the agent will not take the prompt.
+  (should (eq (agent-shell-tests--prompt-send :setting 'steer :steerable t :busy t)
+              'steered-or-queued))
+  ;; An agent that cannot be steered never reaches the steering path.
+  (should (eq (agent-shell-tests--prompt-send :setting 'steer :steerable nil :busy t)
+              'queued))
+  (should (eq (agent-shell-tests--prompt-send :setting 'queue :steerable t :busy t)
+              'queued))
+  ;; Nothing running and nothing paused: send it.
+  (should (eq (agent-shell-tests--prompt-send :setting 'steer :steerable nil :busy nil)
+              'submitted))
+  ;; A paused queue means an untracked turn is still going even though the
+  ;; shell looks idle, so submitting would fire into a working agent.
+  (should (eq (agent-shell-tests--prompt-send
+               :setting 'steer :steerable nil :busy nil :paused 'detached-turn)
+              'queued)))
+
+(ert-deftest agent-shell--prompt-send-calls-a-custom-busy-function-test ()
+  "A plain send mid-turn runs whatever function the setting holds.
+
+`agent-shell-busy-submit-default-function' takes any function, not only
+the two shipped ones, so the dispatch has to call it rather than test it
+against a known symbol.  Reading it as \"steer or else queue\" would drop
+a custom function's prompt into the queue without ever running it."
+  (let (seen)
+    (let ((agent-shell-busy-submit-default-function
+           (lambda (prompt) (setq seen prompt))))
+      (cl-letf (((symbol-function 'agent-shell--prompt-queue-migrate) #'ignore)
+                ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+                ((symbol-function 'agent-shell--prompt-queue-paused-p)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'agent-shell--prompt-queue-enqueue)
+                 (lambda (&rest _) (setq seen 'queued)))
+                ((symbol-function 'agent-shell--insert-to-shell-buffer)
+                 (lambda (&rest _) (setq seen 'submitted))))
+        (agent-shell--prompt-send :prompt "hi")))
+    (should (equal seen "hi"))))
+
+(ert-deftest agent-shell--busy-submit-refuses-a-blank-prompt-test ()
+  "A blank mid-turn send is refused rather than steered or queued.
+
+Idle, shell-maker absorbs a blank submission.  Mid-turn nothing does, so
+it would go to the agent as an empty steer or sit in the queue."
+  (let ((agent-shell-busy-submit-default-function
+         (lambda (prompt) (error "Routed %S" prompt))))
+    (should (equal (condition-case err
+                       (agent-shell--busy-submit :prompt "  \n")
+                     (user-error (cadr err)))
+                   "Nothing to send"))
+    (should-error (agent-shell--busy-submit :prompt "hi"))))
+
+(ert-deftest agent-shell--prompt-steerable-p-test ()
+  "A plain send can steer wherever `agent-shell-prompt-steer' would.
+
+A shell blocked on a permission answer still has a turn to steer into,
+and so does a detached turn, which runs while the shell looks idle.
+Answering nil there queued the prompt behind a turn the explicit command
+steers into, so the same prompt joined the turn's page one way and opened
+a page of its own the other."
+  (dolist (case '((:busy t :status busy :supported t :paused nil :expect t)
+                  (:busy t :status blocked :supported t :paused nil :expect t)
+                  (:busy nil :status ready :supported t :paused detached-turn :expect t)
+                  (:busy t :status busy :supported nil :paused nil :expect nil)
+                  (:busy nil :status ready :supported t :paused nil :expect nil)
+                  (:busy nil :status ready :supported nil :paused detached-turn :expect nil)))
+    (cl-letf (((symbol-function 'shell-maker-busy)
+               (lambda (&rest _) (plist-get case :busy)))
+              ((symbol-function 'agent-shell-status)
+               (lambda (&rest _) (plist-get case :status)))
+              ((symbol-function 'agent-shell-steering-supported-p)
+               (lambda (&rest _) (plist-get case :supported)))
+              ((symbol-function 'agent-shell--prompt-queue-paused-p)
+               (lambda (&rest _) (plist-get case :paused))))
+      (should (eq (agent-shell--prompt-steerable-p) (plist-get case :expect))))))
+
+(ert-deftest agent-shell-busy-submit-steer-asks-a-blocked-shell-test ()
+  "A plain send into a blocked shell asks, as `agent-shell-prompt-steer' does.
+
+Yes steers.  No queues rather than cancelling, since the user asked to
+send a prompt and the queue is somewhere for it to go."
+  (dolist (case '((t steered-or-queued) (nil queued)))
+    (let (taken asked)
+      (cl-letf (((symbol-function 'agent-shell--prompt-steerable-p)
+                 (lambda (&rest _) t))
+                ((symbol-function 'agent-shell-status)
+                 (lambda (&rest _) 'blocked))
+                ((symbol-function 'y-or-n-p)
+                 (lambda (&rest _) (setq asked t) (car case)))
+                ((symbol-function 'agent-shell--prompt-steer-or-queue)
+                 (lambda (&rest _) (setq taken 'steered-or-queued)))
+                ((symbol-function 'agent-shell--prompt-queue-enqueue)
+                 (lambda (&rest _) (setq taken 'queued))))
+        (agent-shell-busy-submit-steer "hi"))
+      (should asked)
+      (should (eq taken (cadr case))))))
+
+(cl-defun agent-shell-tests--steer-or-queue (&key throws busy)
+  "Run `agent-shell--prompt-steer-or-queue' and report what became of the prompt.
+
+THROWS makes the send signal synchronously, as a dead client does, rather
+than answering with an outcome.  BUSY is what `shell-maker-busy' reports
+once the answer is handled.
+
+Returns an alist of the queued prompt, whether the queue was drained, and
+any error that escaped."
+  (let ((state (list (cons :prompt-queue-paused nil)
+                     (cons :pending-prompts nil)
+                     (cons :session (list (cons :id "sess-1")))))
+        queued drained escaped)
+    (cl-letf (((symbol-function 'agent-shell--state) (lambda (&rest _) state))
+              ((symbol-function 'agent-shell--echo) #'ignore)
+              ((symbol-function 'agent-shell-interrupt) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) busy))
+              ((symbol-function 'agent-shell--expand-truncated-regions)
+               (lambda (text) text))
+              ((symbol-function 'agent-shell--prompt-content-blocks)
+               (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+              ((symbol-function 'agent-shell--prompt-queue-enqueue)
+               (cl-function (lambda (&key prompt &allow-other-keys)
+                              (setq queued prompt)
+                              (map-put! state :pending-prompts (list prompt)))))
+              ((symbol-function 'agent-shell--prompt-queue-process-next)
+               (lambda (&rest _) (setq drained t)))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (if throws
+                     (error "Process not running")
+                   (funcall (plist-get args :on-success)
+                            (list (cons 'outcome "failed")))))))
+      (condition-case error
+          (agent-shell--prompt-steer-or-queue :prompt "steer me")
+        (error (setq escaped (error-message-string error)))))
+    (list (cons :queued queued) (cons :drained drained) (cons :escaped escaped))))
+
+(ert-deftest agent-shell--prompt-steer-that-never-went-out-still-queues-test ()
+  "A send that signals synchronously must not take the prompt with it.
+
+`agent-shell--send-request' can signal before the request leaves: a dead
+client, or `acp-send-request' restarting one that fails to start.  The
+prompt never reached the agent, so a plain send -- which promises the
+prompt is never dropped -- has to fall back to the queue rather than let
+the error escape with the prompt still in it."
+  (let ((outcome (agent-shell-tests--steer-or-queue :throws t :busy t)))
+    (should (equal (map-elt outcome :queued) "steer me"))
+    (should-not (map-elt outcome :escaped))))
+
+(ert-deftest agent-shell--prompt-steer-strict-still-signals-a-failed-send-test ()
+  "Without a fallback the same failure is reported rather than swallowed.
+
+`agent-shell-prompt-steer' passes no ON-DECLINED, so it has nowhere to
+put the prompt and the caller must see why the send failed."
+  (let (escaped)
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda (&rest _) (list (cons :prompt-queue-paused nil)
+                                       (cons :session (list (cons :id "sess-1"))))))
+              ((symbol-function 'agent-shell--expand-truncated-regions)
+               (lambda (text) text))
+              ((symbol-function 'agent-shell--prompt-content-blocks)
+               (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest _) (error "Process not running"))))
+      (condition-case error
+          (agent-shell-experimental--send-steering
+           :state (agent-shell--state) :prompt "steer me")
+        (error (setq escaped (error-message-string error)))))
+    (should (equal escaped "Process not running"))))
+
+(ert-deftest agent-shell--prompt-steer-declined-drains-an-idle-queue-test ()
+  "A prompt queued by a declined steer is sent, not left for a manual resume.
+
+The tracked turn can end while the steer is in flight, where the queue
+hook that would normally drain it saw the pause and did nothing.  By the
+time the decline arrives the shell is idle with nothing else coming, so
+the prompt would sit pending until `agent-shell-prompt-queue-resume'."
+  (let ((outcome (agent-shell-tests--steer-or-queue :busy nil)))
+    (should (equal (map-elt outcome :queued) "steer me"))
+    (should (map-elt outcome :drained)))
+  ;; Still running: the turn's own completion drains the queue, and
+  ;; submitting now would fire a prompt at a working agent.
+  (let ((outcome (agent-shell-tests--steer-or-queue :busy t)))
+    (should (equal (map-elt outcome :queued) "steer me"))
+    (should-not (map-elt outcome :drained))))
+
+(ert-deftest agent-shell--prompt-steer-or-queue-queues-a-declined-steer-test ()
+  "Test the forgiving path keeps a declined prompt instead of interrupting."
+  (let (queued interrupted)
+    (cl-letf (((symbol-function 'agent-shell--state) (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--echo) #'ignore)
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-interrupt)
+               (lambda (&rest _) (setq interrupted t)))
+              ((symbol-function 'agent-shell--prompt-queue-enqueue)
+               (cl-function (lambda (&key prompt &allow-other-keys)
+                              (setq queued prompt))))
+              ((symbol-function 'agent-shell-experimental--send-steering)
+               (cl-function
+                (lambda (&key on-declined &allow-other-keys)
+                  (funcall on-declined "failed" 'declined)))))
+      (agent-shell--prompt-steer-or-queue :prompt "hi"))
+    (should (equal queued "hi"))
+    ;; Unlike `agent-shell-prompt-steer', a plain send has somewhere else to
+    ;; put the prompt, so there is no reason to cancel the running turn.
+    (should-not interrupted)))
+
+(cl-defun agent-shell-tests--steer-pause (&key outcome request-failed paused)
+  "Steer a prompt, answer with OUTCOME, and return the pause left behind.
+
+REQUEST-FAILED answers the request with an error instead.  PAUSED is the
+pause already in place when the steer is sent."
+  (let ((state (list (cons :client nil)
+                     (cons :session (list (cons :id "sess-1")))
+                     (cons :request-count 0)
+                     (cons :last-entry-type nil)
+                     (cons :prompt-queue-paused paused)
+                     (cons :pending-prompts nil))))
+    (cl-letf (((symbol-function 'agent-shell--state) (lambda (&rest _) state))
+              ((symbol-function 'agent-shell--expand-truncated-regions)
+               (lambda (text) text))
+              ((symbol-function 'agent-shell--prompt-content-blocks)
+               (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+              ((symbol-function 'agent-shell-interrupt) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'agent-shell--insert-to-shell-buffer) #'ignore)
+              ((symbol-function 'agent-shell-experimental--render-steered-prompt)
+               #'ignore)
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 ;; The pause has to be in place before any answer arrives,
+                 ;; or a turn ending mid-request drains the queue into it.
+                 (should (eq (map-elt state :prompt-queue-paused) 'steering))
+                 (if request-failed
+                     (funcall (plist-get args :on-failure)
+                              '((message . "nope")) "raw")
+                   (funcall (plist-get args :on-success)
+                            (list (cons 'outcome outcome)))))))
+      (agent-shell-experimental--send-steering :state state :prompt "hi"))
+    (map-elt state :prompt-queue-paused)))
+
+(ert-deftest agent-shell-experimental--send-steering-settles-the-pause-test ()
+  "Test the steer outcome decides whether queued prompts may move again."
+  ;; The prompt joined the tracked turn, so that turn still reports its own
+  ;; end and the queue can go back to waiting on it.
+  (should-not (agent-shell-tests--steer-pause :outcome "injected"))
+  ;; Held: this turn is owned by no `session/prompt', so nothing marks the
+  ;; shell busy and nothing signals when it ends.  Only the user resumes.
+  (should (eq (agent-shell-tests--steer-pause :outcome "startedNewTurn")
+              'detached-turn))
+  ;; Nothing was consumed, so there is nothing to hold the queue back for.
+  (should-not (agent-shell-tests--steer-pause :outcome "failed"))
+  (should-not (agent-shell-tests--steer-pause :request-failed t))
+  ;; The agent handed the prompt back and it was submitted as its own turn.
+  (should-not (agent-shell-tests--steer-pause :outcome "promptRequired")))
+
+(ert-deftest agent-shell-experimental--send-steering-keeps-a-detached-hold-test ()
+  "Test a steer sent during a detached turn leaves that turn's hold in place.
+
+The shell looks idle while a detached turn runs, so an explicit steer
+can be sent then.  Settling its own pause to nil would release the hold
+the detached turn put on the queue, and the next drain would fire a
+queued prompt into the agent while it is still working."
+  (dolist (answer '((:outcome "injected")
+                    (:outcome "failed")
+                    (:request-failed t)))
+    (should (eq (apply #'agent-shell-tests--steer-pause :paused 'detached-turn answer)
+                'detached-turn))))
+
+(ert-deftest agent-shell-experimental--send-steering-declined-drains-an-idle-queue-test ()
+  "Test any declined steer drains a queue the ending turn left behind.
+
+The turn can end while the steer is in flight, where the drain on turn
+completion saw the pause and did nothing.  Every caller is exposed to
+this, not just a plain send: a steered pending prompt goes back on the
+queue when declined, and other prompts may be waiting behind it."
+  (dolist (case '((:answer (:outcome "failed") :busy nil :drained t)
+                  (:answer (:request-failed t) :busy nil :drained t)
+                  (:answer (:throws t) :busy nil :drained t)
+                  ;; The running turn's own completion drains it.
+                  (:answer (:outcome "failed") :busy t :drained nil)))
+    (let* ((answer (plist-get case :answer))
+           (drained nil)
+           (state (list (cons :client nil)
+                        (cons :session (list (cons :id "sess-1")))
+                        (cons :request-count 0)
+                        (cons :last-entry-type nil)
+                        (cons :prompt-queue-paused nil)
+                        (cons :pending-prompts (list "a")))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda (&rest _) state))
+                ((symbol-function 'agent-shell--expand-truncated-regions)
+                 (lambda (text) text))
+                ((symbol-function 'agent-shell--prompt-content-blocks)
+                 (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+                ((symbol-function 'shell-maker-busy)
+                 (lambda (&rest _) (plist-get case :busy)))
+                ((symbol-function 'agent-shell--prompt-queue-process-next)
+                 (lambda (&rest _) (setq drained t)))
+                ((symbol-function 'agent-shell--send-request)
+                 (lambda (&rest args)
+                   (cond
+                    ((plist-get answer :throws) (error "Process not running"))
+                    ((plist-get answer :request-failed)
+                     (funcall (plist-get args :on-failure) '((message . "nope")) "raw"))
+                    (t (funcall (plist-get args :on-success)
+                                (list (cons 'outcome (plist-get answer :outcome)))))))))
+        (agent-shell-experimental--send-steering
+         :state state :prompt "hi" :on-declined #'ignore))
+      (should (eq drained (plist-get case :drained))))))
+
+(ert-deftest agent-shell-experimental--send-steering-overlapping-steers-test ()
+  "Test the pause holds until the last of several steers in flight answers.
+
+Two quick sends mid-turn put two steers in flight.  Settling on the first
+answer would free the queue while the second is still out, so a turn
+ending then drains a prompt into a new turn the second steer may start
+as well."
+  (dolist (case '(("injected" nil) ("startedNewTurn" detached-turn)))
+    (let* ((pending nil)
+           (state (list (cons :client nil)
+                        (cons :session (list (cons :id "sess-1")))
+                        (cons :request-count 0)
+                        (cons :last-entry-type nil)
+                        (cons :prompt-queue-paused nil)
+                        (cons :pending-prompts nil))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda (&rest _) state))
+                ((symbol-function 'agent-shell--expand-truncated-regions)
+                 (lambda (text) text))
+                ((symbol-function 'agent-shell--prompt-content-blocks)
+                 (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+                ((symbol-function 'shell-maker-busy) (lambda (&rest _) nil))
+                ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+                ((symbol-function 'agent-shell--update-fragment) #'ignore)
+                ((symbol-function 'agent-shell-experimental--render-steered-prompt)
+                 #'ignore)
+                ((symbol-function 'agent-shell--send-request)
+                 (lambda (&rest args)
+                   (setq pending (append pending (list (plist-get args :on-success)))))))
+        (agent-shell-experimental--send-steering :state state :prompt "one")
+        (agent-shell-experimental--send-steering :state state :prompt "two")
+        (funcall (nth 0 pending) '((outcome . "injected")))
+        (should (eq (map-elt state :prompt-queue-paused) 'steering))
+        (funcall (nth 1 pending) (list (cons 'outcome (nth 0 case))))
+        (should (eq (map-elt state :prompt-queue-paused) (nth 1 case))))))
+  ;; A detached turn the first steer started still holds once the second
+  ;; steer, which joined some turn, answers.
+  (let* ((pending nil)
+         (state (list (cons :client nil)
+                      (cons :session (list (cons :id "sess-1")))
+                      (cons :request-count 0)
+                      (cons :last-entry-type nil)
+                      (cons :prompt-queue-paused nil)
+                      (cons :pending-prompts nil))))
+    (cl-letf (((symbol-function 'agent-shell--state) (lambda (&rest _) state))
+              ((symbol-function 'agent-shell--expand-truncated-regions)
+               (lambda (text) text))
+              ((symbol-function 'agent-shell--prompt-content-blocks)
+               (lambda (text) (vector (list (cons 'type "text") (cons 'text text)))))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'agent-shell-experimental--render-steered-prompt)
+               #'ignore)
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq pending (append pending (list (plist-get args :on-success)))))))
+      (agent-shell-experimental--send-steering :state state :prompt "one")
+      (agent-shell-experimental--send-steering :state state :prompt "two")
+      (funcall (nth 0 pending) '((outcome . "startedNewTurn")))
+      (should (eq (map-elt state :prompt-queue-paused) 'steering))
+      (funcall (nth 1 pending) '((outcome . "injected")))
+      (should (eq (map-elt state :prompt-queue-paused) 'detached-turn)))))
+
+(ert-deftest agent-shell--prompt-queue-process-next-respects-the-pause-test ()
+  "Test a paused queue does not drain into a turn nothing here can see."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :pending-prompts (list "a" "b"))
+                      (cons :prompt-queue-paused 'detached-turn)))
+    (let ((agent-shell-prompt-queue-merge nil)
+          (sent))
+      (cl-letf (((symbol-function 'agent-shell--insert-to-shell-buffer)
+                 (cl-function (lambda (&key text &allow-other-keys)
+                                (push text sent)))))
+        (agent-shell--prompt-queue-process-next)
+        (should-not sent)
+        (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b")))
+        ;; Released, so the next one goes out.
+        (map-put! agent-shell--state :prompt-queue-paused nil)
+        (agent-shell--prompt-queue-process-next)
+        (should (equal sent '("a")))
+        (should (equal (map-elt agent-shell--state :pending-prompts) '("b")))))))
+
+(ert-deftest agent-shell-prompt-queue-resume-clears-a-held-pause-test ()
+  "Test resuming releases a detached turn's hold but not a steer in flight."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :pending-prompts (list "a"))
+                      (cons :prompt-queue-paused 'steering)))
+    (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) nil))
+              ((symbol-function 'agent-shell--prompt-queue-process-next) #'ignore))
+      ;; A steer that has not answered yet settles the pause itself, and
+      ;; clearing it here would race that answer into an untracked turn.
+      (should (equal (condition-case error
+                         (agent-shell-prompt-queue-resume)
+                       (user-error (error-message-string error)))
+                     "Steer still pending"))
+      (should (eq (map-elt agent-shell--state :prompt-queue-paused) 'steering))
+      (map-put! agent-shell--state :prompt-queue-paused 'detached-turn)
+      (agent-shell-prompt-queue-resume)
+      (should-not (map-elt agent-shell--state :prompt-queue-paused)))))
+
+(ert-deftest agent-shell--prompt-queue-remove-at-reports-each-outcome-test ()
+  "Removing a pending prompt tells the three outcomes apart.
+
+Shares its splice with `agent-shell--prompt-queue-take-at' and differs
+only in announcing what happened, so a drained queue and one that shifted
+under us must still read differently: the first says the prompt is gone,
+the second that it was left alone."
+  (with-temp-buffer
+    (setq-local agent-shell--state (list (cons :pending-prompts (list "a" "b" "c"))))
+    (should (equal (agent-shell--prompt-queue-remove-at :index 1 :expected "b")
+                   "Prompt sent (2 pending)"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "c")))
+    ;; In range, but not the prompt we were told to remove.
+    (should (equal (agent-shell--prompt-queue-remove-at :index 1 :expected "moved")
+                   "Prompt queue changed; prompt left pending"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "c")))
+    ;; Past the end: the queue drained while we held the index.
+    (should (equal (agent-shell--prompt-queue-remove-at :index 9 :expected "a")
+                   "Prompt no longer pending"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "c")))))
+
+(ert-deftest agent-shell--prompt-queue-take-and-insert-test ()
+  "Test claiming a pending prompt and putting it back at its position."
+  (with-temp-buffer
+    (setq-local agent-shell--state (list (cons :pending-prompts (list "a" "b" "c"))))
+    (should (equal (agent-shell--prompt-queue-take-at :index 1 :expected "b") "b"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "c")))
+    ;; Back where it was, so a declined steer does not reorder the queue.
+    (agent-shell--prompt-queue-insert-at :index 1 :prompt "b")
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b" "c")))
+    ;; A queue that shifted under us keeps its prompt rather than losing the
+    ;; wrong one.
+    (should-not (agent-shell--prompt-queue-take-at :index 1 :expected "moved"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b" "c")))
+    (should-not (agent-shell--prompt-queue-take-at :index 9 :expected "b"))
+    ;; Out-of-range insertion clamps rather than erroring, since other queue
+    ;; edits can have shrunk it meanwhile.
+    (agent-shell--prompt-queue-insert-at :index 99 :prompt "z")
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b" "c" "z")))))
+
+(cl-defun agent-shell-tests--queue-steer-at (&key declined)
+  "Steer the pending prompt at index 1, and return the queue left behind.
+
+DECLINED answers the steer with a decline rather than delivery."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :pending-prompts (list "a" "b" "c"))
+                      (cons :prompt-queue-paused nil)))
+    (cl-letf (((symbol-function 'agent-shell--echo) #'ignore)
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell--prompt-steerable-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell--prompt-steer)
+               (cl-function
+                (lambda (&key on-delivered on-declined &allow-other-keys)
+                  ;; Claimed before the agent is asked, so a turn ending
+                  ;; meanwhile cannot also submit it.
+                  (should (equal (map-elt agent-shell--state :pending-prompts)
+                                 '("a" "c")))
+                  (if declined
+                      (funcall on-declined "failed" 'declined)
+                    (funcall on-delivered 'injected))))))
+      (agent-shell--prompt-queue-steer-at :index 1 :prompt "b" :expected "b"))
+    (map-elt agent-shell--state :pending-prompts)))
+
+(ert-deftest agent-shell-viewport-compose-entry-clears-stale-disposition-test ()
+  "Test compose entry points that bypass `--show-buffer' reset the disposition.
+
+The disposition is `permanent-local', and with
+`agent-shell-prefer-viewport-interaction' a cancelled steer draft leaves
+the buffer alive with `steer' kept.  A plain reply, or editing a queued
+prompt, would then send as a steer."
+  (let ((shell-buffer (generate-new-buffer " *test-shell*"))
+        (agent-shell-prefer-viewport-interaction t))
+    (unwind-protect
+        (with-current-buffer shell-buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq-local agent-shell--state
+                      (list (cons :pending-prompts (list "a"))))
+          (cl-letf (((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest _) (erase-buffer)))
+                    ((symbol-function 'agent-shell-viewport--update-header)
+                     #'ignore)
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer)))
+            (let ((viewport-buffer (agent-shell-viewport--buffer
+                                    :shell-buffer shell-buffer)))
+              (with-current-buffer viewport-buffer
+                (agent-shell-viewport-view-mode)
+                (setq agent-shell-viewport--compose-disposition 'steer)
+                (agent-shell-viewport--enter-compose-page)
+                (should-not agent-shell-viewport--compose-disposition)
+                (setq agent-shell-viewport--compose-disposition 'steer))
+              (agent-shell-viewport--prefill-edit
+               :shell-buffer shell-buffer :index 0 :text "a")
+              (with-current-buffer viewport-buffer
+                (should-not agent-shell-viewport--compose-disposition)))))
+      (kill-buffer shell-buffer)
+      (when-let ((vp (get-buffer " *test-shell* [viewport]")))
+        (kill-buffer vp)))))
+
+(ert-deftest agent-shell--prompt-queue-steer-at-test ()
+  "Test a queued prompt is neither lost nor run twice when steered."
+  ;; Taken by the agent, so the queue's copy goes.
+  (should (equal (agent-shell-tests--queue-steer-at) '("a" "c")))
+  ;; Declined, so it goes back where it was rather than being dropped.
+  (should (equal (agent-shell-tests--queue-steer-at :declined t) '("a" "b" "c"))))
+
+(ert-deftest agent-shell--prompt-queue-steer-at-leaves-a-shifted-queue-alone-test ()
+  "Test a queue that changed under us is not steered from."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :pending-prompts (list "a" "b"))
+                      (cons :prompt-queue-paused nil)))
+    (should-error (agent-shell--prompt-queue-steer-at
+                   :index 1 :prompt "b" :expected "moved")
+                  :type 'user-error)
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "b")))))
+
+(ert-deftest agent-shell-viewport--compose-disposition-label-test ()
+  "Test the edit header names what the send key will actually do."
+  (dolist (case '((steer   t   "steer")
+                  ;; Sending will error rather than change method, so the
+                  ;; header says so instead of promising a queue.
+                  (steer   nil "steer unavailable")
+                  (queue   t   "queue")
+                  (queue   nil "queue")))
+    (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'agent-shell--prompt-steerable-p)
+               (lambda (&rest _) (nth 1 case))))
+      (should (equal (agent-shell-viewport--compose-disposition-label (nth 0 case))
+                     (nth 2 case)))))
+  ;; With no disposition of its own the draft follows the setting, and a
+  ;; plain send really does queue when a steer cannot be made.  A custom
+  ;; function is named \"send\": the header cannot know what it does, and
+  ;; saying \"queue\" would state a guess as fact.
+  (dolist (case `((,#'agent-shell-busy-submit-steer t   "steer")
+                  (,#'agent-shell-busy-submit-steer nil "queue")
+                  (,#'agent-shell-busy-submit-queue t   "queue")
+                  (,(lambda (_prompt) nil)          t   "send")))
+    (let ((agent-shell-busy-submit-default-function (nth 0 case)))
+      (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+                 (lambda (&rest _) (current-buffer)))
+                ((symbol-function 'agent-shell--prompt-steerable-p)
+                 (lambda (&rest _) (nth 1 case))))
+        (should (equal (agent-shell-viewport--compose-disposition-label nil)
+                       (nth 2 case)))))))
 
 (ert-deftest agent-shell-next-item-walks-into-and-out-of-a-table ()
   "Next item enters a table at its first cell, walks it, then moves on."
