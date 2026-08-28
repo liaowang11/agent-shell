@@ -799,7 +799,15 @@ Agent Shell pauses automatic queue delivery for the length of a steer request, a
 
 *** Subagents and background tasks
 
-An agent can delegate work to a subagent, or push work into the background and carry on.  Agents that report this natively get their own rendering: each subagent and each background task becomes a fragment that updates in place as its state changes, rather than a tool call that reports "completed" the moment the work is handed off and then says nothing while it actually runs.
+An agent can delegate work to a subagent, or push work into the background and carry on.  Agents that report this natively get their own rendering: each background task becomes a fragment that updates in place as its state changes, rather than a tool call that reports "completed" the moment the work is handed off and then says nothing while it actually runs.
+
+A subagent gets a collapsible pane of its own, headed by its name, its state and a summary of what it has done.  Its task, tool calls, thoughts and replies render inside that pane instead of merging into the root session's transcript, so folding the header puts the whole subagent away.  A subagent spawned by another subagent shares its ancestor's pane, and its content carries its name to tell the two apart.
+
+A subagent usually outlives the turn that spawned it, and its pane stays where that turn is: work arriving after the turn ends, or while you are already several prompts further on, still lands on the page it belongs to rather than reading as the answer to a question the subagent never saw.  The pane folds when the subagent reports that it is done.
+
+=M-x agent-shell-stop-async-task= stops a running background task, asking which one when the session has more than one.  Only tasks the agent says it can stop are offered.  A task the agent hides from the transcript, because a tool call already shows it, is still offered here: whether a task draws its own card and whether it can be stopped are separate questions.
+
+This rides claude-agent-acp's JetBrains AIR extension, which the agent gates on the client asking for it by name at initialization.  Agent Shell asks for both halves, =nativeSubagentSessions= and =asyncTasks=, and only for agents whose configuration opts in.  Other agents are told nothing about the extension and keep their existing behavior.
 
 *** Per-model token usage
 
@@ -1338,6 +1346,7 @@ always go to Evil modes if you need to with ~C-z~).
 | C-c C-v                                               | agent-shell-set-session-model                           | Set session model.                                                            |
 | C-c C-t                                               | agent-shell-set-session-thought-level                   | Set thought level (reasoning effort) for the current session.                 |
 |                                                       | agent-shell-show-usage                                  | Display current session usage information in the minibuffer.                  |
+|                                                       | agent-shell-stop-async-task                             | Stop a running, stoppable background async task in this session.              |
 | RET                                                   | agent-shell-submit                                      | Submit the current input to the agent.                                        |
 |                                                       | agent-shell-switch-buffer                               | Switch to another `agent-shell-mode' buffer via `completing-read'.            |
 |                                                       | agent-shell-toggle                                      | Toggle agent shell display.                                                   |
