@@ -747,7 +747,7 @@ Use one of these entry points to create and initialize the viewport buffer:
 (setopt agent-shell-prefer-viewport-interaction t)
 #+end_src
 
-In edit mode, =C-c C-c= sends or queues the prompt and switches to view mode when viewport interaction is preferred.  Use =C-u C-c C-c= to send or queue while keeping the compose buffer open, =C-c C-p= to peek at the latest interaction without losing the draft, =C-c C-k= to cancel, and =C-c C-h= for help.
+In edit mode, =C-c C-c= sends the prompt and switches to view mode when viewport interaction is preferred.  Use =C-u C-c C-c= to send while keeping the compose buffer open, =C-c C-q= to wait behind a running turn or submit when idle, and =C-c C-i= to steer the running turn instead (see [[*Steering a running turn]]).  Use =C-c C-p= to peek at the latest interaction without losing the draft, =C-c C-k= to cancel, and =C-c C-h= for help.
 
 In view mode, use =r= to compose a reply, =R= to quote the response in a reply, =b= / =f= to move between interactions, =p= / =n= to move between items, =?= for help, and =q= to bury the viewport.
 
@@ -761,11 +761,38 @@ Do not invoke =agent-shell-viewport-edit-mode= or =agent-shell-viewport-view-mod
 
 A prompt sent while the agent is working is queued and submitted once the turn ends.  Agents that support steering can take it into the turn already running instead, so a wrong direction can be corrected without waiting for it to finish.  Steering is an ACP extension (=_session/steering=) rather than part of the spec, advertised by the agent at initialization: the Claude and Codex packages implement it, other agents keep queueing.
 
-Steering is always explicit.  =M-x agent-shell-prompt-queue= queues, as it always has.  =M-x agent-shell-prompt-steer= steers the running turn, and errors when the agent cannot steer.  With no turn running there is nothing to steer into, so it submits the prompt instead.  When the agent declines a steer, the running turn is interrupted and the shell says so, rather than letting the agent carry on in a direction you believe you already corrected.
+Each behavior has a command that always does that one thing, so a binding never depends on a setting:
+
+- =M-x agent-shell-prompt-queue= - queue until the running turn ends, or submit immediately when idle.
+- =M-x agent-shell-prompt-steer= - steer the running turn, submit when idle, or error when the agent cannot steer.
+- =M-x agent-shell-prompt-send= - follow =agent-shell-prompt-while-busy= (see below).
+- =M-x agent-shell-prompt-queue-steer= - steer a prompt that is already queued.  Also available as =Steer (s)= in the pending prompts block.
+
+Each of the first three has a =-dwim= variant (=agent-shell-prompt-send-dwim=, =agent-shell-prompt-queue-dwim=, =agent-shell-prompt-steer-dwim=) that prefills the region or error at point as context, so the thing you are looking at can redirect work already under way.  With a prefix argument they ask which shell to use.
+
+=agent-shell-prompt-while-busy= decides what =agent-shell-prompt-send= and the compose buffer's send key do while the agent works.  It defaults to =steer=; set it to =queue= to wait for the turn to end.  A plain send stays lossless whichever way it is set: with no turn running the prompt is submitted, and an agent that cannot take a steered prompt, one that declines it, or a shell waiting on a permission answer all get the prompt queued instead.
 
 What the agent does with the steered prompt is up to the agent: Claude interrupts what it is generating and responds to it, while Codex finishes the message in flight first.
 
-Steering is not additive.  An agent that interrupts may drop the instruction it was working on, so a steer can replace what the agent was already doing rather than adding to it.  Queue instead when the agent should finish first.
+A steered prompt renders where the agent's output paused, under a =Steered prompt= heading, rather than as another shell prompt.  It belongs to the turn it steered, so the turn stays a single interaction and the viewport shows the steer and the response it produced together.
+
+Steering is not additive.  An agent that interrupts may drop the instruction it was working on, so a steer can replace what the agent was already doing rather than adding to it.  Queue instead when the agent should finish first.  This is why the two commands differ on what a declined steer means: =agent-shell-prompt-steer= interrupts the running turn and says so, since you asked to steer and quietly doing something else is worse; a plain send just queues, since you asked to send.
+
+**** Compose buffer
+
+The compose buffer's keys line up with those three commands: =C-c C-c= (=agent-shell-viewport-compose-send=) follows the setting, =C-c C-q= (=agent-shell-viewport-compose-queue=) queues behind a running turn or submits when idle, and =C-c C-i= (=agent-shell-viewport-compose-steer=) steers.  All three leave the compose buffer the same way after delivery, following =agent-shell-viewport-dismiss-on-send= and =agent-shell-prefer-viewport-interaction=; with a prefix argument (=C-u=) the buffer stays open, cleared, for the next prompt.
+
+A compose buffer carries the disposition of whichever command opened it, and that outranks the setting.  A draft started by =agent-shell-prompt-queue-dwim= still queues while the setting says steer, because a draft outlives the command that started it.  While a turn is running, the edit-mode header names what =C-c C-c= will do: =Edit (steer)= or =Edit (queue)=, and =Edit (steer unavailable)= for an explicit steer draft the running turn cannot take, since sending will error rather than change delivery method.
+
+Explicit steering keeps the draft when the agent declines, and the buffer is read-only until the agent answers, since that draft is what gets restored.
+
+**** Prompts that arrive as a turn ends
+
+A steer can race the end of the turn it was aimed at.  Agent Shell asks the agent to hand the prompt back rather than start a turn of its own, but only the Claude package honors that request; Codex ignores unknown options.  When the agent starts a turn anyway, the shell says so in a block: the output arrives out of turn and the shell does not show as busy while it runs.
+
+Agent Shell pauses automatic queue delivery for the length of a steer request, and keeps it paused when a turn started this way, so queued prompts are not fired into an agent that only looks idle.  Wait for that output to finish, then run =M-x agent-shell-prompt-queue-resume=.
+
+=agent-shell-prompt-queue-steer= claims a pending prompt out of the queue before sending it, so turn completion cannot also submit it; a declined steer puts it back at the same position.  The prompt is therefore neither lost nor run twice.
 
 *** Specific Agent Commands
 
@@ -1107,6 +1134,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-prompt-bar-input-mode-hook        | Hook run after entering or leaving ‘agent-shell-prompt-bar-input-mode’.         |
 | agent-shell-prompt-bar-mode                   | Non-nil if Agent-Shell-Prompt-Bar mode is enabled.                              |
 | agent-shell-prompt-bar-mode-hook              | Hook run after entering or leaving ‘agent-shell-prompt-bar-mode’.               |
+| agent-shell-prompt-while-busy                 | What ‘agent-shell-prompt-send’ does while the agent is working on a turn.       |
 | agent-shell-qwen-acp-command                  | Command and parameters for the Qwen Code client.                                |
 | agent-shell-qwen-authentication               | Configuration for Qwen Code authentication.                                     |
 | agent-shell-qwen-environment                  | Environment variables for the Qwen Code client.                                 |
@@ -1264,7 +1292,11 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-prompt-queue-edit                           | Edit the pending prompt at INDEX, replacing it in place.                      |
 |                                                       | agent-shell-prompt-queue-remove                         | Remove all pending prompts or a specific prompt by REMOVE-INDEX.              |
 |                                                       | agent-shell-prompt-queue-resume                         | Resume processing pending prompts in the queue.                               |
+|                                                       | agent-shell-prompt-queue-steer                          | Steer the pending prompt at INDEX into the turn already running.              |
+|                                                       | agent-shell-prompt-send                                 | Send PROMPT, steering or queueing it when a turn is already running.          |
+|                                                       | agent-shell-prompt-send-dwim                            | Send a prompt with DWIM context to an existing shell.                         |
 |                                                       | agent-shell-prompt-steer                                | Steer PROMPT into the turn the agent is currently running.                    |
+|                                                       | agent-shell-prompt-steer-dwim                           | Steer a prompt with DWIM context into the turn already running.               |
 | r                                                     | agent-shell-quote-region                                | Quote the active region into the shell's latest prompt.                       |
 |                                                       | agent-shell-qwen-start                                  | Start an interactive Qwen Code CLI agent shell.                               |
 |                                                       | agent-shell-reload                                      | Reload the current session by restarting with the same session ID.            |
@@ -1307,10 +1339,12 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-viewport-compose-cancel                     | Cancel prompt composition.                                                    |
 |                                                       | agent-shell-viewport-compose-help-menu                  | Show the transient help menu for compose (edit) mode.                         |
 |                                                       | agent-shell-viewport-compose-peek-last                  | Save compose buffer snapshot and peek at the last interaction.                |
+| C-c C-q                                               | agent-shell-viewport-compose-queue                      | Queue behind a running turn or submit when idle, then clear the buffer.       |
 |                                                       | agent-shell-viewport-compose-send                       | Send the viewport composed prompt to the agent shell.                         |
 |                                                       | agent-shell-viewport-compose-send-and-dismiss           | Queue or send the composed prompt, then dismiss the compose window.           |
 |                                                       | agent-shell-viewport-compose-send-and-kill              | Send the viewport composed prompt to the agent shell and kill compose buffer. |
 |                                                       | agent-shell-viewport-compose-send-and-wait-for-response | Send the viewport composed prompt and display response in viewport.           |
+| C-c C-i                                               | agent-shell-viewport-compose-steer                      | Steer the composed prompt into the running turn, then clear the buffer.       |
 |                                                       | agent-shell-viewport-copy-session-id                    | Copy the current session ID to the kill ring.                                 |
 |                                                       | agent-shell-viewport-cycle-session-mode                 | Cycle through available session modes.                                        |
 |                                                       | agent-shell-viewport-edit-mode                          | Major mode for composing agent shell prompts.                                 |
