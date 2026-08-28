@@ -140,6 +140,17 @@ while \\='default returns nil."
     (or (memq 'comint-highlight-prompt faces)
         (memq 'agent-shell-prompt faces))))
 
+(defun agent-shell-chat--subagent-label-p (position)
+  "Return non-nil when POSITION starts a rendered subagent label.
+
+New labels carry `agent-shell-subagent-label'.  The `display' and
+`agent-shell-ui-state' fallback keeps labels rendered before that marker
+was introduced from being relabeled when this file is reloaded in a live
+shell."
+  (or (get-text-property position 'agent-shell-subagent-label)
+      (and (get-text-property position 'display)
+           (get-text-property position 'agent-shell-ui-state))))
+
 (defun agent-shell-chat--extends-bg-p (face)
   "Return non-nil when FACE paints an `:extend' background past end of line.
 FACE is a `face' text-property value (a face symbol or list of them).  A
@@ -395,8 +406,12 @@ whitespace separates them."
       (while (< pos (point-max))
         (let ((run-end (or (next-single-property-change pos 'font-lock-face)
                            (point-max))))
-          (when (agent-shell-chat--prompt-face-p
-                 (get-text-property pos 'font-lock-face))
+          (when (and (agent-shell-chat--prompt-face-p
+                      (get-text-property pos 'font-lock-face))
+                     ;; Subagent headings use the prompt face so they get
+                     ;; the same styling as a shell prompt.  Their marker
+                     ;; keeps chat mode from relabeling them as user turns.
+                     (not (agent-shell-chat--subagent-label-p pos)))
             (push (cons pos run-end) runs))
           (setq pos run-end)))
       (nreverse runs))))

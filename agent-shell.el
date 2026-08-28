@@ -698,6 +698,7 @@ Each element can be:
                                               default-session-mode-id
                                               default-config-options
                                               session-meta
+                                              initialize-meta
                                               mcp-servers
                                               notification-adapter
                                               icon-name
@@ -730,6 +731,10 @@ Keyword arguments:
 - SESSION-META: Optional alist of agent-specific metadata sent as `_meta'
   with session-creating requests (`session/new', `session/load',
   `session/resume', and `session/fork').
+- INITIALIZE-META: Optional alist of agent-specific metadata sent as `_meta'
+  with the `initialize' request.  This is where a vendor extension is
+  advertised, so the shared handshake does not accrete a union of every
+  vendor's keys and send them to every agent.
 - MCP-SERVERS: Optional list of MCP servers for this agent, taking
   precedence over the global `agent-shell-mcp-servers'.  Same shape as
   that variable.
@@ -751,6 +756,7 @@ Returns an alist with all specified values."
     (:default-session-mode-id . ,default-session-mode-id)       ;; function
     (:default-config-options . ,default-config-options)         ;; function
     (:session-meta . ,session-meta)
+    (:initialize-meta . ,initialize-meta)
     (:mcp-servers . ,mcp-servers)
     (:notification-adapter . ,notification-adapter)            ;; function
     (:icon-name . ,icon-name)
@@ -1198,9 +1204,18 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
                              (cons :title nil)))
         (cons :config-options nil)
         (cons :last-entry-type nil)
-        (cons :last-agent-message-id nil)
+        (cons :last-agent-message-ids nil)
+        (cons :last-agent-message-block-ids nil)
         (cons :chunked-group-count 0)
         (cons :activity-group-count 0)
+        (cons :activity-group-latest-id nil)
+        ;; Keep the root entry record from the start.  A root message may be
+        ;; the first rendered item, before any activity group exists; falling
+        ;; back to the shared transcript entry type there would mistake a
+        ;; preceding subagent message for the root's own continuation.
+        (cons :activity-group-sessions
+              '((:root (:group-count . 0)
+                       (:last-entry-type . nil))))
         (cons :activity-thoughts nil)
         (cons :expanded-activity-group nil)
         (cons :request-count 0)
@@ -2642,6 +2657,19 @@ Bound by `agent-shell--on-notification' while dispatching a
 `agent-shell--update-fragment' lands its content above the fresh
 prompt instead of inside the user's input region.")
 
+(defvar agent-shell--subagent-group nil
+  "(SUBAGENT-SESSION-ID . PLIST) for the native subagent session whose
+content is currently being dispatched, or nil for the root session.
+PLIST is the `:name'/`:task' plist `agent-shell--native-subagent' returns.
+
+Bound by `agent-shell--on-notification' when a `session/update'
+notification's `sessionId' names a registered native subagent rather
+than the root session, so `agent-shell--update-fragment' can tag that
+fragment as the subagent's rather than rendering it indistinguishably
+from root content.  A subagent's own tool calls and messages carry no
+other marker of which session they belong to (see native-subagents.ts's
+`route' in claude-agent-acp).")
+
 (defun agent-shell--session-bound-notification-p (acp-notification)
   "Return non-nil if ACP-NOTIFICATION reports session request progress.
 
@@ -2775,19 +2803,97 @@ rendered entry between them (e.g. a streamed message) starts a fresh one.
 A permission request is part of a tool call's own flow (its dialog is
 transient, deleted on completion), so it must not break the run.")
 
+(defun agent-shell--activity-group-session-key ()
+  "Return the key for the session currently dispatching activity.
+
+The root session uses the `:root' sentinel.  Native subagent notifications
+bind `agent-shell--subagent-group' around dispatch, so their ACP session ID
+becomes the key used to namespace their activity groups."
+  (or (car-safe agent-shell--subagent-group) :root))
+
+(defun agent-shell--activity-group-session-state (state)
+  "Return the activity run state for the currently dispatching session.
+Return nil when STATE has no record for that session yet."
+  (alist-get (agent-shell--activity-group-session-key)
+             (map-elt state :activity-group-sessions)
+             nil nil #'equal))
+
+(defun agent-shell--activity-group-session-entry-type (state)
+  "Return the last rendered entry type for STATE's current session.
+
+Legacy states and direct helper tests may have no per-session record or may
+have a record without an entry type.  The root falls back to STATE's old
+shared value in those cases; a new subagent starts with no preceding entry."
+  (let ((session-state (agent-shell--activity-group-session-state state)))
+    (if (assq :last-entry-type session-state)
+        (map-elt session-state :last-entry-type)
+      (when (eq (agent-shell--activity-group-session-key) :root)
+        (map-elt state :last-entry-type)))))
+
+(defun agent-shell--activity-group-set-session-fields (state &rest fields)
+  "Set activity FIELDS for STATE's currently dispatching session.
+
+FIELDS is a list of alist pairs.  The session record is copied before its
+fields change, then replaced in STATE's `:activity-group-sessions' alist so
+old live states can be extended in place."
+  (agent-shell--ensure-state-key state :activity-group-sessions)
+  (let* ((session-key (agent-shell--activity-group-session-key))
+         (sessions (map-elt state :activity-group-sessions))
+         (entry (assoc session-key sessions))
+         (session-state (copy-alist (cdr entry))))
+    (dolist (field fields)
+      (if (assq (car field) session-state)
+          (map-put! session-state (car field) (cdr field))
+        (push field session-state)))
+    (map-put! state :activity-group-sessions
+              (cons (cons session-key session-state)
+                    (assoc-delete-all session-key sessions))))
+  state)
+
+(defun agent-shell--activity-group-note-entry-type (state entry-type)
+  "Record ENTRY-TYPE as STATE's latest rendered entry.
+
+The shared `:last-entry-type' remains available to transcript logic.  The
+parallel session record drives activity grouping, so interleaved root and
+subagent notifications do not change one another's run boundary."
+  (map-put! state :last-entry-type entry-type)
+  (agent-shell--activity-group-set-session-fields
+   state (cons :last-entry-type entry-type)))
+
 (defun agent-shell--activity-group-current-id (state)
   "Return the current activity group id for STATE, advancing on a new run.
 
-Advances STATE's `:activity-group-count' unless `:last-entry-type' keeps
-the run open (see `agent-shell--activity-group-run-entry-types'),
-mirroring the `:chunked-group-count' pattern used for message/thought
-chunks.  Shared by tool-call and thought rendering so both land in the
-same group."
-  (unless (member (map-elt state :last-entry-type)
-                  agent-shell--activity-group-run-entry-types)
-    (map-put! state :activity-group-count
-              (1+ (or (map-elt state :activity-group-count) 0))))
-  (agent-shell--activity-group-latest-id state))
+Advances the current session's group count and records a new current group
+unless its last entry keeps the run open (see
+`agent-shell--activity-group-run-entry-types').  Root IDs retain their
+short `activity-N' form; subagent IDs include their session key so each
+session has an independent sequence.  The latest id is tracked separately
+for folding, while the legacy root `:activity-group-count' mirrors the root
+sequence.  Shared by tool-call and thought rendering so both land in the
+same session-local group."
+  (let* ((session-key (agent-shell--activity-group-session-key))
+         (session-state (agent-shell--activity-group-session-state state))
+         (last-entry-type (agent-shell--activity-group-session-entry-type state))
+         (group-id (map-elt session-state :group-id))
+         (group-count (or (map-elt session-state :group-count)
+                          (and (eq session-key :root)
+                               (map-elt state :activity-group-count))
+                          0)))
+    (if (and group-id
+             (member last-entry-type agent-shell--activity-group-run-entry-types))
+        group-id
+      (let* ((new-group-count (1+ group-count))
+             (new-group-id (if (eq session-key :root)
+                               (format "activity-%s" new-group-count)
+                             (format "activity-%s-%s" session-key new-group-count))))
+        (agent-shell--ensure-state-key state :activity-group-latest-id)
+        (map-put! state :activity-group-latest-id new-group-id)
+        (when (eq session-key :root)
+          (map-put! state :activity-group-count new-group-count))
+        (agent-shell--activity-group-set-session-fields
+         state (cons :group-count new-group-count)
+         (cons :group-id new-group-id))
+        new-group-id))))
 
 (defun agent-shell--activity-group-latest-id (state)
   "Return the id of the most recently started activity group in STATE.
@@ -2798,7 +2904,8 @@ the agent's current run or an earlier one taking a late update.
 
   (agent-shell--activity-group-latest-id \\='((:activity-group-count . 2)))
   ;; => \"activity-2\""
-  (format "activity-%s" (map-elt state :activity-group-count)))
+  (or (map-elt state :activity-group-latest-id)
+      (format "activity-%s" (map-elt state :activity-group-count))))
 
 (defun agent-shell--activity-group-id (state tool-call-id)
   "Return TOOL-CALL-ID's activity group-id in STATE, assigning it on first sight.
@@ -2806,7 +2913,8 @@ the agent's current run or an earlier one taking a late update.
 The assignment is stored on the tool call and reused by later updates, so
 a completion arriving after an interleaving message keeps its original
 group.  The run counter is shared with thoughts via
-`agent-shell--activity-group-current-id'."
+`agent-shell--activity-group-current-id'.  The current group and sequence
+are kept per dispatching session, while root IDs retain their old shape."
   (or (map-nested-elt state `(:tool-calls ,tool-call-id :group-id))
       (let ((group-id (agent-shell--activity-group-current-id state)))
         (agent-shell--save-tool-call state tool-call-id (list (cons :group-id group-id)))
@@ -3183,12 +3291,28 @@ Clears STATE's `:expanded-activity-group'."
   ;; `agent_message_chunk' branch also labels it.  Session-level
   ;; updates (usage_update, session_info_update, etc.) are legitimate
   ;; any time and unaffected.
-  (let ((agent-shell--render-above-prompt
-         (and (not (agent-shell--active-requests-p state))
-              (agent-shell--session-bound-notification-p acp-notification))))
+  (let* ((agent-shell--render-above-prompt
+          (and (not (agent-shell--active-requests-p state))
+               (agent-shell--session-bound-notification-p acp-notification)))
+         (agent-shell--subagent-group
+          (agent-shell--notification-subagent-group state acp-notification)))
     (when agent-shell--render-above-prompt
       (agent-shell--note-out-of-turn-activity state))
     (agent-shell--dispatch-notification :state state :acp-notification acp-notification)))
+
+(defun agent-shell--notification-subagent-group (state acp-notification)
+  "Return ACP-NOTIFICATION's subagent group for `agent-shell--subagent-group'.
+
+Non-nil only when the notification's `sessionId' differs from STATE's
+own session and names a subagent `subagent_spawned' already registered
+in STATE (see `agent-shell--save-native-subagent') -- i.e. content
+attributed to a subagent, not the `subagent_spawned'/`subagent_state_update'
+lifecycle notifications themselves, which stay on the root session id."
+  (when-let* ((notification-session-id (map-nested-elt acp-notification '(params sessionId)))
+              (root-session-id (map-nested-elt state '(:session :id)))
+              ((not (equal notification-session-id root-session-id)))
+              (subagent (agent-shell--native-subagent state notification-session-id)))
+    (cons notification-session-id subagent)))
 
 (cl-defun agent-shell--dispatch-notification (&key state acp-notification)
   "Render ACP-NOTIFICATION into STATE's shell buffer.
@@ -3236,13 +3360,40 @@ around this call to reflect whether the update arrived out of turn."
            ;; boundary heuristic: a new run whenever the previous rendered
            ;; entry was not itself a message chunk.
            (let* ((message-id (map-nested-elt acp-notification '(params update messageId)))
+                  ;; Compared within the session the message belongs to: a
+                  ;; subagent's messages render here too, and the sessions
+                  ;; interleave.
+                  (message-session-id (or (map-nested-elt acp-notification '(params sessionId))
+                                          (map-nested-elt state '(:session :id))))
                   (new-message (if message-id
-                                   (not (equal message-id (map-elt state :last-agent-message-id)))
-                                 (not (equal (map-elt state :last-entry-type) "agent_message_chunk"))))
+                                   (not (equal message-id
+                                               (agent-shell--last-agent-message-id
+                                                state message-session-id)))
+                                 (not (equal (agent-shell--activity-group-session-entry-type state)
+                                             "agent_message_chunk"))))
+                  ;; ACP's `messageId' is optional.  Keep a separate
+                  ;; per-session fallback block when it is absent, because
+                  ;; the global chunk counter can advance while another
+                  ;; session streams a message between two of this session's
+                  ;; chunks.
+                  (message-block-id
+                   (or message-id
+                       (and (not new-message)
+                            (agent-shell--last-agent-message-block-id
+                             state message-session-id))))
                   (content (agent-shell--content-block-to-markdown
                             (map-nested-elt acp-notification '(params update content)))))
              (when new-message
                (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
+               (unless message-id
+                 (setq message-block-id
+                       (if (eq (agent-shell--activity-group-session-key) :root)
+                           (number-to-string (map-elt state :chunked-group-count))
+                         (format "%s-%s"
+                                 message-session-id
+                                 (map-elt state :chunked-group-count))))
+                 (agent-shell--set-last-agent-message-block-id
+                  state message-session-id message-block-id))
                (agent-shell--append-transcript
                 :text (format "\n## Agent (%s)\n\n" (format-time-string "%F %T"))
                 :file-path agent-shell--transcript-file))
@@ -3265,14 +3416,15 @@ around this call to reflect whether the update arrived out of turn."
               ;; Key on `messageId' when present so distinct messages stay
               ;; distinct; otherwise fall back to the per-run group count.
               :block-id (format "%s-agent_message_chunk"
-                                (or message-id (map-elt state :chunked-group-count)))
+                                (or message-block-id
+                                    (map-elt state :chunked-group-count)))
               :body content
               :create-new new-message
               :append t
               :navigation 'never
               :render-body-images t)
-             (map-put! state :last-agent-message-id message-id))
-           (map-put! state :last-entry-type "agent_message_chunk"))
+             (agent-shell--set-last-agent-message-id state message-session-id message-id))
+           (agent-shell--activity-group-note-entry-type state "agent_message_chunk"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
            (let* ((tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
                   (content (map-nested-elt acp-notification '(params update content)))
@@ -3331,10 +3483,11 @@ around this call to reflect whether the update arrived out of turn."
                 :label-left (propertize "Proposed plan" 'font-lock-face 'agent-shell-section-heading)
                 :body (agent-shell--format-plan (map-nested-elt acp-notification '(params update rawInput plan)))
                 :expanded t)))
-           (map-put! state :last-entry-type "tool_call"))
+           (agent-shell--activity-group-note-entry-type state "tool_call"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_thought_chunk")
-           (let ((new-thought-p (not (equal (map-elt state :last-entry-type)
-                                            "agent_thought_chunk")))
+           (let ((new-thought-p
+                  (not (equal (agent-shell--activity-group-session-entry-type state)
+                              "agent_thought_chunk")))
                  (content (agent-shell--content-block-to-markdown
                            (map-nested-elt acp-notification '(params update content))))
                  ;; Share the tool-call run counter so a thought lands in
@@ -3361,8 +3514,10 @@ around this call to reflect whether the update arrived out of turn."
               ;; only populated by newer agents, so we group by turn
               ;; boundary instead.
               :namespace-id (unless (agent-shell--active-requests-p state) "out-of-turn")
-              :block-id (format "%s-agent_thought_chunk"
-                                (map-elt state :chunked-group-count))
+              ;; The activity group is globally unique and remains stable
+              ;; across a thought's streamed chunks, including when another
+              ;; session starts a thought between them.
+              :block-id (format "%s-agent_thought_chunk" group-id)
               :label-left  (concat
                             (when-let* ((icon (agent-shell--thought-process-icon)))
                               (concat icon " "))
@@ -3380,7 +3535,7 @@ around this call to reflect whether the update arrived out of turn."
                      content
                      'face 'agent-shell-thought-body
                      'font-lock-face 'agent-shell-thought-body)
-              :append (equal (map-elt state :last-entry-type)
+              :append (equal (agent-shell--activity-group-session-entry-type state)
                              "agent_thought_chunk")
               :expanded agent-shell-thought-process-expand-by-default
               :group-id group-id
@@ -3402,7 +3557,7 @@ around this call to reflect whether the update arrived out of turn."
                (agent-shell--sync-activity-group-fold
                 :state state :group-id group-id
                 :namespace-id (unless (agent-shell--active-requests-p state) "out-of-turn"))))
-           (map-put! state :last-entry-type "agent_thought_chunk"))
+           (agent-shell--activity-group-note-entry-type state "agent_thought_chunk"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "user_message_chunk")
            ;; A user_message_chunk replays a user submission.  Render it
            ;; while a `session/load' or `session/push' is active; with no
@@ -3462,7 +3617,7 @@ around this call to reflect whether the update arrived out of turn."
                                     'font-lock-face 'agent-shell-input))
                 :create-new new-prompt-p
                 :append t))
-             (map-put! state :last-entry-type "user_message_chunk"))
+             (agent-shell--activity-group-note-entry-type state "user_message_chunk"))
             ((not (agent-shell--active-requests-p state))
              ;; No session/load or session/push to attach this echo to,
              ;; and unlike tool calls or message chunks from a background
@@ -3483,7 +3638,7 @@ around this call to reflect whether the update arrived out of turn."
             :label-left (propertize "Plan" 'font-lock-face 'agent-shell-section-heading)
             :body (agent-shell--format-plan (map-nested-elt acp-notification '(params update entries)))
             :expanded t)
-           (map-put! state :last-entry-type "plan"))
+           (agent-shell--activity-group-note-entry-type state "plan"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "subagent_spawned")
            (let* ((subagent-session-id (map-nested-elt acp-notification '(params update subagentSessionId)))
                   (name (map-nested-elt acp-notification '(params update name)))
@@ -3498,7 +3653,7 @@ around this call to reflect whether the update arrived out of turn."
                                               'font-lock-face 'agent-shell-section-heading))
               :body (agent-shell--format-subagent-body task)
               :expanded agent-shell-tool-use-expand-by-default))
-           (map-put! state :last-entry-type "subagent_spawned"))
+           (agent-shell--activity-group-note-entry-type state "subagent_spawned"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "subagent_state_update")
            (let* ((subagent-session-id (map-nested-elt acp-notification '(params update subagentSessionId)))
                   (subagent-state (map-nested-elt acp-notification '(params update state)))
@@ -3511,66 +3666,90 @@ around this call to reflect whether the update arrived out of turn."
                                   (propertize (or (map-elt registered :name) "Subagent")
                                               'font-lock-face 'agent-shell-section-heading))
               :body (agent-shell--format-subagent-body (map-elt registered :task))))
-           (map-put! state :last-entry-type "subagent_state_update"))
-          ;; `showInTranscript' is false for tasks already represented by their
-          ;; own card (e.g. a backgrounded Bash tool call) -- rendering it here
-          ;; too would just duplicate that card.
-          ((and (equal (map-nested-elt acp-notification '(params update sessionUpdate)) "async_task_spawned")
-                (map-nested-elt acp-notification '(params update showInTranscript)))
+           (agent-shell--activity-group-note-entry-type state "subagent_state_update"))
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "async_task_spawned")
            (let* ((async-task-id (map-nested-elt acp-notification '(params update asyncTaskId)))
                   (name (map-nested-elt acp-notification '(params update name)))
                   (task-type (map-nested-elt acp-notification '(params update taskType)))
-                  (description (map-nested-elt acp-notification '(params update description))))
-             (agent-shell--save-async-task state async-task-id name task-type description)
-             (agent-shell--update-fragment
-              :state state
-              :block-id (agent-shell--async-task-block-id async-task-id)
-              :label-left (format "%s %s"
-                                  (agent-shell--make-status-kind-label :status "running")
-                                  (propertize (or name task-type "Background task")
-                                              'font-lock-face 'agent-shell-section-heading))
-              :body (agent-shell--format-async-task-body description nil nil nil)
-              :expanded agent-shell-tool-use-expand-by-default))
-           (map-put! state :last-entry-type "async_task_spawned"))
+                  (description (map-nested-elt acp-notification '(params update description)))
+                  (can-stop (map-nested-elt acp-notification '(params update canStop)))
+                  ;; False for tasks already represented by their own card
+                  ;; (e.g. a backgrounded Bash tool call): a second card here
+                  ;; would just duplicate that one.  It says nothing about
+                  ;; whether the task exists or can be stopped, so it gates
+                  ;; the rendering below and nothing else.
+                  (show-in-transcript (map-nested-elt acp-notification
+                                                      '(params update showInTranscript))))
+             ;; Registered either way.  `canStop' is the agent's own,
+             ;; separate claim, and `agent-shell-stop-async-task' can only
+             ;; offer what the registry holds.  Later `async_task_progress'
+             ;; and `async_task_state_update' notifications look themselves
+             ;; up here too.
+             (agent-shell--save-async-task state async-task-id name task-type description
+                                           can-stop show-in-transcript)
+             (when show-in-transcript
+               (agent-shell--update-fragment
+                :state state
+                :block-id (agent-shell--async-task-block-id async-task-id)
+                :label-left (format "%s %s"
+                                    (agent-shell--make-status-kind-label :status "running")
+                                    (propertize (or name task-type "Background task")
+                                                'font-lock-face 'agent-shell-section-heading))
+                :body (agent-shell--format-async-task-body description nil nil nil)
+                :expanded agent-shell-tool-use-expand-by-default)
+               ;; Only when something was drawn: advancing this with nothing
+               ;; on screen splits a streaming agent message in two.
+               (agent-shell--activity-group-note-entry-type state "async_task_spawned"))))
           ((and (equal (map-nested-elt acp-notification '(params update sessionUpdate)) "async_task_progress")
                 (agent-shell--async-task state (map-nested-elt acp-notification '(params update asyncTaskId))))
            (let* ((async-task-id (map-nested-elt acp-notification '(params update asyncTaskId)))
                   (registered (agent-shell--async-task state async-task-id)))
-             (agent-shell--update-fragment
-              :state state
-              :block-id (agent-shell--async-task-block-id async-task-id)
-              :label-left (format "%s %s"
-                                  (agent-shell--make-status-kind-label :status "running")
-                                  (propertize (or (map-elt registered :name)
-                                                  (map-elt registered :task-type)
-                                                  "Background task")
-                                              'font-lock-face 'agent-shell-section-heading))
-              :body (agent-shell--format-async-task-body
-                     (or (map-nested-elt acp-notification '(params update description))
-                         (map-elt registered :description))
-                     (map-nested-elt acp-notification '(params update summary))
-                     (map-nested-elt acp-notification '(params update lastToolName))
-                     (map-nested-elt acp-notification '(params update usage)))))
-           (map-put! state :last-entry-type "async_task_progress"))
+             ;; Deliberately not a state write: `async_task_progress' carries
+             ;; no `state' of its own and the agent sends one for any
+             ;; non-terminal task, paused included, so treating it as
+             ;; "running" resumes a paused task in the registry the stop
+             ;; command reads.  `async_task_state_update' owns the state.
+             ;; A task that draws no card of its own is tracked but not
+             ;; drawn, the same as when it spawned.
+             (when (map-elt registered :show-in-transcript)
+               (agent-shell--update-fragment
+                :state state
+                :block-id (agent-shell--async-task-block-id async-task-id)
+                :label-left (format "%s %s"
+                                    (agent-shell--make-status-kind-label
+                                     :status (or (map-elt registered :state) "running"))
+                                    (propertize (or (map-elt registered :name)
+                                                    (map-elt registered :task-type)
+                                                    "Background task")
+                                                'font-lock-face 'agent-shell-section-heading))
+                :body (agent-shell--format-async-task-body
+                       (or (map-nested-elt acp-notification '(params update description))
+                           (map-elt registered :description))
+                       (map-nested-elt acp-notification '(params update summary))
+                       (map-nested-elt acp-notification '(params update lastToolName))
+                       (map-nested-elt acp-notification '(params update usage))))
+               (agent-shell--activity-group-note-entry-type state "async_task_progress"))))
           ((and (equal (map-nested-elt acp-notification '(params update sessionUpdate)) "async_task_state_update")
                 (agent-shell--async-task state (map-nested-elt acp-notification '(params update asyncTaskId))))
            (let* ((async-task-id (map-nested-elt acp-notification '(params update asyncTaskId)))
                   (task-state (map-nested-elt acp-notification '(params update state)))
                   (registered (agent-shell--async-task state async-task-id)))
-             (agent-shell--update-fragment
-              :state state
-              :block-id (agent-shell--async-task-block-id async-task-id)
-              :label-left (format "%s %s"
-                                  (agent-shell--make-status-kind-label :status task-state)
-                                  (propertize (or (map-elt registered :name)
-                                                  (map-elt registered :task-type)
-                                                  "Background task")
-                                              'font-lock-face 'agent-shell-section-heading))
-              :body (agent-shell--format-async-task-body
-                     (or (map-nested-elt acp-notification '(params update summary))
-                         (map-elt registered :description))
-                     nil nil nil)))
-           (map-put! state :last-entry-type "async_task_state_update"))
+             (agent-shell--set-async-task-state state async-task-id task-state)
+             (when (map-elt registered :show-in-transcript)
+               (agent-shell--update-fragment
+                :state state
+                :block-id (agent-shell--async-task-block-id async-task-id)
+                :label-left (format "%s %s"
+                                    (agent-shell--make-status-kind-label :status task-state)
+                                    (propertize (or (map-elt registered :name)
+                                                    (map-elt registered :task-type)
+                                                    "Background task")
+                                                'font-lock-face 'agent-shell-section-heading))
+                :body (agent-shell--format-async-task-body
+                       (or (map-nested-elt acp-notification '(params update summary))
+                           (map-elt registered :description))
+                       nil nil nil))
+               (agent-shell--activity-group-note-entry-type state "async_task_state_update"))))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call_update")
            (let* ((tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
                   (old-tool-call (map-nested-elt state `(:tool-calls ,tool-call-id)))
@@ -3697,7 +3876,7 @@ around this call to reflect whether the update arrived out of turn."
              ;; tool call (appended at the end).  An in-place update of an
              ;; earlier tool must not erase an intervening entry's boundary.
              (when tool-newly-grouped
-               (map-put! state :last-entry-type "tool_call_update")))))
+               (agent-shell--activity-group-note-entry-type state "tool_call_update")))))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "available_commands_update")
            (map-put! state :available-commands (map-nested-elt acp-notification '(params update availableCommands)))
            (agent-shell--update-bootstrapping-fragment
@@ -3705,7 +3884,7 @@ around this call to reflect whether the update arrived out of turn."
             :block-id "available_commands_update"
             :label-left (propertize "Available /commands" 'font-lock-face 'agent-shell-section-heading)
             :body (agent-shell--format-available-commands (map-nested-elt acp-notification '(params update availableCommands))))
-           (map-put! state :last-entry-type "available_commands_update"))
+           (agent-shell--activity-group-note-entry-type state "available_commands_update"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "current_mode_update")
            (let ((updated-session (map-elt state :session))
                  (new-mode-id (map-nested-elt acp-notification '(params update currentModeId))))
@@ -3758,7 +3937,7 @@ around this call to reflect whether the update arrived out of turn."
             :body (agent-shell--make-unhandled-notification-body acp-notification)
             :append t
             :above-last-prompt (not (shell-maker-busy)))
-           (map-put! state :last-entry-type nil))))
+           (agent-shell--activity-group-note-entry-type state nil))))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
@@ -3768,7 +3947,7 @@ around this call to reflect whether the update arrived out of turn."
           :body (agent-shell--make-unhandled-notification-body acp-notification)
           :append t
           :above-last-prompt (not (shell-maker-busy)))
-         (map-put! state :last-entry-type nil))))
+         (agent-shell--activity-group-note-entry-type state nil))))
 
 (cl-defun agent-shell--on-request (&key state acp-request)
   "Handle incoming ACP-REQUEST using STATE."
@@ -3842,7 +4021,7 @@ around this call to reflect whether the update arrived out of turn."
                 :event 'permission-request
                 :data data)
                (agent-shell--start-idle-timer :event 'permission-request :data data))
-             (map-put! state :last-entry-type "session/request_permission"))))
+             (agent-shell--activity-group-note-entry-type state "session/request_permission"))))
         ((equal (map-elt acp-request 'method) "fs/read_text_file")
          (agent-shell--on-fs-read-text-file-request
           :state state
@@ -3871,7 +4050,7 @@ around this call to reflect whether the update arrived out of turn."
                         (:error . ,(acp-make-error
                                     :code -32601
                                     :message (format "Method not found: %s" method)))))
-           (map-put! state :last-entry-type nil)))))
+           (agent-shell--activity-group-note-entry-type state nil)))))
 
 (cl-defun agent-shell--extract-buffer-text (&key buffer line limit)
   "Extract text from BUFFER starting from LINE with optional LIMIT.
@@ -4878,6 +5057,10 @@ a `status' key and a `content' or `step' key."
 Only `subagent_spawned' calls this; later `subagent_state_update'
 notifications carry no name/task of their own and look this up by
 SUBAGENT-SESSION-ID instead."
+  ;; Migrate state for sessions created before :native-subagents existed.
+  ;; Without this, map-put! fails on mid-session package updates.
+  (unless (assq :native-subagents state)
+    (nconc state (list (cons :native-subagents nil))))
   (map-put! state :native-subagents
             (cons (cons subagent-session-id (list :name name :task task))
                   (map-elt state :native-subagents))))
@@ -4890,19 +5073,172 @@ SUBAGENT-SESSION-ID instead."
   "Format a native subagent fragment body for TASK."
   (or task ""))
 
-(defun agent-shell--save-async-task (state async-task-id name task-type description)
-  "Record ASYNC-TASK-ID's NAME, TASK-TYPE, and DESCRIPTION in STATE's registry.
+(defun agent-shell--subagent-name-label (subagent)
+  "Return a styled label for SUBAGENT's name, or nil.
+
+The underlying text stays as the plain name so copying a fragment does not
+include terminal-only brackets.  A display-time replacement adds brackets
+on terminal frames, where the name face alone may not distinguish the label
+from surrounding text."
+  (when-let* ((name (map-elt subagent :name)))
+    (let ((terminal-label
+           (propertize (format "[%s]" name) 'face 'agent-shell-subagent-name)))
+      (propertize name
+                  'font-lock-face 'agent-shell-subagent-name
+                  'agent-shell-subagent-label t
+                  'display `(when (not window-system) . ,terminal-label)))))
+
+(defun agent-shell--maybe-prefix-with-subagent (label)
+  "Prefix LABEL with the active subagent's name when one is bound.
+
+The name comes first so it reads like a speaker heading.  A fragment without
+a LABEL-LEFT, such as an `agent_message_chunk', receives the name as its
+whole label.  Root content and subagents without names remain unchanged."
+  (if-let* ((subagent (cdr-safe agent-shell--subagent-group))
+            (name-label (agent-shell--subagent-name-label subagent)))
+      (if label
+          (concat name-label " " label)
+        name-label)
+    label))
+
+(defun agent-shell--last-agent-message-id (state session-id)
+  "Return the last agent `messageId' STATE rendered for SESSION-ID, or nil.
+
+Kept per session rather than one slot for the shell: a native subagent's
+messages render into this same shell, so a shared slot makes a message
+interrupted by another session's message look like a new one, and
+`agent-shell-ui-update-fragment' then opens a second block for it instead
+of continuing the first."
+  (alist-get session-id (map-elt state :last-agent-message-ids) nil nil #'equal))
+
+(defun agent-shell--set-last-agent-message-id (state session-id message-id)
+  "Record MESSAGE-ID as the last one rendered for SESSION-ID in STATE."
+  ;; Migrate state for sessions created before :last-agent-message-ids
+  ;; existed.  Without this, map-put! fails on mid-session package updates.
+  (unless (assq :last-agent-message-ids state)
+    (nconc state (list (cons :last-agent-message-ids nil))))
+  (map-put! state :last-agent-message-ids
+            (cons (cons session-id message-id)
+                  (assoc-delete-all session-id
+                                    (map-elt state :last-agent-message-ids)))))
+
+(defun agent-shell--last-agent-message-block-id (state session-id)
+  "Return the fallback message block ID for SESSION-ID in STATE, or nil.
+
+ACP agents may omit `messageId'.  This per-session ID keeps a streamed
+message attached to its original fragment when another session advances the
+shared `:chunked-group-count'."
+  (alist-get session-id (map-elt state :last-agent-message-block-ids)
+             nil nil #'equal))
+
+(defun agent-shell--set-last-agent-message-block-id (state session-id block-id)
+  "Record fallback message BLOCK-ID for SESSION-ID in STATE."
+  (agent-shell--ensure-state-key state :last-agent-message-block-ids)
+  (map-put! state :last-agent-message-block-ids
+            (cons (cons session-id block-id)
+                  (assoc-delete-all session-id
+                                    (map-elt state :last-agent-message-block-ids)))))
+
+(defun agent-shell--save-async-task (state async-task-id name task-type description
+                                          can-stop show-in-transcript)
+  "Record ASYNC-TASK-ID's NAME, TASK-TYPE, DESCRIPTION, and CAN-STOP in
+STATE's registry, with an initial `:state' of \"running\".
 Only `async_task_spawned' calls this; later `async_task_progress' and
-`async_task_state_update' notifications carry no name/type of their own
-and look this up by ASYNC-TASK-ID instead."
+`async_task_state_update' notifications carry no name/type/canStop of
+their own and look this up by ASYNC-TASK-ID instead.
+
+SHOW-IN-TRANSCRIPT records whether this task draws its own transcript
+card, so those later notifications can keep a hidden task hidden while
+still tracking its state.  Every task is registered regardless: the flag
+is about display, and `agent-shell-stop-async-task' can only offer what
+the registry holds."
+  ;; Migrate state for sessions created before :async-tasks existed.
+  ;; Without this, map-put! fails on mid-session package updates.
+  (unless (assq :async-tasks state)
+    (nconc state (list (cons :async-tasks nil))))
   (map-put! state :async-tasks
             (cons (cons async-task-id (list :name name :task-type task-type
-                                            :description description))
+                                            :description description
+                                            :can-stop can-stop
+                                            :show-in-transcript show-in-transcript
+                                            :state "running"))
                   (map-elt state :async-tasks))))
 
 (defun agent-shell--async-task (state async-task-id)
   "Return the plist recorded for ASYNC-TASK-ID, or nil."
   (map-elt (map-elt state :async-tasks) async-task-id))
+
+(defun agent-shell--set-async-task-state (state async-task-id task-state)
+  "Update ASYNC-TASK-ID's recorded `:state' to TASK-STATE in STATE's registry.
+No-op if ASYNC-TASK-ID was never registered by `agent-shell--save-async-task'."
+  (when-let* ((entry (assoc async-task-id (map-elt state :async-tasks))))
+    (setcdr entry (plist-put (cdr entry) :state task-state))))
+
+(defun agent-shell--stoppable-async-tasks (state)
+  "Return STATE's async tasks that are still running and stoppable.
+Each element is (ASYNC-TASK-ID . PLIST), newest first."
+  (seq-filter (lambda (entry)
+                (let ((task (cdr entry)))
+                  (and (map-elt task :can-stop)
+                       (not (member (map-elt task :state)
+                                    '("completed" "failed" "stopped"))))))
+              (map-elt state :async-tasks)))
+
+(defun agent-shell--async-task-candidate-label (entry)
+  "Return a `completing-read' candidate label for async task ENTRY.
+ENTRY is (ASYNC-TASK-ID . PLIST), as returned by
+`agent-shell--stoppable-async-tasks'."
+  (format "%s (%s)"
+         (or (map-elt (cdr entry) :name) (map-elt (cdr entry) :task-type) (car entry))
+         (car entry)))
+
+(cl-defun agent-shell--async-task-stop-request (&key session-id async-task-id)
+  "Return a `_session/async_task/stop' request for SESSION-ID's ASYNC-TASK-ID.
+This is claude-agent-acp's extension for stopping a background async
+task from the client -- there is no canonical ACP method for it."
+  (unless session-id
+    (error ":session-id is required"))
+  (unless async-task-id
+    (error ":async-task-id is required"))
+  `((:method . "_session/async_task/stop")
+    (:params . ((sessionId . ,session-id)
+                (asyncTaskId . ,async-task-id)))))
+
+(defun agent-shell-stop-async-task ()
+  "Stop a running, stoppable background async task in this session.
+With more than one candidate, prompt among the currently running,
+stoppable tasks; the agent's own `async_task_state_update' notification
+updates the fragment once the task actually stops."
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-mode)
+    (error "Not in an agent-shell buffer"))
+  (let* ((state (agent-shell--state))
+         (candidates (agent-shell--stoppable-async-tasks state)))
+    (unless candidates
+      (user-error "No stoppable background tasks in this session"))
+    (let* ((chosen (if (= (length candidates) 1)
+                       (car candidates)
+                     (let ((choice (completing-read
+                                   "Stop background task: "
+                                   (mapcar #'agent-shell--async-task-candidate-label candidates)
+                                   nil t)))
+                       (seq-find (lambda (entry)
+                                   (equal (agent-shell--async-task-candidate-label entry) choice))
+                                 candidates))))
+           (async-task-id (car chosen)))
+      (agent-shell--send-request
+       :state state
+       :client (map-elt state :client)
+       :request (agent-shell--async-task-stop-request
+                 :session-id (map-nested-elt state '(:session :id))
+                 :async-task-id async-task-id)
+       :buffer (current-buffer)
+       :on-success (lambda (acp-response)
+                     (unless (eq (map-elt acp-response 'stopped) t)
+                       (message "Background task %s could not be stopped (already finished?)"
+                                async-task-id)))
+       :on-failure (lambda (acp-error _raw-message)
+                     (message "Failed to stop background task: %s" acp-error))))))
 
 (defun agent-shell--format-async-task-body (description summary last-tool-name usage)
   "Format an async task fragment body from DESCRIPTION, SUMMARY,
@@ -5414,6 +5750,9 @@ from GROUP-LABEL on first use (see `agent-shell-ui-make-fragment-model'),
 with GROUP-EXPANDED as the group's initial fold state."
   (when label-right
     (setq label-right (string-trim label-right)))
+  ;; Prefix this fragment with a native subagent's name rather than the root
+  ;; session's -- see `agent-shell--subagent-group'.
+  (setq label-left (agent-shell--maybe-prefix-with-subagent label-left))
   ;; Convert non-standard multiline single-backtick code spans to fenced
   ;; code blocks so the markdown renderer can recognize them as source
   ;; blocks, but only for labels that start with `.
@@ -6935,6 +7274,29 @@ don't implement the extension ignore the unrecognized `_meta' key."
                           (list (cons 'version 1)
                                 (cons 'capabilities (vconcat capabilities))))))))
 
+(defun agent-shell--air-client-capabilities-meta ()
+  "Return the AIR `_meta' naming every extension feature this client renders.
+
+The agent gates each feature on the client naming it here: native
+subagent sessions on \"nativeSubagentSessions\" and background tasks on
+\"asyncTasks\".  A feature rendered but not named is dead code, since the
+agent never sends its notifications; a feature named but not rendered
+leaves its notifications unhandled.  Keep this list and what
+`agent-shell--dispatch-notification' handles in step."
+  (agent-shell--air-capabilities-meta "nativeSubagentSessions" "asyncTasks"))
+
+(defun agent-shell--air-extension-supported-p (acp-response)
+  "Return non-nil when ACP-RESPONSE's agent implements the AIR extension.
+
+ACP-RESPONSE is an `initialize' response.  The agent advertises the
+extension as a version and capability list under the response's
+top-level `_meta.jetbrains.air', a sibling of `agentCapabilities'.
+
+Read rather than assumed, because the extension is one vendor's: an
+agent that never advertised it ignores AIR `_meta' on the requests we
+send, which turns a feature riding one into a silent no-op."
+  (and (map-nested-elt acp-response '(_meta jetbrains air version)) t))
+
 (cl-defun agent-shell--initialize-client ()
   "Initialize ACP client."
   (agent-shell--update-bootstrapping-fragment
@@ -7041,15 +7403,21 @@ Must provide ON-INITIATED (lambda ())."
                             (version . ,agent-shell--version))
              :read-text-file-capability agent-shell-text-file-capabilities
              :write-text-file-capability agent-shell-text-file-capabilities
-             ;; `subagents' is the draft ACP field (agent-client-protocol#1992);
-             ;; `asyncTasks' has no canonical field yet, so it only exists as
-             ;; claude-agent-acp's AIR `_meta' extension.  The AIR payload rides
-             ;; inside `clientCapabilities' because that is where agents read it
-             ;; (claude-agent-acp, codex-acp): a request-level `_meta' goes
-             ;; unnoticed and every gated feature silently falls back.  Unknown
-             ;; capabilities and `_meta' keys are ignored per the ACP spec.
-             :client-capabilities `((subagents . ())
-                                    (_meta . ,(agent-shell--air-capabilities-meta "asyncTasks"))))
+             ;; Vendor extensions are advertised per agent rather than from
+             ;; here: the `jetbrains.air' namespace is one vendor's, and a
+             ;; shared handshake would send every vendor's keys to every
+             ;; agent with no way for one config to opt out.  The payload
+             ;; rides inside `clientCapabilities' because that is where
+             ;; agents read it (claude-agent-acp, codex-acp): a request-level
+             ;; `_meta' goes unnoticed and every gated feature silently
+             ;; falls back.  `subagents' is the draft ACP field
+             ;; (agent-client-protocol#1992).  Unknown capabilities and
+             ;; `_meta' keys are ignored per the ACP spec.
+             :client-capabilities (append '((subagents . ()))
+                                         (when-let* ((air-meta (map-nested-elt
+                                                                agent-shell--state
+                                                                '(:agent-config :initialize-meta))))
+                                           `((_meta . ,air-meta)))))
    :on-success (lambda (acp-response)
                  (with-current-buffer shell-buffer
                    (let ((acp-session-capabilities (or (map-elt acp-response 'sessionCapabilities)
@@ -8142,7 +8510,7 @@ pending-restore state once replay completes."
                                       'read-only t
                                       'front-sticky '(read-only)
                                       'rear-nonsticky '(field read-only))))
-                (map-put! state :last-entry-type nil))))
+                (agent-shell--activity-group-note-entry-type state nil))))
         (map-put! state :active-requests saved-active-requests))
       ;; Replay renders history as a live turn would, so the last replayed
       ;; group is left expanded under `latest'.  Nothing is actually
@@ -8923,7 +9291,7 @@ reads the buffer's prompt capabilities."
     (agent-shell--emit-event :event 'input-submitted
                              :data (list (cons :prompt (substring-no-properties expanded-prompt))))
 
-    (map-put! agent-shell--state :last-entry-type nil)
+    (agent-shell--activity-group-note-entry-type agent-shell--state nil)
 
     ;; Seed the session title with the first user prompt so consumers
     ;; (e.g. agent-shell-manager) have something to display before any

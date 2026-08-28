@@ -905,6 +905,18 @@ group children."
       (should (string-match-p "some tool output"
                               (buffer-substring-no-properties (point-min) (point-max)))))))
 
+(ert-deftest agent-shell-ui-empty-group-child-does-not-create-header-test ()
+  "A group child with no labels or body does not leave a bare header."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "1" :block-id "t1"
+      :group-id "activity-1" :group-label "Activity")
+     :no-undo t)
+    (should-not (agent-shell-ui--group-header-range "1-activity-1"))
+    (should (= (point-min) (point-max)))))
+
 ;;; actions
 
 (ert-deftest agent-shell-ui-make-foldable-text-shares-one-map-test ()

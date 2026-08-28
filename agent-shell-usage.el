@@ -79,6 +79,10 @@ per-model breakdown at ACP-META's `quota.model_usage', when present."
     (when-let* ((cached-write (map-elt acp-usage 'cachedWriteTokens)))
       (map-put! usage-state :cached-write-tokens cached-write))
     (when-let* ((model-usage (map-nested-elt acp-meta '(quota model_usage))))
+      ;; Migrate state for sessions created before :model-usage existed.
+      ;; Without this, map-put! fails on mid-session package updates.
+      (unless (assq :model-usage usage-state)
+        (nconc usage-state (list (cons :model-usage nil))))
       (map-put! usage-state :model-usage
                 (mapcar #'agent-shell--parse-model-usage-entry model-usage)))
     (map-put! state :usage usage-state)))

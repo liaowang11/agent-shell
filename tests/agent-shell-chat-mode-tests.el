@@ -872,6 +872,24 @@ The overlay starts past the `:extend' background and drops its `line-prefix'."
       (should (= 2 (length runs)))
       (should (< (cdr (nth 0 runs)) (car (nth 1 runs)))))))
 
+(ert-deftest agent-shell-chat-subagent-label-is-not-a-prompt-run-test ()
+  "A subagent name is not labeled as a user prompt."
+  (with-temp-buffer
+    (insert (propertize "Researcher"
+                        'font-lock-face 'agent-shell-subagent-name
+                        'agent-shell-subagent-label t))
+    (should-not (agent-shell-chat--prompt-runs))))
+
+(ert-deftest agent-shell-chat-legacy-subagent-label-is-not-a-prompt-run-test ()
+  "A pre-marker subagent name is not labeled after chat mode reloads."
+  (with-temp-buffer
+    (insert (propertize "Researcher"
+                        'font-lock-face 'agent-shell-subagent-name
+                        'display '(when (not window-system)
+                                   . "[Researcher]")
+                        'agent-shell-ui-state '((:qualified-id . "global-1"))))
+    (should-not (agent-shell-chat--prompt-runs))))
+
 (ert-deftest agent-shell-chat-label-after-interrupted-turn-test ()
   "A label after an interrupted turn keeps one blank line before it.
 An interrupted turn appends its notice right before the end-of-prompt
