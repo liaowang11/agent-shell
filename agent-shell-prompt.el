@@ -48,7 +48,7 @@
 When non-nil, the prompt returns as soon as a submission is dispatched
 and stays for the whole turn, so there is always somewhere to type.  What
 submitting into a working agent then does is up to
-`agent-shell-busy-submit-default-function', which queues by default, the
+`agent-shell-busy-submit-default-function', which steers by default, the
 way a TUI agent takes type-ahead.
 
 Everything a turn renders lands above that prompt, pushing unsubmitted
