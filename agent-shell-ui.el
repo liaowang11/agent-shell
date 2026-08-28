@@ -99,7 +99,7 @@ otherwise nil so the id stays hidden from users."
   (when agent-shell-ui-debug-enabled
     qualified-id))
 
-(cl-defun agent-shell-ui-make-fragment-model (&key (namespace-id "global") (block-id "1") label-left label-right body group-id group-label (group-expanded t))
+(cl-defun agent-shell-ui-make-fragment-model (&key (namespace-id "global") (block-id "1") label-left label-right body group-id group-label (group-expanded t) stack-labels)
   "Create a fragment model alist.
 NAMESPACE-ID, BLOCK-ID, LABEL-LEFT, LABEL-RIGHT, and BODY are the keys.
 
@@ -107,7 +107,10 @@ GROUP-ID nests this fragment under a collapsible group header (a sibling
 fragment with `block-id' GROUP-ID in the same namespace).  When that
 header does not yet exist, GROUP-LABEL materializes it (auto-create) with
 GROUP-EXPANDED as its initial fold state.  GROUP-ID nil means a top-level
-fragment."
+fragment.
+
+STACK-LABELS puts LABEL-RIGHT on its own line under LABEL-LEFT instead of
+beside it, so both stay readable in a narrow window."
   (list (cons :namespace-id namespace-id)
         (cons :block-id block-id)
         (cons :label-left (agent-shell-ui--string-or-nil label-left))
@@ -115,7 +118,8 @@ fragment."
         (cons :body (agent-shell-ui--string-or-nil body))
         (cons :group-id (agent-shell-ui--string-or-nil group-id))
         (cons :group-label (agent-shell-ui--string-or-nil group-label))
-        (cons :group-expanded group-expanded)))
+        (cons :group-expanded group-expanded)
+        (cons :stack-labels stack-labels)))
 
 (cl-defun agent-shell-ui-make-group-model (&key (namespace-id "global") (block-id "1") label-left label-right (expanded t))
   "Create a group-header model alist.
@@ -209,6 +213,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
             ;; a tool call and its completion) would spawn an empty group.
             ;; Either way the resolved parent qualified-id and indent are
             ;; recorded on the model so insertion and body regeneration nest.
+            ;; A content-free child must not materialize its parent: doing so
+            ;; leaves a bare group header with no member to render beneath it.
             (cond
              ((and existing-start (not create-new))
               (when-let* ((state (get-text-property existing-start
@@ -218,7 +224,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                     (list (cons :group-qualified-id existing-group)
                                           (cons :group-indent
                                                 (or (map-elt state :group-indent) "  ")))))))
-             (group-id
+             ((and group-id (or new-label-left new-label-right new-body))
               (setq group-header (agent-shell-ui--insert-group-header
                                   :namespace-id namespace-id
                                   :group-id group-id
@@ -313,6 +319,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                             (or new-label-right
                                                 (map-elt existing-labels :label-right)))
                                       (cons :body new-body)
+                                      (cons :stack-labels (map-elt model :stack-labels))
                                       ;; Preserve the parent group + indent so
                                       ;; the regenerated child stays nested.
                                       (cons :group-qualified-id
@@ -462,11 +469,16 @@ fenced block)."
   "Hide trailing whitespace within [BODY-START, BODY-END) via invisible property.
 Marks the hidden chars `rear-nonsticky' for `invisible' so chars later
 inserted at BODY-END don't silently inherit `invisible t' from the
-trailing-whitespace tail."
+trailing-whitespace tail.
+
+A button's padding is left visible: it carries the button's box, and
+hiding it drops the box's right edge."
   (save-excursion
     (goto-char body-end)
     (when (re-search-backward "[^ \t\n]" body-start t)
       (forward-char 1)
+      (when (get-text-property (point) 'button)
+        (goto-char (next-single-property-change (point) 'button nil body-end)))
       (when (< (point) body-end)
         (add-text-properties (point) body-end
                              '(invisible t rear-nonsticky (invisible)))))))
@@ -1045,7 +1057,8 @@ NAVIGATION controls navigability:
 A group header (MODEL `:kind' `group') gets a fold triangle and no body of
 its own; its children render below it as separate fragments tagged with its
 qualified-id via `:group-qualified-id'.  MODEL `:group-indent' visually
-indents a child's header line under its group header."
+indents a child's header line under its group header.  MODEL `:stack-labels'
+puts label-right on its own line under label-left instead of beside it."
   (let* ((block-start (point))
          (kind (map-elt model :kind))
          (group (eq kind 'group))
@@ -1114,7 +1127,7 @@ indents a child's header line under its group header."
 
     (when label-right
       (when need-space
-        (insert " "))
+        (insert (if (map-elt model :stack-labels) "\n  " " ")))
       (setq label-right-start (point))
       (insert (agent-shell-ui-make-foldable-text
                :text label-right

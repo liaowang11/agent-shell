@@ -780,7 +780,7 @@ block -- covering the dispatch path, not just the helper in isolation."
                      ;; Pre-set so the header/end-of-prompt branches are
                      ;; skipped; the test only exercises content rendering.
                      (cons :last-entry-type "agent_message_chunk")
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :last-activity-time nil)))
         (rendered nil))
     (cl-letf (((symbol-function 'agent-shell--active-requests-p)
@@ -896,7 +896,7 @@ prompt -- unlabeled, not as an error fragment."
                      ;; No request in flight => the update is out of turn.
                      (cons :active-requests nil)
                      (cons :last-activity-time nil)
-                     (cons :last-agent-message-id nil)))
+                     (cons :last-agent-message-ids nil)))
         (captured nil)
         (above-flag nil))
     (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
@@ -931,7 +931,7 @@ ordinary streaming output stays in the normal flow."
                      (cons :last-entry-type "agent_message_chunk")
                      (cons :active-requests '(((:method . "session/prompt"))))
                      (cons :last-activity-time nil)
-                     (cons :last-agent-message-id nil)))
+                     (cons :last-agent-message-ids nil)))
         (captured nil)
         (above-flag 'unset))
     (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
@@ -1022,7 +1022,7 @@ goes quiet."
                       (cons :last-entry-type nil)
                       (cons :active-requests nil)
                       (cons :last-activity-time nil)
-                      (cons :last-agent-message-id nil)
+                      (cons :last-agent-message-ids nil)
                       (cons :heartbeat heartbeat)
                       (cons :out-of-turn-timer nil)))
     (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
@@ -1054,7 +1054,7 @@ out-of-turn re-raise must not apply."
                       (cons :last-entry-type "agent_message_chunk")
                       (cons :active-requests '(((:method . "session/prompt"))))
                       (cons :last-activity-time nil)
-                      (cons :last-agent-message-id nil)
+                      (cons :last-agent-message-ids nil)
                       (cons :heartbeat heartbeat)
                       (cons :out-of-turn-timer nil)))
     (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
@@ -3733,7 +3733,7 @@ and avoid inserting paragraph breaks between chunks of one prompt."
         (state (list (cons :buffer (current-buffer))
                      (cons :active-requests '(((:method . "session/load"))))
                      (cons :last-entry-type "agent_message_chunk")
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :last-activity-time nil)
                      (cons :chunked-group-count 1)
                      (cons :pending-restore nil)
@@ -8714,7 +8714,7 @@ Between successive chunks `:last-entry-type' is left as-is, reproducing an
 interleaved entry that failed to advance it.  Returns a list of
 \(BLOCK-ID . CREATE-NEW) as passed to `agent-shell--update-fragment'."
   (let ((state (list (cons :last-entry-type nil)
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :chunked-group-count 0)
                      (cons :active-requests t)
                      (cons :pending-restore nil)
@@ -8872,7 +8872,7 @@ in flight shows its members."
         (agent-shell-activity-group-expand-by-default 'latest)
         (state (list (cons :tool-calls nil)
                      (cons :last-entry-type nil)
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :activity-group-count 0)
                      (cons :chunked-group-count 0)
                      (cons :request-count 1)
@@ -12024,6 +12024,21 @@ with the next block's."
             (agent-shell--render-deferred-markup)
             (should-not (string-match-p "\n\\'" (agent-shell-tests--visible-text)))))
       (delete-file image-file))))
+
+(ert-deftest agent-shell-ui--trailing-whitespace-invisible-spares-button-test ()
+  "A button ending a body keeps its padding visible.
+The padding carries the button's box, so hiding it drops the box's
+right edge, as with the \"Open subagent\" button ending a subagent
+row's body.  Plain whitespace after the button is still hidden."
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _d) t)))
+    (with-temp-buffer
+      (insert "task\n\n"
+              (agent-shell--make-button :text "Open subagent" :kind 'subagent
+                                        :action #'ignore)
+              "\n\n")
+      (agent-shell-ui--apply-trailing-whitespace-invisible (point-min) (point-max))
+      (should (equal (agent-shell-tests--visible-text)
+                     "task\n\n Open subagent ")))))
 
 (defun agent-shell-tests--visible-text ()
   "Return the current buffer's text with `invisible' chars removed."
