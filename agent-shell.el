@@ -1316,6 +1316,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :sleep-token nil)
         (cons :out-of-turn-timer nil)
         (cons :active-requests nil)
+        (cons :prompt-queue-paused nil)
         (cons :pending-prompts nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
@@ -1327,6 +1328,19 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
                            (cons :context-size 0)
                            (cons :cost-amount 0.0)
                            (cons :cost-currency nil)))))
+
+(defun agent-shell--ensure-state-key (state key)
+  "Make sure STATE carries KEY, adding it with a nil value when it does not.
+
+`map-put!' refuses to add a key an alist does not already have, so a
+shell built before KEY existed -- a live session across a package
+upgrade -- would fail on the first write to it.  `nconc' extends the
+alist in place, which keeps every reference to STATE seeing the addition.
+
+Return STATE."
+  (unless (assq key state)
+    (nconc state (list (cons key nil))))
+  state)
 
 (defvar-local agent-shell--state
     (agent-shell--make-state))
@@ -1387,14 +1401,18 @@ instead of being echoed into the transcript and rejected later.
 
 Submitting mid-turn hands the text to
 `agent-shell-busy-submit-default-function' and clears the input, which
-queues by default and drains when the turn ends.  Whether there is a
-prompt to submit from mid-turn is up to
+steers by default, so a turn going the wrong way can be corrected
+without waiting for it.  \"Mid-turn\" is
+`agent-shell--prompt-submittable-p' rather than `shell-maker-busy': a
+paused queue means an untracked turn is still running while the shell
+looks idle, and submitting then would fire a prompt at a working agent.
+Whether there is a prompt to submit from mid-turn is up to
 `agent-shell-persistent-prompt-enabled', but the routing does not depend
 on it: the same setting governs the viewport's compose buffer, which is
 there either way.
 
 With \\[universal-argument] prefix ARG, submit through
-`agent-shell-busy-submit-override-function' instead, which steers by
+`agent-shell-busy-submit-override-function' instead, which queues by
 default.  \\[agent-shell-submit-override] is bound to the same thing.
 
 This owns the `agent-shell-submit' name because shell-maker's
@@ -1406,11 +1424,11 @@ per-start aliasing is disabled (see the `:alias-commands nil' call in
   (unless (or (map-nested-elt agent-shell--state '(:session :id))
               (eq agent-shell-session-strategy 'new-deferred))
     (user-error "Starting agent, please wait"))
-  (if (shell-maker-busy)
-      (when-let* ((prompt (agent-shell--prompt-input)))
-        (agent-shell--busy-submit :prompt prompt :override arg)
-        (agent-shell--clear-prompt-input))
-    (shell-maker-submit)))
+  (if (agent-shell--prompt-submittable-p)
+      (shell-maker-submit)
+    (when-let* ((prompt (agent-shell--prompt-input)))
+      (agent-shell--busy-submit :prompt prompt :override arg)
+      (agent-shell--clear-prompt-input))))
 
 (defun agent-shell-submit-override ()
   "Submit the current input through the override route.
@@ -1446,14 +1464,14 @@ with no turn to queue behind or steer into, both simply submit."
       (agent-shell--insert-to-shell-buffer :text text
                                            :shell-buffer shell-buffer))))
 
-(cl-defun agent-shell--display-viewport-when-ready (&key shell-buffer append override edit)
+(cl-defun agent-shell--display-viewport-when-ready (&key shell-buffer append override edit disposition)
   "Show the viewport for SHELL-BUFFER, deferring until its session is ready.
 
 When SHELL-BUFFER uses the `prompt' session strategy and has no session id
 yet, wait for the `session-selected' event before showing the viewport.
 Otherwise the session picker `completing-read' races a visible compose
-buffer, which is confusing.  APPEND, OVERRIDE and EDIT are forwarded to
-`agent-shell-viewport--show-buffer'."
+buffer, which is confusing.  APPEND, OVERRIDE, EDIT and DISPOSITION are
+forwarded to `agent-shell-viewport--show-buffer'."
   (if (and (eq (buffer-local-value 'agent-shell-session-strategy shell-buffer) 'prompt)
            (not (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
                                 '(:session :id))))
@@ -1463,9 +1481,11 @@ buffer, which is confusing.  APPEND, OVERRIDE and EDIT are forwarded to
        :on-event (agent-shell--preserving-display-override
                   (lambda (_event)
                     (agent-shell-viewport--show-buffer
-                     :append append :override override :edit edit :shell-buffer shell-buffer))))
+                     :append append :override override :edit edit
+                     :disposition disposition :shell-buffer shell-buffer))))
     (agent-shell-viewport--show-buffer
-     :append append :override override :edit edit :shell-buffer shell-buffer)))
+     :append append :override override :edit edit
+     :disposition disposition :shell-buffer shell-buffer)))
 
 (cl-defun agent-shell--dwim (&key config new-shell switch-to-shell)
   "Start or reuse an agent shell with DWIM behavior.
@@ -7399,31 +7419,34 @@ Wraps `acp-send-request' so that REQUEST is pushed to
 
 CLIENT, REQUEST, BUFFER, ON-SUCCESS, ON-FAILURE, and SYNC are passed
 through to `acp-send-request'."
-  ;; Migrate state for sessions created before :active-requests existed.
-  ;; Without this, map-put! fails on mid-session package updates.
-  (unless (assq :active-requests state)
-    (nconc state (list (cons :active-requests nil))))
-  (map-put! state :active-requests
-            (cons request (map-elt state :active-requests)))
-  (acp-send-request
-   :client client
-   :request request
-   :buffer buffer
-   :on-success (lambda (acp-response)
-                 (map-put! state :active-requests
-                           (seq-remove (lambda (r)
-                                         (equal r request))
-                                       (map-elt state :active-requests)))
-                 (when on-success
-                   (funcall on-success acp-response)))
-   :on-failure (lambda (acp-error raw-message)
-                 (map-put! state :active-requests
-                           (seq-remove (lambda (r)
-                                         (equal r request))
-                                       (map-elt state :active-requests)))
-                 (when on-failure
-                   (funcall on-failure acp-error raw-message)))
-   :sync sync))
+  (agent-shell--ensure-state-key state :active-requests)
+  (let ((remove-request
+         (lambda ()
+           (map-put! state :active-requests
+                     (seq-remove (lambda (r)
+                                   (equal r request))
+                                 (map-elt state :active-requests))))))
+    (map-put! state :active-requests
+              (cons request (map-elt state :active-requests)))
+    ;; A request that never went out must not stay listed as in flight, or
+    ;; the shell reads as busy for the rest of the session.
+    (condition-case err
+        (acp-send-request
+         :client client
+         :request request
+         :buffer buffer
+         :on-success (lambda (acp-response)
+                       (funcall remove-request)
+                       (when on-success
+                         (funcall on-success acp-response)))
+         :on-failure (lambda (acp-error raw-message)
+                       (funcall remove-request)
+                       (when on-failure
+                         (funcall on-failure acp-error raw-message)))
+         :sync sync)
+      (error
+       (funcall remove-request)
+       (signal (car err) (cdr err))))))
 
 (cl-defun agent-shell--initiate-handshake (&key shell-buffer on-initiated)
   "Initiate ACP handshake with SHELL-BUFFER.
@@ -9545,6 +9568,10 @@ reads the buffer's prompt capabilities."
                        (agent-shell--prompt-queue-display))
                       ;; Cancelled with nothing queued: nothing to ask.
                       ((not (map-elt (agent-shell--state) :pending-prompts)))
+                      ;; A paused queue sends nothing, so a yes would be
+                      ;; ignored.  Show how to resume it instead.
+                      ((agent-shell--prompt-queue-paused-p)
+                       (agent-shell--prompt-queue-display))
                       ((y-or-n-p (format "%s
 
 Continue?" (agent-shell--prompt-queue-summary)))
@@ -9648,21 +9675,135 @@ Returns a buffer object or nil."
   "Move point to the last interaction in the shell buffer."
   (when-let* ((shell-buffer (agent-shell--shell-buffer)))
     (with-current-buffer shell-buffer
-      ;; Not `comint-last-input-start' alone: a steered prompt is rendered
-      ;; rather than submitted through comint, so that marker still sits on
-      ;; the interaction the steer interrupted.
-      (goto-char (or (when-let* ((position (shell-maker-history-position)))
-                       (agent-shell--prompt-begin-position-at-index
-                        (map-elt position :total)))
+      ;; The last turn's submitted prompt (see `agent-shell--turns'), not
+      ;; the last prompt: a steer's prompt starts an exchange but not a
+      ;; turn.  `comint-last-input-start' is the fallback for a shell with
+      ;; no readable history.
+      (goto-char (or (map-elt (car (last (agent-shell--turns))) :position)
                      comint-last-input-start)))))
 
-(defun agent-shell--shell-response-start ()
-  "Return where the response of the interaction at point begins.
-Return nil when point is not on an interaction with a response.  The
-position sits right after the `<shell-maker-end-of-prompt>' delimiter, so
-it aligns with the start of the response text copied into the viewport."
+(defun agent-shell--steered-prompt-p (position)
+  "Return non-nil when the prompt beginning at POSITION was steered into a turn.
+`agent-shell-experimental--render-steered-prompt' marks the prompts it renders."
+  (get-text-property position 'agent-shell-steered-prompt))
+
+(defun agent-shell--turns ()
+  "Return the shell's history as turns, oldest first.
+
+A turn is a prompt the user submitted plus every prompt steered into the
+turn it started, up to the next submitted prompt.  The shell renders a
+steer as a prompt of its own, so `shell-maker--extract-history' and
+`shell-maker-history-position' count it as an exchange; the viewport shows
+the turn as one page, with each steer's line and answer reading on under
+the prompt that started it -- the shape the live mirror already gives it.
+
+Walks the buffer the way `shell-maker-history-position' does, counting an
+exchange wherever a prompt's chunk carries an end-of-prompt marker, so a
+turn's `:exchanges' index into that count.  Prompts and responses are raw:
+the viewport's own trimming keeps display padding.
+
+Each turn is an alist:
+
+  ((:prompt . PROMPT)              ; the submitted prompt, or nil if empty
+   (:response . RESPONSE)          ; its response, then each steer's prompt
+                                   ; line and response, or nil if empty
+   (:position . POSITION)          ; where the submitted prompt begins
+   (:exchanges . (FIRST . LAST)))  ; one-based exchange indices it spans"
+  (let ((prompt-regexp (if shell-maker--config
+                           (shell-maker-prompt-regexp shell-maker--config)
+                         comint-prompt-regexp))
+        (index 0)
+        turns)
+    (save-excursion
+      (goto-char (point-min))
+      ;; `comint-prompt-regexp' can match the empty string -- comint's own
+      ;; default is "^" -- and a search that matches without moving would
+      ;; loop here forever, so such a regexp reads as no prompts at all.
+      (while (and (not (string-match-p prompt-regexp ""))
+                  (shell-maker--re-search-forward-prompt prompt-regexp)
+                  (> (point) (match-beginning 0)))
+        (let* ((prompt-start (match-beginning 0))
+               (command-start (point))
+               (next-prompt (save-excursion
+                              (if (shell-maker--re-search-forward-prompt prompt-regexp)
+                                  (match-beginning 0)
+                                (point-max))))
+               (end-marker (shell-maker--find-marker
+                            "<shell-maker-end-of-prompt>" next-prompt)))
+          (when end-marker
+            (setq index (1+ index))
+            (let ((command (buffer-substring command-start (car end-marker)))
+                  (response (buffer-substring (cdr end-marker) next-prompt)))
+              (if (and turns (agent-shell--steered-prompt-p prompt-start))
+                  (let ((turn (car turns)))
+                    (setf (alist-get :response turn)
+                          (concat (or (alist-get :response turn) "")
+                                  ;; The prompt string as rendered, so the
+                                  ;; page reads as the live mirror did.
+                                  (buffer-substring prompt-start command-start)
+                                  command
+                                  response))
+                    (setcdr (alist-get :exchanges turn) index))
+                (push (list (cons :prompt (unless (string-empty-p command) command))
+                            (cons :response (unless (string-empty-p response) response))
+                            (cons :position prompt-start)
+                            (cons :exchanges (cons index index)))
+                      turns))))
+          ;; Always forward: NEXT-PROMPT is at or past point.
+          (goto-char (max next-prompt (point))))))
+    (nreverse turns)))
+
+(defun agent-shell--turn-at-index (index)
+  "Return the turn at one-based INDEX (see `agent-shell--turns'), or nil."
+  (when (> index 0)
+    (nth (1- index) (agent-shell--turns))))
+
+(defun agent-shell--turn-position ()
+  "Return the shell's position in history as turns.
+
+Like `shell-maker-history-position', an alist with `:current' and
+`:total', but counting turns (see `agent-shell--turns'): point anywhere in
+a steer's exchange is in the turn the steer joined.  Nil with no history."
+  (when-let* ((position (shell-maker-history-position))
+              (turns (agent-shell--turns)))
+    (let* ((exchange (map-elt position :current))
+           (current (or (cl-position-if
+                         (lambda (turn)
+                           (let ((span (map-elt turn :exchanges)))
+                             (<= (car span) exchange (cdr span))))
+                         turns)
+                        (1- (length turns)))))
+      (list (cons :current (1+ current))
+            (cons :total (length turns))))))
+
+(defun agent-shell--turn-begin-position ()
+  "Return where the turn at point begins, or nil.
+
+The prompt the user submitted, not a steer's: with point in a steer's
+exchange, `shell-maker--prompt-begin-position' answers with the steer's
+prompt, so walk back to the prompt that started the turn."
   (save-excursion
-    (when-let* ((begin (ignore-errors (shell-maker--prompt-begin-position)))
+    (let ((begin (ignore-errors (shell-maker--prompt-begin-position))))
+      (while (and begin
+                  (> begin (point-min))
+                  (agent-shell--steered-prompt-p begin))
+        (goto-char (1- begin))
+        ;; Strictly backwards, or not at all, so a search that answers
+        ;; with the same prompt cannot loop.
+        (setq begin (let ((earlier (ignore-errors (shell-maker--prompt-begin-position))))
+                      (and earlier (< earlier begin) earlier))))
+      begin)))
+
+(defun agent-shell--shell-response-start ()
+  "Return where the response of the turn at point begins.
+Return nil when point is not on a turn with a response.  The position
+sits right after the first `<shell-maker-end-of-prompt>' delimiter of the
+turn, so it aligns with the start of the response text copied into the
+viewport.  Past a steer, the shell holds the steer's own delimiter text
+and the viewport does not, so offsets from here into the viewport are
+exact up to the first steer and a little long after it."
+  (save-excursion
+    (when-let* ((begin (agent-shell--turn-begin-position))
                 ;; Located by property rather than by text: an agent quoting
                 ;; the delimiter back writes the same characters without it,
                 ;; and the response would then appear to start mid-sentence.
@@ -9731,18 +9872,38 @@ In the form:
               (interaction (with-current-buffer shell-buffer
                              (let* ((on-live-prompt (and comint-last-input-start
                                                          (>= (point) comint-last-input-start)))
-                                    (result (or (shell-maker--command-and-response-at-point :trimmed nil)
-                                                ;; Nothing is under point on the live prompt, and
-                                                ;; `shell-maker-next-command-and-response' going
-                                                ;; backwards from there skips the last response
-                                                ;; when it equals the last output, landing one
-                                                ;; interaction early.
-                                                (if on-live-prompt
-                                                    (car (last (shell-maker--extract-history
-                                                                (shell-maker-prompt-regexp shell-maker--config)
-                                                                :trimmed nil)))
-                                                  (shell-maker-next-command-and-response t :trimmed nil))))
-                                    (latest-p (and result on-live-prompt))
+                                    ;; The turn point is in: the last one
+                                    ;; starting at or before point, or the
+                                    ;; first when point sits above it in the
+                                    ;; welcome message.  A steer's exchange
+                                    ;; is part of the turn it joined.
+                                    (turns (agent-shell--turns))
+                                    (turn (and turns
+                                               (or (cl-find-if (lambda (turn)
+                                                                 (<= (map-elt turn :position) (point)))
+                                                               (reverse turns))
+                                                   (car turns))))
+                                    (result (cond
+                                             (turn
+                                              (cons (map-elt turn :prompt) (map-elt turn :response)))
+                                             ;; No prompt this shell can read (a bare
+                                             ;; buffer), so the exchange is the turn.
+                                             ((shell-maker--command-and-response-at-point :trimmed nil))
+                                             ;; Nothing is under point on the live prompt, and
+                                             ;; `shell-maker-next-command-and-response' going
+                                             ;; backwards from there skips the last response
+                                             ;; when it equals the last output, landing one
+                                             ;; interaction early.
+                                             (on-live-prompt
+                                              (car (last (shell-maker--extract-history
+                                                          (shell-maker-prompt-regexp shell-maker--config)
+                                                          :trimmed nil))))
+                                             (t
+                                              (shell-maker-next-command-and-response t :trimmed nil))))
+                                    (latest-p (and result
+                                                   (if turn
+                                                       (eq turn (car (last turns)))
+                                                     on-live-prompt)))
                                     (after-turn (and latest-p
                                                      (agent-shell--after-turn-tail-before-live-prompt))))
                                (when result
@@ -9812,7 +9973,8 @@ than editable user input."
 
 The command executes asynchronously.  When finished, the output is
 inserted into the prompt of the buffer it ran from, shell or viewport.
-If the shell is busy with no live prompt, it is queued instead."
+If the shell is busy with no live prompt, it is sent the way a prompt
+is (see `agent-shell--prompt-send')."
   (declare (modes agent-shell-mode
                   agent-shell-viewport-view-mode
                   agent-shell-viewport-edit-mode))
@@ -9874,9 +10036,9 @@ If the shell is busy with no live prompt, it is queued instead."
                                                   (map-elt inserted :end))
                                 (agent-shell--render-markdown))))
                         (with-current-buffer shell-buffer
-                          (agent-shell-prompt-queue
-                           (agent-shell--prompt-queue-read
-                            :initial (concat code-block "\n\n"))))))
+                          (agent-shell--prompt-send
+                           :prompt (agent-shell--prompt-queue-read
+                                    :initial (concat code-block "\n\n"))))))
                     (when (buffer-live-p output-buffer)
                       (kill-buffer output-buffer)))))))
     (set-process-query-on-exit-flag proc nil)
@@ -10814,8 +10976,8 @@ When PICK-SHELL is non-nil, prompt for which shell buffer to use."
     (if (agent-shell--can-insert-into-prompt-p :shell-buffer shell-buffer)
         (agent-shell-insert :text text :shell-buffer shell-buffer)
       (with-current-buffer shell-buffer
-        (agent-shell-prompt-queue
-         (agent-shell--prompt-queue-read :initial (concat text "\n\n")))))))
+        (agent-shell--prompt-send
+         :prompt (agent-shell--prompt-queue-read :initial (concat text "\n\n")))))))
 
 (defun agent-shell-send-region-to ()
   "Like `agent-shell-send-region' but prompt for which shell to use."
@@ -10827,7 +10989,11 @@ When PICK-SHELL is non-nil, prompt for which shell buffer to use."
 
 With \\[universal-argument] prefix ARG, force start a new shell.
 
-With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an existing shell."
+With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an existing shell.
+
+On a busy shell this follows `agent-shell-busy-submit-default-function'
+rather than hard-queueing, so the region in front of you can redirect
+work already under way."
   (interactive "P")
   (cond
    ;; `agent-shell--dwim' already carries the context to the chosen shell
@@ -10843,24 +11009,30 @@ With \\[universal-argument] \\[universal-argument] prefix ARG, prompt to pick an
       (if (agent-shell--can-insert-into-prompt-p :shell-buffer shell-buffer)
           (agent-shell-insert :text text :shell-buffer shell-buffer)
         (with-current-buffer shell-buffer
-          (agent-shell-prompt-queue
-           (agent-shell--prompt-queue-read :initial (concat text "\n\n")))))))))
+          (agent-shell--prompt-send
+           :prompt (agent-shell--prompt-queue-read :initial (concat text "\n\n")))))))))
 
-(cl-defun agent-shell-prompt-queue-dwim (&optional arg)
-  "Queue a prompt with DWIM context for an existing shell.
+(cl-defun agent-shell--prompt-dwim (&key disposition label pick-shell)
+  "Read a prompt with DWIM context and send it with DISPOSITION.
 
-When called with prefix ARG, prompt to choose an existing shell.
+DISPOSITION is `queue', `steer', or nil to follow
+`agent-shell-busy-submit-default-function' (see
+`agent-shell--prompt-send').  LABEL
+names the action when asking which shell to use.  PICK-SHELL, when
+non-nil, prompts for that shell rather than using the project's.
 
-Prefills the minibuffer with `agent-shell--context' when available, but does
-not send until the minibuffer input is confirmed.
+Prefills the minibuffer with `agent-shell--context' when available, but
+does not send until the input is confirmed.
 
-When `agent-shell-prefer-viewport-interaction' is non-nil, opens the viewport
-compose buffer with context prefilled instead of using the minibuffer."
-  (interactive "P")
+When `agent-shell-prefer-viewport-interaction' is non-nil, opens the
+viewport compose buffer with the context prefilled instead.  DISPOSITION
+travels with that buffer, so its send key still does what the calling
+command's name said, however
+`agent-shell-busy-submit-default-function' is set."
   (let ((shell-buffer
-         (if arg
+         (if pick-shell
              (get-buffer
-              (completing-read "Queue prompt to shell: "
+              (completing-read (format "%s prompt to shell: " label)
                                (mapcar #'buffer-name (or (agent-shell-buffers)
                                                          (user-error "No shells available")))
                                nil t))
@@ -10869,18 +11041,57 @@ compose buffer with context prefilled instead of using the minibuffer."
         (agent-shell--display-viewport-when-ready
          :shell-buffer shell-buffer
          :append (or (agent-shell--context :shell-buffer shell-buffer) "")
-         :edit t)
-      (let* ((context (when-let ((text (agent-shell--context :shell-buffer shell-buffer)))
+         :edit t
+         :disposition disposition)
+      (let* ((context (when-let* ((text (agent-shell--context :shell-buffer shell-buffer)))
                         (concat text "\n\n")))
              (prompt (with-current-buffer shell-buffer
                        (or (map-nested-elt (agent-shell--state) '(:agent-config :shell-prompt))
-                           "Enqueue prompt: ")))
+                           (format "%s prompt: " label))))
              (request (minibuffer-with-setup-hook
                           (lambda ()
                             (agent-shell-completion--setup-minibuffer shell-buffer))
                         (read-string prompt context))))
         (with-current-buffer shell-buffer
-          (agent-shell-prompt-queue request))))))
+          (agent-shell--prompt-send :prompt request :disposition disposition))))))
+
+(cl-defun agent-shell-prompt-send-dwim (&optional arg)
+  "Send a prompt with DWIM context to an existing shell.
+
+`agent-shell-busy-submit-default-function' decides whether a prompt sent
+while a turn is running joins that turn or waits for it.  Use
+`agent-shell-prompt-queue-dwim' or `agent-shell-prompt-steer-dwim' to
+pick one outright.
+
+When called with prefix ARG, prompt to choose an existing shell.  See
+`agent-shell--prompt-dwim' for how the prompt is read."
+  (interactive "P")
+  (agent-shell--prompt-dwim :label "Send" :pick-shell arg))
+
+(cl-defun agent-shell-prompt-queue-dwim (&optional arg)
+  "Queue a prompt with DWIM context for an existing shell.
+
+The prompt waits for a running turn to end, whatever
+`agent-shell-busy-submit-default-function' says.  With no turn running,
+submit it immediately.
+
+When called with prefix ARG, prompt to choose an existing shell.  See
+`agent-shell--prompt-dwim' for how the prompt is read."
+  (interactive "P")
+  (agent-shell--prompt-dwim :disposition 'queue :label "Queue" :pick-shell arg))
+
+(cl-defun agent-shell-prompt-steer-dwim (&optional arg)
+  "Steer a prompt with DWIM context into the turn already running.
+
+The prompt joins a running turn, whatever
+`agent-shell-busy-submit-default-function' says, so the region or error
+at hand can redirect work already under way.
+An agent that cannot take a steered prompt causes a `user-error'.
+
+When called with prefix ARG, prompt to choose an existing shell.  See
+`agent-shell--prompt-dwim' for how the prompt is read."
+  (interactive "P")
+  (agent-shell--prompt-dwim :disposition 'steer :label "Steer" :pick-shell arg))
 
 (cl-defun agent-shell--get-region-context (&key deactivate no-error agent-cwd)
   "Get region as insertable text, ready for sending to agent.
@@ -12253,8 +12464,8 @@ with the block quote, when there is no prompt to insert into."
                    (string-trim
                     (map-elt (agent-shell--get-region :deactivate t) :content)))))
       (if (not (agent-shell--can-insert-into-prompt-p))
-          (agent-shell-prompt-queue
-           (agent-shell--prompt-queue-read :initial (concat "\n\n" quoted "\n\n")))
+          (agent-shell--prompt-send
+           :prompt (agent-shell--prompt-queue-read :initial (concat "\n\n" quoted "\n\n")))
         (agent-shell-insert :text (concat quoted "\n\n")
                             :shell-buffer (current-buffer)
                             :no-focus t)

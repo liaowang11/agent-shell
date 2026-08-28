@@ -49,7 +49,16 @@
 (declare-function agent-shell--display-buffer "agent-shell")
 (declare-function agent-shell--get-region "agent-shell")
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
+(declare-function agent-shell--echo "agent-shell")
+(declare-function agent-shell--turn-at-index "agent-shell")
+(declare-function agent-shell--turn-position "agent-shell")
 (declare-function agent-shell--prompt-queue-replace "agent-shell-prompt-queue")
+(declare-function agent-shell--prompt-queue-paused-p "agent-shell-prompt-queue")
+(declare-function agent-shell--prompt-queue-steer-at "agent-shell-prompt-queue")
+(declare-function agent-shell--prompt-send "agent-shell-prompt-queue")
+(declare-function agent-shell--prompt-steer "agent-shell-prompt-queue")
+(declare-function agent-shell--prompt-steerable-p "agent-shell-prompt-queue")
+(declare-function agent-shell--busy-submit-steers-p "agent-shell-prompt-queue")
 (declare-function agent-shell--make-header "agent-shell")
 (declare-function agent-shell--context "agent-shell")
 (declare-function agent-shell--shell-buffer "agent-shell")
@@ -95,6 +104,7 @@
 
 (defvar agent-shell-header-style)
 (defvar agent-shell-prefer-viewport-interaction)
+(defvar agent-shell-busy-submit-default-function)
 (defvar agent-shell-viewport-dismiss-on-send)
 (defvar agent-shell-preferred-agent-config)
 (defvar agent-shell-session-strategy)
@@ -137,7 +147,24 @@ this index instead of enqueueing a new one.")
 ;; Survives mode switches (edit <-> view) which clear buffer-local vars.
 (put 'agent-shell-viewport--edit-pending-prompt 'permanent-local t)
 
-(cl-defun agent-shell-viewport--show-buffer (&key append override submit no-focus shell-buffer edit)
+(defvar-local agent-shell-viewport--compose-disposition nil
+  "What this compose buffer's send key does while a turn is running.
+
+`steer', `queue', or nil to follow
+`agent-shell-busy-submit-default-function'.
+
+Set by whichever command opened the buffer, so a command that named its
+behavior keeps it: a draft started by `agent-shell-prompt-queue-dwim'
+still queues even when the setting says steer.  The header shows which it
+is, since the draft outlives the command that started it.")
+;; Survives mode switches (edit <-> view) which clear buffer-local vars.
+(put 'agent-shell-viewport--compose-disposition 'permanent-local t)
+
+(defvar-local agent-shell-viewport--steer-pending nil
+  "Non-nil while this compose buffer awaits a steer outcome.")
+(put 'agent-shell-viewport--steer-pending 'permanent-local t)
+
+(cl-defun agent-shell-viewport--show-buffer (&key append override submit no-focus shell-buffer edit disposition)
   "Show a viewport compose buffer for the agent shell.
 
 APPEND is appended to the viewport compose buffer.
@@ -147,6 +174,12 @@ NO-FOCUS, when non-nil, avoids focusing the viewport compose buffer.
 SHELL-BUFFER, when non-nil, prefer this shell buffer.
 EDIT, when non-nil, open in edit mode even while the shell is busy, so
 the user can compose a prompt to queue (rather than staying in view mode).
+DISPOSITION becomes the buffer's
+`agent-shell-viewport--compose-disposition', so a command that named what
+it does with a busy shell keeps that promise once its draft is sent.  It
+is always written, nil included: the variable is `permanent-local', so
+leaving it alone would let one command's choice apply to the next
+command's draft.
 NEW-SHELL, create a new shell (no history).
 
 Returns an alist with insertion details or nil otherwise:
@@ -222,9 +255,25 @@ Returns an alist with insertion details or nil otherwise:
           (unless (string-empty-p text)
             (insert "\n\n" text))
           (setq insert-end (point)))))
+      ;; After the mode switches above, which is where a compose buffer
+      ;; comes into being.
+      (with-current-buffer viewport-buffer
+        (setq agent-shell-viewport--compose-disposition disposition))
       `((:buffer . ,viewport-buffer)
         (:start . ,insert-start)
         (:end . ,insert-end)))))
+
+(defun agent-shell-viewport--reset-compose-state ()
+  "Forget what this compose buffer was in the middle of.
+
+The peeked location, the history ring position and the saved draft belong
+to the prompt being composed, so sending one clears all three together.
+Called with the compose buffer current, from every send path -- a path
+that reset only some of them would carry a stale peek or ring index into
+the next draft."
+  (setq agent-shell-viewport--compose-snapshot nil)
+  (setq agent-shell-viewport--ring-index nil)
+  (setq agent-shell-viewport--page-cursor nil))
 
 (defun agent-shell-viewport-compose-send (&optional keep-composing)
   "Send the viewport composed prompt to the agent shell.
@@ -240,18 +289,21 @@ queued right away, regardless of `agent-shell-viewport-dismiss-on-send'."
              (not (with-current-buffer (agent-shell-viewport--shell-buffer)
                     (map-nested-elt agent-shell--state '(:session :id)))))
     (user-error "Starting agent, please wait"))
-  (setq agent-shell-viewport--compose-snapshot nil)
-  (setq agent-shell-viewport--ring-index nil)
-  (setq agent-shell-viewport--page-cursor nil)
-  (cond
-   (keep-composing
-    (agent-shell-viewport--compose-queue))
-   (agent-shell-viewport-dismiss-on-send
-    (agent-shell-viewport-compose-send-and-dismiss))
-   (agent-shell-prefer-viewport-interaction
-    (agent-shell-viewport-compose-send-and-wait-for-response))
-   (t
-    (agent-shell-viewport-compose-send-and-kill))))
+  ;; An explicit `steer' draft cannot go through the paths below: they
+  ;; leave the buffer before the agent has answered, and a declined steer
+  ;; must keep the draft rather than clear it.
+  (if (eq agent-shell-viewport--compose-disposition 'steer)
+      (agent-shell-viewport-compose-steer keep-composing)
+    (agent-shell-viewport--reset-compose-state)
+    (cond
+     (keep-composing
+      (agent-shell-viewport--compose-deliver))
+     (agent-shell-viewport-dismiss-on-send
+      (agent-shell-viewport-compose-send-and-dismiss))
+     (agent-shell-prefer-viewport-interaction
+      (agent-shell-viewport-compose-send-and-wait-for-response))
+     (t
+      (agent-shell-viewport-compose-send-and-kill)))))
 
 (defun agent-shell-viewport-compose-send-override (&optional keep-composing)
   "Send the viewport composed prompt through the override route.
@@ -267,7 +319,13 @@ KEEP-COMPOSING behaves as it does there, so \\[universal-argument]
 keeps the compose buffer open for the next prompt.
 
 Rebinds the default for this one call rather than threading a flag
-through each way of sending, so every route stays a single code path."
+through each way of sending, so every route stays a single code path.
+
+A compose buffer opened by a command that named its own delivery -- a
+draft from `agent-shell-prompt-queue-dwim', say -- keeps that whatever
+this rebinds, since `agent-shell-viewport--compose-disposition' outranks
+the setting.  Overriding a draft that already promised one thing would
+make the promise depend on which key sent it."
   (declare (modes agent-shell-viewport-edit-mode))
   (interactive "P")
   (let ((agent-shell-busy-submit-default-function
@@ -284,6 +342,7 @@ through each way of sending, so every route stays a single code path."
         (viewport-buffer (current-buffer))
         (edit-index agent-shell-viewport--edit-pending-index)
         (edit-prompt agent-shell-viewport--edit-pending-prompt)
+        (disposition agent-shell-viewport--compose-disposition)
         (prompt (string-trim (buffer-string))))
     (setq agent-shell-viewport--edit-pending-index nil
           agent-shell-viewport--edit-pending-prompt nil)
@@ -292,8 +351,8 @@ through each way of sending, so every route stays a single code path."
        (edit-index
         (agent-shell--prompt-queue-replace
          :index edit-index :expected edit-prompt :prompt prompt))
-       ((agent-shell-viewport--busy-p)
-        (agent-shell--busy-submit :prompt prompt))
+       ((agent-shell-viewport--hold-p)
+        (agent-shell--prompt-send :prompt prompt :disposition disposition))
        (t
         (agent-shell--insert-to-shell-buffer
          :text prompt
@@ -307,31 +366,182 @@ through each way of sending, so every route stays a single code path."
         (kill-buffer viewport-buffer)))
     (pop-to-buffer shell-buffer)))
 
-(defun agent-shell-viewport--compose-queue ()
-  "Send the composed prompt, then clear the compose buffer.
+(cl-defun agent-shell-viewport--compose-deliver (&key disposition)
+  "Deliver the composed prompt, then clear the compose buffer.
 
-Mid-turn the prompt goes through `agent-shell-busy-submit-default-function',
-which queues by default, so prompts can be fired in a row; otherwise it is
-submitted.  Signals a `user-error' when the draft is empty.  Leaves the
-compose buffer open in edit mode, cleared.
+While a turn is running, DISPOSITION decides whether the prompt joins it
+or waits for it, defaulting to this buffer's
+`agent-shell-viewport--compose-disposition' (itself defaulting to
+`agent-shell-busy-submit-default-function').  The prompt also waits
+while automatic delivery is paused, and is submitted when nothing is
+running and nothing is paused, so prompts can be fired in a row.
+Signals a `user-error' when the draft is empty.  Leaves the compose
+buffer open in edit mode, cleared.
 
-A submitted prompt is echoed to the minibuffer as the active one, since
-the cleared compose buffer does not itself show it.  Mid-turn the chosen
-function does its own reporting: queueing echoes the queue, steering
-renders the prompt into the shell."
+When the prompt is submitted immediately, it is echoed to the minibuffer
+as the active prompt, since the cleared compose buffer does not itself
+show what was submitted.  Queueing and steering echo their own outcome."
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
         (prompt (string-trim (buffer-string)))
-        ;; Sampled before submitting, which clears it.
-        (busy (agent-shell-viewport--busy-p)))
+        (disposition (or disposition agent-shell-viewport--compose-disposition))
+        ;; Sample state before the send below submits, queues or steers.
+        (submitted (not (agent-shell-viewport--hold-p))))
     (when (string-empty-p prompt)
       (user-error "Nothing to send"))
     (with-current-buffer shell-buffer
-      (if busy
-          (agent-shell--busy-submit :prompt prompt)
-        (agent-shell--insert-to-shell-buffer :text prompt :submit t :no-focus t)))
+      (agent-shell--prompt-send :prompt prompt :disposition disposition))
     (agent-shell-viewport--initialize)
-    (unless busy
+    (when submitted
       (agent-shell--prompt-queue-echo :active-prompt prompt))))
+
+(cl-defun agent-shell-viewport--compose-dispose (&key keep-composing shell-buffer)
+  "Leave the compose buffer where `agent-shell-viewport-compose-send' would.
+
+Applies the same policy that command dispatches on, so delivering a
+prompt lands the user in the same place however it was delivered:
+KEEP-COMPOSING keeps the cleared buffer in edit mode,
+`agent-shell-viewport-dismiss-on-send' dismisses its window,
+`agent-shell-prefer-viewport-interaction' shows the interaction in view
+mode, and by default the buffer is killed and SHELL-BUFFER focused.
+
+Call with the compose buffer current, after it was cleared."
+  (let ((viewport-buffer (current-buffer)))
+    (cond
+     ;; Composing again: the cleared buffer is already where it belongs.
+     (keep-composing)
+     (agent-shell-viewport-dismiss-on-send
+      (agent-shell-viewport--dismiss viewport-buffer))
+     (agent-shell-prefer-viewport-interaction
+      (agent-shell-viewport-view-last))
+     (t
+      ;; Killing the compose buffer here should not ask whether to kill the
+      ;; shell too: sending a prompt states the intent to keep it.
+      (let ((agent-shell-viewport--clean-up nil))
+        (kill-buffer viewport-buffer))
+      (pop-to-buffer shell-buffer)))))
+
+(defun agent-shell-viewport-compose-queue (&optional keep-composing)
+  "Queue behind a running turn or submit when idle, then clear the buffer.
+
+Where `agent-shell-viewport-compose-send' follows
+`agent-shell-busy-submit-default-function' and
+`agent-shell-viewport-compose-steer' selects steering, this selects
+queue delivery whatever the setting is.
+
+The compose buffer is then left where `agent-shell-viewport-compose-send'
+leaves it (see `agent-shell-viewport--compose-dispose').  With prefix
+argument KEEP-COMPOSING, it stays open in edit mode, cleared, so another
+prompt can be composed right away.
+
+Signals a `user-error' when the draft is empty.
+
+When the draft is an edit of a pending prompt (see
+`agent-shell-prompt-queue-edit'), it replaces that prompt in place rather
+than queueing a second copy of it."
+  (declare (modes agent-shell-viewport-edit-mode))
+  (interactive "P")
+  (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
+    (user-error "Not in a shell viewport buffer"))
+  (let ((shell-buffer (agent-shell-viewport--shell-buffer))
+        (prompt (string-trim (buffer-string)))
+        (edit-index agent-shell-viewport--edit-pending-index)
+        (edit-prompt agent-shell-viewport--edit-pending-prompt))
+    (when (string-empty-p prompt)
+      (user-error "Nothing to send"))
+    (setq agent-shell-viewport--edit-pending-index nil
+          agent-shell-viewport--edit-pending-prompt nil)
+    (agent-shell-viewport--reset-compose-state)
+    (with-current-buffer shell-buffer
+      (if edit-index
+          (agent-shell--prompt-queue-replace
+           :index edit-index :expected edit-prompt :prompt prompt)
+        (agent-shell--prompt-send :prompt prompt :disposition 'queue)))
+    (agent-shell-viewport--initialize)
+    (agent-shell-viewport--compose-dispose :keep-composing keep-composing
+                                           :shell-buffer shell-buffer)))
+
+(defun agent-shell-viewport-compose-steer (&optional keep-composing)
+  "Steer the composed prompt into the running turn, then clear the buffer.
+
+Where `agent-shell-viewport-compose-send' follows
+`agent-shell-busy-submit-default-function' and
+`agent-shell-viewport-compose-queue' selects queue delivery, this
+selects steering: it hands the draft to the turn already running (see
+`agent-shell-prompt-steer'), so the agent can change course mid-work.
+
+Signals a `user-error' when a running turn cannot be steered, and keeps
+the draft when the agent declines it.  With no turn running the prompt is
+submitted normally.
+
+The buffer is read-only while the agent has not answered, since the draft
+is what gets restored if it declines.
+
+The compose buffer is then left where `agent-shell-viewport-compose-send'
+leaves it (see `agent-shell-viewport--compose-dispose').  With prefix
+argument KEEP-COMPOSING, it stays open in edit mode, cleared, so another
+prompt can be composed right away.
+
+Signals a `user-error' when the draft is empty.
+
+When the draft is an edit of a pending prompt (see
+`agent-shell-prompt-queue-edit'), a steer the agent will not take leaves
+both the draft and the queue entry unchanged.  One it takes consumes the
+entry; a decline restores the edited draft as that single queued entry."
+  (declare (modes agent-shell-viewport-edit-mode))
+  (interactive "P")
+  (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
+    (user-error "Not in a shell viewport buffer"))
+  (when agent-shell-viewport--steer-pending
+    (user-error "Steer still pending"))
+  (let ((shell-buffer (agent-shell-viewport--shell-buffer))
+        (viewport-buffer (current-buffer))
+        (prompt (string-trim (buffer-string)))
+        (edit-index agent-shell-viewport--edit-pending-index)
+        (edit-prompt agent-shell-viewport--edit-pending-prompt))
+    (when (string-empty-p prompt)
+      (user-error "Nothing to send"))
+    (agent-shell-viewport--reset-compose-state)
+    (setq agent-shell-viewport--steer-pending t
+          buffer-read-only t)
+    (condition-case err
+        (with-current-buffer shell-buffer
+          (let ((delivered
+                 (lambda (_outcome)
+                   (when (buffer-live-p viewport-buffer)
+                     (with-current-buffer viewport-buffer
+                       (setq buffer-read-only nil
+                             agent-shell-viewport--steer-pending nil
+                             agent-shell-viewport--edit-pending-index nil
+                             agent-shell-viewport--edit-pending-prompt nil)
+                       (agent-shell-viewport--initialize)
+                       (agent-shell-viewport--compose-dispose
+                        :keep-composing keep-composing
+                        :shell-buffer shell-buffer)))))
+                (declined
+                 (lambda (reason _outcome)
+                   (when (buffer-live-p viewport-buffer)
+                     (with-current-buffer viewport-buffer
+                       (setq buffer-read-only nil
+                             agent-shell-viewport--steer-pending nil)
+                       ;; The queue entry went back, so the draft has to
+                       ;; keep tracking it or a later send queues a second
+                       ;; copy.
+                       (when edit-index
+                         (setq agent-shell-viewport--edit-pending-prompt prompt))))
+                   (agent-shell--echo "Steer declined (%s): draft kept"
+                                      (or reason "no outcome")))))
+            (if edit-index
+                (agent-shell--prompt-queue-steer-at
+                 :index edit-index :prompt prompt :expected edit-prompt
+                 :on-delivered delivered :on-declined declined)
+              (agent-shell--prompt-steer
+               :prompt prompt :on-delivered delivered :on-declined declined))))
+      (error
+       (when (buffer-live-p viewport-buffer)
+         (with-current-buffer viewport-buffer
+           (setq buffer-read-only nil
+                 agent-shell-viewport--steer-pending nil)))
+       (signal (car err) (cdr err))))))
 
 (defun agent-shell-viewport-compose-send-and-dismiss ()
   "Queue or send the composed prompt, then dismiss the compose window.
@@ -342,7 +552,7 @@ The compose window is dismissed, restoring the previous window layout."
   (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
     (user-error "Not in a shell viewport buffer"))
   (let ((viewport-buffer (current-buffer)))
-    (agent-shell-viewport--compose-queue)
+    (agent-shell-viewport--compose-deliver)
     (agent-shell-viewport--dismiss viewport-buffer)))
 
 (defun agent-shell-viewport--dismiss (viewport-buffer)
@@ -384,9 +594,10 @@ resolving to its shell on the next invocation."
           (agent-shell-viewport--initialize)
           (agent-shell-viewport-view-last))
         (throw 'exit nil))
-      (when (agent-shell-viewport--busy-p)
-        (with-current-buffer shell-buffer
-          (agent-shell--busy-submit :prompt prompt))
+      (when (agent-shell-viewport--hold-p)
+        (let ((disposition agent-shell-viewport--compose-disposition))
+          (with-current-buffer shell-buffer
+            (agent-shell--prompt-send :prompt prompt :disposition disposition)))
         (with-current-buffer viewport-buffer
           ;; Clear first, or `agent-shell-viewport-view-last' parks the
           ;; sent prompt as a draft.
@@ -679,30 +890,24 @@ page."
     (unless (with-current-buffer (agent-shell-viewport--shell-buffer)
               (shell-maker-history-position))
       (user-error "No history"))
-    (setq agent-shell-viewport--compose-snapshot
-          `((:content . ,(buffer-string))
-            (:location . ,(point))))
-    ;; Capture the cursor before `view-last'/`next-page' below overwrite it
-    ;; with the page they land on.
-    (let ((cursor agent-shell-viewport--page-cursor))
-      (agent-shell-viewport-view-last)
-      (let* ((total (map-elt (agent-shell-viewport--position :force-refresh t)
-                             :total))
-             (remembered (min total (or (map-elt cursor :index) total)))
-             (target (max 1 (- remembered (1- n)))))
-        ;; One jump rather than a step per page, so pages in between are
-        ;; never rendered.
-        (when (< target total)
-          (agent-shell-viewport-next-page :backwards t :start-at-top t
-                                          :n (- total target)))
-        ;; Restore the exact reading point on the remembered page, but only
-        ;; within its bounds -- a point captured on a differently-sized page
-        ;; could land anywhere.
-        (when-let* (((eql target (map-elt cursor :index)))
-                    (point (map-elt cursor :point))
-                    ((<= (point-min) point (point-max))))
-          (goto-char point)
-          (setf (map-elt agent-shell-viewport--page-cursor :point) point))))))
+    (let* ((total (map-elt (agent-shell-viewport--position :force-refresh t)
+                           :total))
+           (cursor agent-shell-viewport--page-cursor)
+           (remembered (min total (or (map-elt cursor :index) total)))
+           (target (max 1 (- remembered (1- n)))))
+      (setq agent-shell-viewport--compose-snapshot
+            `((:content . ,(buffer-string))
+              (:location . ,(point))))
+      (agent-shell-viewport-view-mode)
+      (agent-shell-viewport--show-page target)
+      ;; Restore the exact reading point on the remembered page, but only
+      ;; within its bounds -- a point captured on a differently-sized page
+      ;; could land anywhere.
+      (when-let* (((eql target (map-elt cursor :index)))
+                  (point (map-elt cursor :point))
+                  ((<= (point-min) point (point-max))))
+        (goto-char point)
+        (setf (map-elt agent-shell-viewport--page-cursor :point) point)))))
 
 (defun agent-shell-viewport--interaction-response (interaction)
   "Return INTERACTION's renderable response, including any after-turn tail."
@@ -1113,33 +1318,6 @@ them.  A negative N moves forward instead, though never into compose."
       (agent-shell-viewport--leave-compose-page n)
     (agent-shell-viewport-next-page :backwards t :start-at-top t :n n)))
 
-(cl-defun agent-shell-viewport--move-pages (&key backwards (n 1))
-  "Return an alist describing a move of up to N interactions.
-
-:interaction is the last interaction reached, nil when none was.
-:exhausted is non-nil when history ran out before N moves.
-Move backwards through the current shell buffer when BACKWARDS is non-nil.
-
-With three interactions ahead:
-
-  (agent-shell-viewport--move-pages :n 2)
-  ;; => ((:interaction . (\"prompt\" . \"response\")) (:exhausted . nil))
-
-With only one interaction ahead:
-
-  (agent-shell-viewport--move-pages :n 2)
-  ;; => ((:interaction . (\"prompt\" . \"response\")) (:exhausted . t))"
-  (let ((remaining n)
-        (interaction nil)
-        (stepped t))
-    (while (and (> remaining 0) stepped)
-      (setq stepped (shell-maker-next-command-and-response backwards :trimmed nil))
-      (when stepped
-        (setq interaction stepped)
-        (setq remaining (1- remaining))))
-    `((:interaction . ,interaction)
-      (:exhausted . ,(> remaining 0)))))
-
 (cl-defun agent-shell-viewport-next-page (&key backwards start-at-top n)
   "Show next interaction (request / response).
 
@@ -1164,39 +1342,47 @@ overshoots would otherwise land in the draft and type into it.  Use
   (when (< n 0)
     (setq backwards (not backwards))
     (setq n (- n)))
-  (let* ((shell-buffer (agent-shell-viewport--shell-buffer))
-         (pos (agent-shell-viewport--position :force-refresh t)))
+  (let ((pos (agent-shell-viewport--position :force-refresh t)))
     (unless pos
       (user-error "No history"))
-    (cond
-     ((and (not backwards) (= (map-elt pos :current) (map-elt pos :total)))
-      (user-error "Last page"))
-     ((and backwards (= (map-elt pos :current) 1))
-      (user-error "First page"))
-     (t
-      (when-let* ((move (with-current-buffer shell-buffer
-                          ;; Navigate relative to the interaction containing
-                          ;; point, not wherever point happens to sit within
-                          ;; it.  Without this, switching to the viewport
-                          ;; with point mid-interaction makes the first
-                          ;; backward step land on the current interaction's
-                          ;; prompt instead of the previous interaction.
-                          (goto-char (shell-maker--prompt-begin-position))
-                          (agent-shell-viewport--move-pages
-                           :backwards backwards :n n)))
-                  (next (map-elt move :interaction)))
-        (agent-shell-viewport--initialize
-         :prompt (car next) :response (cdr next))
-        (goto-char (if start-at-top
-                       (point-min)
-                     (if backwards (point-max) (point-min))))
-        (setq agent-shell-viewport--page-cursor
-              ;; A jump that runs past either end stops on that end's page.
-              `((:index . ,(max 1 (min (map-elt pos :total)
-                                       (+ (map-elt pos :current)
-                                          (if backwards (- n) n)))))
-                (:point . ,(point))))
-        next)))))
+    (let ((current (map-elt pos :current))
+          (total (map-elt pos :total)))
+      (cond
+       ((and (not backwards) (= current total))
+        (user-error "Last page"))
+       ((and backwards (= current 1))
+        (user-error "First page"))
+       (t
+        (agent-shell-viewport--show-page
+         (max 1 (min total (+ current (if backwards (- n) n))))
+         :at-end (and backwards (not start-at-top))))))))
+
+(cl-defun agent-shell-viewport--show-page (index &key at-end)
+  "Show history page INDEX, counted from the oldest page.
+
+Point goes to the start of the page, or its end with AT-END.  Records
+INDEX as the page cursor and returns the shown (PROMPT . RESPONSE)."
+  (let ((next (with-current-buffer (agent-shell-viewport--shell-buffer)
+                ;; Index-based, rather than a relative
+                ;; comint-previous-prompt/next-prompt step, so a tool
+                ;; result that echoes the prompt string inside a response
+                ;; is never mistaken for a real prompt (comint-prompt-regexp
+                ;; is unanchored).  A page is a turn: a steered prompt and
+                ;; its answer read on inside the page of the turn they
+                ;; joined (see `agent-shell--turns').
+                (let ((turn (agent-shell--turn-at-index index)))
+                  (unless turn
+                    (error "Page %d not found" index))
+                  (goto-char (map-elt turn :position))
+                  (cons (map-elt turn :prompt)
+                        (map-elt turn :response))))))
+    (agent-shell-viewport--initialize
+     :prompt (car next) :response (cdr next))
+    (goto-char (if at-end (point-max) (point-min)))
+    (setq agent-shell-viewport--page-cursor
+          `((:index . ,index)
+            (:point . ,(point))))
+    next))
 
 (defun agent-shell-viewport-set-session-model ()
   "Set session model."
@@ -1409,7 +1595,10 @@ When FORCE-REFRESH is non-nil, recalculate and update cache."
   (if (and (not force-refresh) agent-shell-viewport--position-cache)
       agent-shell-viewport--position-cache
     (let ((position (with-current-buffer (agent-shell-viewport--shell-buffer)
-                      (shell-maker-history-position))))
+                      ;; In turns, not exchanges: a steered prompt is an
+                      ;; exchange of its own in the shell but not a page
+                      ;; here (see `agent-shell--turns').
+                      (agent-shell--turn-position))))
       (setq agent-shell-viewport--position-cache position)
       position)))
 
@@ -1423,12 +1612,30 @@ VIEWPORT-BUFFER is the viewport buffer to check."
     (with-current-buffer shell-buffer
       shell-maker--busy)))
 
+(cl-defun agent-shell-viewport--hold-p (&key viewport-buffer)
+  "Return non-nil when a composed prompt must not be submitted as a new turn.
+
+VIEWPORT-BUFFER is the viewport buffer to check.
+
+This covers a `shell-maker' turn reported as busy and an untracked turn
+started by a steer, whose queue stays paused until the user resumes it.
+The second looks idle from here, so submitting on `agent-shell-viewport--busy-p'
+alone fires a prompt at a working agent."
+  (or (agent-shell-viewport--busy-p :viewport-buffer viewport-buffer)
+      (when-let* ((shell-buffer (agent-shell--shell-buffer
+                                 :viewport-buffer viewport-buffer
+                                 :no-error t)))
+        (with-current-buffer shell-buffer
+          (agent-shell--prompt-queue-paused-p)))))
+
 (defvar agent-shell-viewport-edit-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c C-c") #'agent-shell-viewport-compose-send)
     ;; Both spellings: a GUI frame and a terminal disagree on which arrives.
     (define-key map (kbd "M-RET") #'agent-shell-viewport-compose-send-override)
     (define-key map (kbd "M-<return>") #'agent-shell-viewport-compose-send-override)
+    (define-key map (kbd "C-c C-i") #'agent-shell-viewport-compose-steer)
+    (define-key map (kbd "C-c C-q") #'agent-shell-viewport-compose-queue)
     (define-key map (kbd "C-c C-p") #'agent-shell-viewport-previous-page)
     (define-key map (kbd "C-c C-k") #'agent-shell-viewport-compose-cancel)
     (define-key map (kbd "C-c C-h") #'agent-shell-viewport-compose-help-menu)
@@ -1516,9 +1723,7 @@ VIEWPORT-BUFFER is the viewport buffer to check."
                      (agent-shell-viewport--make-transient-group
                       agent-shell-viewport-view-mode-map
                       `(((:function . agent-shell-viewport-reply)
-                         (:description . ,(if (agent-shell-viewport--busy-p)
-                                              "Queue reply…"
-                                            "Reply…")))
+                         (:description . ,(agent-shell-viewport--reply-description)))
                         ((:function . agent-shell-viewport-quote-reply)
                          (:description . "Quote reply…"))
                         ((:function . agent-shell-viewport-reply-yes)
@@ -1599,6 +1804,10 @@ VIEWPORT-BUFFER is the viewport buffer to check."
                       agent-shell-viewport-edit-mode-map
                       '(((:function . agent-shell-viewport-compose-send)
                          (:description . "Submit"))
+                        ((:function . agent-shell-viewport-compose-steer)
+                         (:description . "Steer running turn"))
+                        ((:function . agent-shell-viewport-compose-queue)
+                         (:description . "Queue behind turn or submit"))
                         ((:function . agent-shell-viewport-compose-cancel)
                          (:description . "Cancel"))
                         ((:function . agent-shell-viewport-previous-page)
@@ -1679,6 +1888,50 @@ edits, completes, and submits."
     (overlay-put agent-shell-viewport--layout-spacer-overlay
                  'before-string "\n")))
 
+(defun agent-shell-viewport--compose-disposition-label (disposition)
+  "Return the label for what a send will do while a turn is running.
+
+DISPOSITION is a compose buffer's own
+`agent-shell-viewport--compose-disposition', or nil to follow
+`agent-shell-busy-submit-default-function'.
+
+A plain send reports \"queue\" when a preferred steer cannot be made, since
+that is what it will actually do.  An explicit steer draft reports
+\"steer unavailable\" instead, because sending will error rather than
+change delivery method.  Both read `agent-shell--prompt-steerable-p', the
+same predicate the dispatch asks, so the label and the send cannot drift
+apart.  The check reads the shell's state, so it runs there rather than
+in this viewport buffer.
+
+A custom `agent-shell-busy-submit-default-function' reports \"send\": what
+it does with the prompt is its own business, and naming it \"queue\" would
+be a guess this header states as fact."
+  (let ((steerable
+         (when-let* ((shell-buffer (agent-shell-viewport--shell-buffer)))
+           (with-current-buffer shell-buffer
+             (agent-shell--prompt-steerable-p)))))
+    (cond
+     ((eq disposition 'queue) "queue")
+     ((eq disposition 'steer)
+      (if steerable "steer" "steer unavailable"))
+     ((agent-shell--busy-submit-steers-p) (if steerable "steer" "queue"))
+     ((eq agent-shell-busy-submit-default-function #'agent-shell-busy-submit-queue)
+      "queue")
+     (t "send"))))
+
+(defun agent-shell-viewport--reply-description ()
+  "Return the menu wording for replying from this viewport.
+
+While a turn runs, names where the reply will land -- the compose buffer
+this opens sends with the same disposition, so promising \"Reply\" when it
+will queue reads as a different action than the one that happens.  Shared
+by the graphical and text headers, which render the same entry."
+  (if (agent-shell-viewport--busy-p)
+      (format "%s reply…"
+              (capitalize (agent-shell-viewport--compose-disposition-label
+                           agent-shell-viewport--compose-disposition)))
+    "Reply…"))
+
 (defun agent-shell-viewport--update-header ()
   "Update header and mode line based on `agent-shell-header-style'.
 
@@ -1695,7 +1948,10 @@ on current major mode."
          (status (cond
                   ((and (agent-shell-viewport--busy-p)
                         (derived-mode-p 'agent-shell-viewport-edit-mode))
-                   (propertize "Edit (queue)" 'face 'agent-shell-viewport-status-edit))
+                   (propertize (format "Edit (%s)"
+                                       (agent-shell-viewport--compose-disposition-label
+                                        agent-shell-viewport--compose-disposition))
+                               'face 'agent-shell-viewport-status-edit))
                   ((agent-shell-viewport--busy-p) (propertize "Busy" 'face 'agent-shell-viewport-status-busy))
                   ((derived-mode-p 'agent-shell-viewport-edit-mode)
                    (propertize "Edit" 'face 'agent-shell-viewport-status-edit))
@@ -1735,9 +1991,7 @@ on current major mode."
                        `((:key . ,(key-description (where-is-internal
                                                     'agent-shell-viewport-reply
                                                     agent-shell-viewport-view-mode-map t)))
-                         (:description . ,(if (agent-shell-viewport--busy-p)
-                                              "Queue reply…"
-                                            "Reply…"))))
+                         (:description . ,(agent-shell-viewport--reply-description))))
                       (when (agent-shell-viewport--busy-p)
                         (list
                          `((:key . ,(key-description (where-is-internal
