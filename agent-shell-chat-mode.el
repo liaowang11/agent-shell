@@ -191,11 +191,16 @@ stopped at the caret would never grow to cover what follows it."
                                (overlays-in anchor-beg (max anchor-end (1+ anchor-beg))))
                      (let ((created (make-overlay beg end nil nil rear-advance)))
                        (overlay-put created 'agent-shell-chat--tag tag)
-                       (unless rear-advance
-                         (overlay-put created 'evaporate t))
                        created))))
     (unless (and (= (overlay-start overlay) beg) (= (overlay-end overlay) end))
       (move-overlay overlay beg end))
+    ;; `evaporate' deletes an empty overlay on the spot, and a deleted
+    ;; overlay has no start, so only opt into it once there is text to
+    ;; cover.  An empty span happens when nothing separates the input's
+    ;; terminator from the response (input abutting the marker, then a
+    ;; single newline), and it still shows its label through
+    ;; `before-string'.
+    (overlay-put overlay 'evaporate (and (not rear-advance) (< beg end)))
     (map-do (lambda (property value)
               (unless (equal (overlay-get overlay property) value)
                 (overlay-put overlay property value)))

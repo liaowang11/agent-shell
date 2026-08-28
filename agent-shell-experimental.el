@@ -46,13 +46,16 @@
 (declare-function acp-make-error "acp")
 (declare-function agent-shell--active-requests-p "agent-shell")
 (declare-function agent-shell--cancel-idle-timer "agent-shell")
+(declare-function agent-shell--ensure-state-key "agent-shell")
 (declare-function agent-shell--expand-truncated-regions "agent-shell")
 (declare-function agent-shell--prompt-content-blocks "agent-shell")
+(declare-function agent-shell--prompt-queue-process-next "agent-shell-prompt-queue")
 (declare-function agent-shell--insert-to-shell-buffer "agent-shell")
 (declare-function agent-shell--append-transcript "agent-shell")
 (declare-function agent-shell--indent-markdown-headers "agent-shell")
 (declare-function agent-shell--live-input-prompt-p "agent-shell")
 (declare-function agent-shell--reset-undo-history "agent-shell")
+(declare-function agent-shell--separate-transcript-after-agent-message "agent-shell")
 (declare-function agent-shell--make-boxed-message "agent-shell")
 (declare-function agent-shell--send-request "agent-shell")
 (declare-function agent-shell--state "agent-shell")
@@ -90,8 +93,7 @@ in progress), the request is immediately rejected with an error."
                                          :message "Busy")))
     (let ((request (agent-shell-experimental--normalize-request acp-request)))
       ;; Track as active so notifications are not treated as stale.
-      (unless (assq :active-requests state)
-        (nconc state (list (cons :active-requests nil))))
+      (agent-shell--ensure-state-key state :active-requests)
       (map-put! state :active-requests
                 (cons request (map-elt state :active-requests))))
     ;; Remove trailing empty shell prompt before push notifications render.
@@ -199,12 +201,20 @@ For example:
                 (prompt . ,(vconcat prompt))
                 (_meta . ((steering . ((idleBehavior . "promptRequired")))))))))
 
-(cl-defun agent-shell-experimental--send-steering (&key state prompt)
+(cl-defun agent-shell-experimental--send-steering (&key state prompt
+                                                        on-delivered on-declined)
   "Steer PROMPT into the turn STATE's session is currently running.
 
 Must be called from the shell buffer: PROMPT is converted with
 `agent-shell--prompt-content-blocks', which reads the buffer's prompt
 capabilities.
+
+ON-DELIVERED (lambda (outcome)) is called once the agent took PROMPT, so
+a caller holding its own copy (a pending prompt claimed out of the queue)
+can drop it.  ON-DECLINED (lambda (reason outcome)) replaces the report
+and interrupt below, for a caller that has somewhere else to put a prompt
+the agent would not take.  Both are optional; with neither, this behaves
+as `agent-shell-prompt-steer' needs it to.
 
 Acts on the `outcome' the agent answers with:
 
@@ -222,139 +232,173 @@ Acts on the `outcome' the agent answers with:
 
 Agents differ on which they answer with, so an unrecognised outcome, and
 a request that fails outright, are treated as a steer that did not land:
-reported in the shell, and the running turn interrupted.
+reported in the shell, and the running turn interrupted.  A caller that
+passes ON-DECLINED takes that decision over.
 
-Nothing here queues.  Queueing is `agent-shell-prompt-queue', and a steer
-turned into a queued prompt would reach the agent long after the user
-asked for it."
+Automatic queue delivery is paused for the duration of the request and
+settled by the outcome, because the turn can end before the answer
+arrives: released when the prompt joined the turn, held when the agent
+started a turn of its own, cleared when the steer did not land.  Without
+it a queued prompt drains into a turn nothing here can see."
   (let ((content-blocks (agent-shell--prompt-content-blocks
-                         (agent-shell--expand-truncated-regions prompt))))
-    (agent-shell--send-request
-     :state state
-     :client (map-elt state :client)
-     :request (agent-shell-experimental--make-session-steering-request
-               :session-id (map-nested-elt state '(:session :id))
-               :prompt content-blocks)
-     :buffer (current-buffer)
-     :on-failure (lambda (acp-error _raw-message)
-                   (agent-shell--update-fragment
-                    :state (agent-shell--state)
-                    :block-id (format "%s-steer-declined"
-                                      (map-elt (agent-shell--state) :request-count))
-                    :body (agent-shell--make-boxed-message
-                           ;; Unlike an agent answering with an outcome, a
-                           ;; request that failed outright says nothing about
-                           ;; why, so carry its error text.
-                           :text (if (map-elt acp-error 'message)
-                                     (format "Note: Steered prompt declined (%s)."
-                                             (map-elt acp-error 'message))
-                                   "Note: Steered prompt declined."))
-                    :create-new t
-                    :above-last-prompt (not (agent-shell--active-requests-p
-                                             (agent-shell--state))))
-                   (map-put! (agent-shell--state) :last-entry-type "steering_declined")
-                   ;; Interrupted so the agent does not carry on for a long
-                   ;; while in a direction the user believes they already
-                   ;; corrected.  A declined steer does not say whether
-                   ;; continuing is harmless, and the cost of guessing wrong
-                   ;; is far higher one way than interrupting current work.
-                   (agent-shell-interrupt t))
-     :on-success
-     (lambda (acp-response)
-       (pcase (map-elt acp-response 'outcome)
-         ;; Claude and Codex both answer with this one.
-         ("injected"
-          (agent-shell-experimental--render-steered-prompt
-           :state (agent-shell--state) :prompt prompt))
-         ;; Claude only, and only because the request opts into it with
-         ;; _meta.steering.idleBehavior set to "promptRequired".  A shell
-         ;; that has not yet processed its own `session/prompt' response is
-         ;; still busy, where submitting errors ("Busy, try later") without
-         ;; inserting, so that case falls through to declined.
-         ((and "promptRequired" (guard (not (shell-maker-busy))))
-          (agent-shell--insert-to-shell-buffer :text prompt :submit t :no-focus t))
-         ;; Claude and Codex both answer with this one.  No `session/prompt'
-         ;; owns this turn, so nothing signals when it ends: its output
-         ;; arrives out of turn and the shell does not show as busy.  See
-         ;; claude-agent-acp#903.
-         ;;
-         ;; TODO: Track the turn once an end signal exists.  claude-agent-acp
-         ;; proposes `_session/turn_ended' for exactly this in #997, which
-         ;; would let us close the turn out rather than just warn about it.
-         ("startedNewTurn"
-          (agent-shell--update-fragment
-           :state (agent-shell--state)
-           :block-id (format "%s-steer-detached-turn"
-                             (map-elt (agent-shell--state) :request-count))
-           :body (agent-shell--make-boxed-message
-                  :text "Note: Steered prompt still in progress.")
-           :create-new t
-           :above-last-prompt (not (agent-shell--active-requests-p
-                                    (agent-shell--state))))
-          (map-put! (agent-shell--state) :last-entry-type "steering_detached_turn")
-          ;; The turn ending is what started this timer, and it would now
-          ;; announce the agent idle while the turn it just began runs.
-          ;; Nothing re-arms it for this turn, since that happens on the
-          ;; `session/prompt' response there will never be.  A permission
-          ;; request during the turn still arms it on its own.
-          (agent-shell--cancel-idle-timer))
-         ;; Codex's "failed", a "promptRequired" this shell is too busy to
-         ;; act on, and anything an agent we do not know about answers with.
-         (_
-          (agent-shell--update-fragment
-           :state (agent-shell--state)
-           :block-id (format "%s-steer-declined"
-                             (map-elt (agent-shell--state) :request-count))
-           :body (agent-shell--make-boxed-message
-                  :text (if (map-elt acp-response 'outcome)
-                            (format "Note: Steered prompt declined (%s)."
-                                    (map-elt acp-response 'outcome))
-                          "Note: Steered prompt declined."))
-           :create-new t
-           :above-last-prompt (not (agent-shell--active-requests-p
-                                    (agent-shell--state))))
-          (map-put! (agent-shell--state) :last-entry-type "steering_declined")
-          ;; Interrupted so the agent does not carry on for hours in a
-          ;; direction the user believes they already corrected.  A declined
-          ;; steer does not say whether continuing is harmless, and the cost
-          ;; of guessing wrong is far higher one way than the other.
-          (agent-shell-interrupt t)))))))
+                         (agent-shell--expand-truncated-regions prompt)))
+        (report-declined
+         (lambda (reason outcome)
+           (if on-declined
+               (funcall on-declined reason outcome)
+             (agent-shell--update-fragment
+              :state (agent-shell--state)
+              :block-id (format "%s-steer-declined"
+                                (map-elt (agent-shell--state) :request-count))
+              :body (agent-shell--make-boxed-message
+                     :text (if reason
+                               (format "Note: Steered prompt declined (%s)." reason)
+                             "Note: Steered prompt declined."))
+              :create-new t
+              :above-last-prompt (not (agent-shell--active-requests-p
+                                       (agent-shell--state))))
+             (map-put! (agent-shell--state) :last-entry-type "steering_declined")
+             ;; Interrupted so the agent does not carry on for a long while
+             ;; in a direction the user believes they already corrected.  A
+             ;; declined steer does not say whether continuing is harmless,
+             ;; and the cost of guessing wrong is far higher one way than
+             ;; interrupting current work.
+             (agent-shell-interrupt t)))))
+    ;; Ensured on the STATE we were handed, not via
+    ;; `agent-shell--prompt-queue-migrate', which works on the buffer-local
+    ;; variable and need not be this same object.
+    (agent-shell--ensure-state-key state :prompt-queue-paused)
+    (map-put! state :prompt-queue-paused 'steering)
+    (condition-case err
+        (agent-shell--send-request
+         :state state
+         :client (map-elt state :client)
+         :request (agent-shell-experimental--make-session-steering-request
+                   :session-id (map-nested-elt state '(:session :id))
+                   :prompt content-blocks)
+         :buffer (current-buffer)
+         :on-failure (lambda (acp-error _raw-message)
+                       (map-put! state :prompt-queue-paused nil)
+                       ;; Unlike an agent answering with an outcome, a request
+                       ;; that failed outright says nothing about why, so carry
+                       ;; its error text.
+                       (funcall report-declined (map-elt acp-error 'message) 'failed))
+         :on-success
+         (lambda (acp-response)
+           (pcase (map-elt acp-response 'outcome)
+             ;; Claude and Codex both answer with this one.
+             ("injected"
+              (agent-shell-experimental--render-steered-prompt
+               :state (agent-shell--state) :prompt prompt)
+              (map-put! state :prompt-queue-paused nil)
+              (when on-delivered
+                (funcall on-delivered 'injected))
+              ;; The tracked turn may have ended while the steer was in flight,
+              ;; where its queue hook saw the pause and did nothing.  An
+              ;; `injected' outcome confirms that turn consumed the prompt, so
+              ;; the queue is free to move again.
+              (when (and (not (shell-maker-busy))
+                         (map-elt state :pending-prompts))
+                (agent-shell--prompt-queue-process-next)))
+             ;; Claude only, and only because the request opts into it with
+             ;; _meta.steering.idleBehavior set to "promptRequired".  A shell
+             ;; that has not yet processed its own `session/prompt' response is
+             ;; still busy, where submitting errors ("Busy, try later") without
+             ;; inserting, so that case falls through to declined.
+             ((and "promptRequired" (guard (not (shell-maker-busy))))
+              (map-put! state :prompt-queue-paused nil)
+              (agent-shell--insert-to-shell-buffer :text prompt :submit t :no-focus t)
+              (when on-delivered
+                (funcall on-delivered 'prompt-required)))
+             ;; Claude and Codex both answer with this one.  No `session/prompt'
+             ;; owns this turn, so nothing signals when it ends: its output
+             ;; arrives out of turn and the shell does not show as busy.  See
+             ;; claude-agent-acp#903.
+             ;;
+             ;; TODO: Track the turn once an end signal exists.  claude-agent-acp
+             ;; proposes `_session/turn_ended' for exactly this in #997, which
+             ;; would let us close the turn out rather than just warn about it.
+             ("startedNewTurn"
+              (agent-shell--update-fragment
+               :state (agent-shell--state)
+               :block-id (format "%s-steer-detached-turn"
+                                 (map-elt (agent-shell--state) :request-count))
+               :body (agent-shell--make-boxed-message
+                      :text "Note: Steered prompt still in progress.")
+               :create-new t
+               :above-last-prompt (not (agent-shell--active-requests-p
+                                        (agent-shell--state))))
+              (map-put! (agent-shell--state) :last-entry-type "steering_detached_turn")
+              ;; The turn ending is what started this timer, and it would now
+              ;; announce the agent idle while the turn it just began runs.
+              ;; Nothing re-arms it for this turn, since that happens on the
+              ;; `session/prompt' response there will never be.  A permission
+              ;; request during the turn still arms it on its own.
+              (agent-shell--cancel-idle-timer)
+              ;; Held rather than released: the shell does not show as busy
+              ;; while this turn runs, so an automatic send would fire a queued
+              ;; prompt straight into a working agent.  The user resumes with
+              ;; `agent-shell-prompt-queue-resume' once the output settles.
+              (map-put! state :prompt-queue-paused 'detached-turn)
+              ;; Consumed, whether we asked for it or not, so a caller holding
+              ;; its own copy must not send it a second time.
+              (when on-delivered
+                (funcall on-delivered 'started-new-turn)))
+             ;; Codex's "failed", a "promptRequired" this shell is too busy to
+             ;; act on, and anything an agent we do not know about answers with.
+             (_
+              (map-put! state :prompt-queue-paused nil)
+              (funcall report-declined (map-elt acp-response 'outcome) 'declined)))))
+      (error
+       ;; The request never went out, so nothing will settle the pause.
+       (map-put! state :prompt-queue-paused nil)
+       (if on-declined
+           ;; The prompt never reached the agent, and a caller that has
+           ;; somewhere else to put it promised not to drop it.  Letting the
+           ;; error escape would take the prompt with it.
+           (funcall on-declined (error-message-string err) 'failed)
+         ;; Nowhere to put it, so the caller has to see why the send failed.
+         (signal (car err) (cdr err)))))))
 
 (cl-defun agent-shell-experimental--render-steered-prompt (&key state prompt)
-  "Render PROMPT into STATE's shell as the user prompt it is.
+  "Render PROMPT into STATE's shell as a labelled block inside the running turn.
 
 A steered prompt is never echoed back: neither the Claude nor the Codex
-adapter forwards it as a `user_message_chunk' while the turn runs, so
-the client renders it or it does not appear at all.
+adapter forwards it as a `user_message_chunk' while the turn runs, so the
+client renders it or it does not appear at all.
 
-Uses the field/face shape comint gives a live prompt, so
-`comint-next-prompt', `agent-shell-next-item', copying and screen-reader
-prompt navigation treat it as a user prompt rather than as a new kind of
-entry.  `shell-maker-insert-end-of-prompt-marker' then closes it, which
-is what bounds the prompt for anything measuring it by searching forward
-for the marker; without it such a search runs to the next submission and
-takes the rest of the turn's output as this prompt's body.
+Rendered inside the turn rather than as another shell prompt.  A
+prompt-shaped line is an interaction boundary for
+`shell-maker-narrow-to-prompt', which matches `comint-prompt-regexp',
+while `shell-maker--extract-history' counts only a prompt carrying the
+literal `comint-highlight-prompt' face.  The two disagree about a
+synthesized prompt, and a steered turn came apart on that: the viewport
+rebuilds from `agent-shell-interaction-at-point', so view-last stopped at
+the steer and hid the response it asked for, and with point past the
+steer extraction returned nil, leaving a shell -> viewport switch showing
+whatever was there before.
 
-The `[steer]' prefix carries the one thing this shape would otherwise
-lose -- that the prompt was injected into a running turn rather than
-typed before one.
-
-The turn can end while the steer is in flight, leaving a live input
-prompt at the buffer end by the time the agent answers.  Rendering above
-it then keeps this out of comint's input area, where submitting would
-send it as input."
-  (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
+Prefixing with the agent's own prompt string said the wrong thing too:
+the text is the user's, and reading `Claude> ' in front of it makes a
+mid-turn correction look like the start of a new turn.  A heading
+separates it from the agent output around it instead, and one steered
+turn stays one interaction."
+  (agent-shell--separate-transcript-after-agent-message
+   :last-entry-type (map-elt state :last-entry-type)
+   :file-path agent-shell--transcript-file)
   (agent-shell--append-transcript
    :text (format "## User (steered) (%s)\n\n%s\n\n"
                  (format-time-string "%F %T")
                  (agent-shell--indent-markdown-headers prompt))
    :file-path agent-shell--transcript-file)
+  (map-put! state :chunked-group-count (1+ (map-elt state :chunked-group-count)))
   (with-current-buffer (map-elt state :buffer)
-    ;; Narrow to everything above a live input prompt so both inserts land
-    ;; there, and flip the prompt-start marker's insertion type so it
-    ;; advances past the new text rather than being stranded inside it.
-    ;; `shell-maker-insert-end-of-prompt-marker' documents this narrowing as
-    ;; the way to synthesize history above a live prompt.
+    ;; The turn can end while the steer is in flight, so the shell may have
+    ;; printed its next prompt by the time the agent answers.  Rendering at
+    ;; the buffer end would then land inside comint's input area, where
+    ;; submitting sends it as input.  Narrow above the live prompt, and flip
+    ;; that prompt's start marker so it advances past the new text rather
+    ;; than being stranded inside it.
     (let* ((late-prompt-start (and (not (shell-maker-busy))
                                    comint-last-prompt
                                    (marker-position (car comint-last-prompt))
@@ -370,15 +414,13 @@ send it as input."
               (narrow-to-region (point-min) (marker-position late-prompt-start)))
             (agent-shell--update-text
              :state state
-             :block-id (format "%s-steered-user_message_chunk"
+             :block-id (format "%s-steered-user_message"
                                (map-elt state :chunked-group-count))
-             :text (concat (propertize (map-nested-elt state '(:agent-config :shell-prompt))
-                                       'font-lock-face 'agent-shell-prompt
-                                       'field 'output)
-                           (propertize (concat "[steer] " (substring-no-properties prompt))
+             :text (concat (propertize "Steered prompt\n"
+                                       'font-lock-face 'agent-shell-section-heading)
+                           (propertize prompt
                                        'font-lock-face 'agent-shell-input))
              :create-new t)
-            (shell-maker-insert-end-of-prompt-marker)
             ;; Under the narrowing `point-max' is the live prompt's start,
             ;; so this keeps that prompt on its own line.
             (when late-prompt-start
@@ -392,8 +434,8 @@ send it as input."
         ;; undo entries recorded for it point at the shifted text.
         (agent-shell--reset-undo-history))))
   ;; Deliberately not "user_message_chunk": that value asks the replay path
-  ;; to insert the end-of-prompt marker on the next notification, and one
-  ;; has already gone in above.
+  ;; to insert an end-of-prompt marker on the next notification, and this
+  ;; prompt is not one.
   (map-put! state :last-entry-type "steered_user_message"))
 
 (defun agent-shell-experimental--normalize-request (request)
