@@ -53,7 +53,7 @@ Every file is checked before any is copied, so a drop that includes an
 unreadable file or a directory attaches nothing rather than part of the
 selection.  A drop made mid-turn attaches to the live prompt when
 `agent-shell-persistent-prompt-enabled' keeps one there.  Without one, it
-is queued the way `agent-shell-send-region' queues its region, whether it
+is sent the way `agent-shell-send-region' sends its region, whether it
 lands on the shell or on a viewport buffer.
 
 For example, dropping \"file:///tmp/diagram.png\" and
@@ -74,8 +74,8 @@ an image preview and \"@/tmp/notes.txt\"."
     (if (agent-shell--can-insert-into-prompt-p :shell-buffer shell-buffer)
         (agent-shell-insert :text text :shell-buffer shell-buffer)
       (with-current-buffer shell-buffer
-        (agent-shell-prompt-queue
-         (agent-shell--prompt-queue-read :initial (concat text "\n\n")))))
+        (agent-shell--prompt-send
+         :prompt (agent-shell--prompt-queue-read :initial (concat text "\n\n")))))
     'private))
 
 ;; Emacs 30+ reads the dnd-multiple-handler property off the handler's
@@ -149,8 +149,8 @@ add a second set of entries."
 A `yank-media' handler: Emacs reads the image off the clipboard itself,
 so no external utility from `agent-shell-clipboard-image-handlers' is
 needed.  DATA is saved to the screenshots directory and inserted as file
-context, or queued when the shell is busy with no live prompt, the way
-`agent-shell--dnd-handle-file-url' attaches a dropped file.
+context, or sent as a prompt when the shell is busy with no live prompt,
+the way `agent-shell--dnd-handle-file-url' attaches a dropped file.
 
 For example, yanking an image/png inserts
 \"@.agent-shell/screenshots/clipboard-20260928-101512-Ab3xK9.png\" with
@@ -170,8 +170,8 @@ an image preview."
     (if (agent-shell--can-insert-into-prompt-p :shell-buffer shell-buffer)
         (agent-shell-insert :text text :shell-buffer shell-buffer)
       (with-current-buffer shell-buffer
-        (agent-shell-prompt-queue
-         (agent-shell--prompt-queue-read :initial (concat text "\n\n")))))))
+        (agent-shell--prompt-send
+         :prompt (agent-shell--prompt-queue-read :initial (concat text "\n\n")))))))
 
 (defun agent-shell--yank-media-image-extension (type)
   "Return the file extension for image MIME TYPE, without the dot.

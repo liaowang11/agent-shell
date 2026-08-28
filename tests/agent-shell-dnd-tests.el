@@ -117,8 +117,9 @@ on a viewport buffer queues too."
                     ((symbol-function 'shell-maker-busy) (lambda () t))
                     ((symbol-function 'agent-shell--prompt-queue-read)
                      (lambda (&rest args) (plist-get args :initial)))
-                    ((symbol-function 'agent-shell-prompt-queue)
-                     (lambda (prompt) (setq queued prompt))))
+                    ((symbol-function 'agent-shell--prompt-send)
+                     (cl-function
+                      (lambda (&key prompt &allow-other-keys) (setq queued prompt)))))
             (let ((temporary-file-directory agent-shell-dnd-test--no-temp-dir))
               (agent-shell--dnd-handle-file-url (concat "file://" file) 'copy))
             (should-not inserted)
@@ -145,8 +146,9 @@ Only a busy shell with nowhere to type falls back to the queue."
                     ((symbol-function 'shell-maker-busy) (lambda () t))
                     ((symbol-function 'agent-shell--prompt-input-start)
                      (lambda () (point-max)))
-                    ((symbol-function 'agent-shell-prompt-queue)
-                     (lambda (prompt) (setq queued prompt))))
+                    ((symbol-function 'agent-shell--prompt-send)
+                     (cl-function
+                      (lambda (&key prompt &allow-other-keys) (setq queued prompt)))))
             (let ((temporary-file-directory agent-shell-dnd-test--no-temp-dir))
               (agent-shell--dnd-handle-file-url (concat "file://" file) 'copy))
             (should-not queued)
@@ -285,8 +287,9 @@ The handler goes ahead of Emacs's own, the host form still reaches
                      (lambda (_subdir) screenshots-dir))
                     ((symbol-function 'agent-shell--prompt-queue-read)
                      (lambda (&rest args) (plist-get args :initial)))
-                    ((symbol-function 'agent-shell-prompt-queue)
-                     (lambda (prompt) (setq queued prompt))))
+                    ((symbol-function 'agent-shell--prompt-send)
+                     (cl-function
+                      (lambda (&key prompt &allow-other-keys) (setq queued prompt)))))
             (agent-shell--yank-media-image 'image/png "pixels")
             (should-not inserted)
             (should (equal queued
