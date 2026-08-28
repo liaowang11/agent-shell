@@ -209,6 +209,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
             ;; a tool call and its completion) would spawn an empty group.
             ;; Either way the resolved parent qualified-id and indent are
             ;; recorded on the model so insertion and body regeneration nest.
+            ;; A content-free child must not materialize its parent: doing so
+            ;; leaves a bare group header with no member to render beneath it.
             (cond
              ((and existing-start (not create-new))
               (when-let* ((state (get-text-property existing-start
@@ -218,7 +220,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                     (list (cons :group-qualified-id existing-group)
                                           (cons :group-indent
                                                 (or (map-elt state :group-indent) "  ")))))))
-             (group-id
+             ((and group-id (or new-label-left new-label-right new-body))
               (setq group-header (agent-shell-ui--insert-group-header
                                   :namespace-id namespace-id
                                   :group-id group-id
