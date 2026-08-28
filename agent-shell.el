@@ -1322,9 +1322,11 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-session-load nil)
         (cons :supports-session-resume nil)
         (cons :supports-session-fork nil)
+        (cons :supports-fork-point nil)
         (cons :supports-steering nil)
         (cons :resume-session-id nil)
         (cons :fork-session-id nil)
+        (cons :fork-message-id nil)
         (cons :pending-restore nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
@@ -1730,29 +1732,18 @@ Works from both shell and viewport buffers."
       (user-error "No active session to reload"))
     (agent-shell-restart :session-id session-id)))
 
-;;;###autoload
-(defun agent-shell-fork ()
-  "Fork the current session into a new shell.
-
-Creates a new shell that forks the current session's conversation,
-leaving the original shell intact.  The new shell shares conversation
-history with the original but diverges from this point forward.
-
-Works from both shell and viewport buffers."
-  (declare (modes agent-shell-mode
-                  agent-shell-viewport-view-mode
-                  agent-shell-viewport-edit-mode))
-  (interactive)
-  (let* ((from-viewport (or (derived-mode-p 'agent-shell-viewport-view-mode)
-                            (derived-mode-p 'agent-shell-viewport-edit-mode)))
-         (shell-buffer (or (agent-shell--current-shell)
-                           (user-error "Not in a shell or viewport buffer")))
-         (session-id (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                                     '(:session :id)))
-         (supports-fork (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                                 :supports-session-fork))
-         (config (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                          :agent-config)))
+(cl-defun agent-shell--fork-shell-buffer (&key shell-buffer message-id from-viewport)
+  "Start a new shell forking SHELL-BUFFER's session.
+MESSAGE-ID, when given, forks up to that message instead of the
+session's latest turn (see `agent-shell--fork-message-meta').
+FROM-VIEWPORT controls whether the new buffer is shown via the
+viewport or as a plain shell buffer.  Returns the new shell buffer."
+  (let ((session-id (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                                    '(:session :id)))
+        (supports-fork (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                                :supports-session-fork))
+        (config (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                         :agent-config)))
     (unless session-id
       (user-error "No active session to fork"))
     (unless supports-fork
@@ -1761,12 +1752,120 @@ Works from both shell and viewport buffers."
                              :config config
                              :session-strategy 'new
                              :fork-session-id session-id
+                             :fork-message-id message-id
                              :new-session t
                              :no-focus t)))
       (if (or from-viewport agent-shell-prefer-viewport-interaction)
           (agent-shell-viewport--show-buffer
            :shell-buffer new-shell-buffer)
-        (agent-shell--display-buffer new-shell-buffer)))))
+        (agent-shell--display-buffer new-shell-buffer))
+      new-shell-buffer)))
+
+;;;###autoload
+(defun agent-shell-fork ()
+  "Fork the current session into a new shell.
+
+Creates a new shell that forks the current session's conversation,
+leaving the original shell intact.  The new shell shares conversation
+history with the original but diverges from this point forward.
+
+Works from both shell and viewport buffers.  To fork up to a specific
+past message instead of the latest turn, use `agent-shell-fork-at-point'."
+  (declare (modes agent-shell-mode
+                  agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
+  (interactive)
+  (let* ((from-viewport (or (derived-mode-p 'agent-shell-viewport-view-mode)
+                            (derived-mode-p 'agent-shell-viewport-edit-mode)))
+         (shell-buffer (or (agent-shell--current-shell)
+                           (user-error "Not in a shell or viewport buffer"))))
+    (agent-shell--fork-shell-buffer :shell-buffer shell-buffer :from-viewport from-viewport)))
+
+(defun agent-shell--stamp-message-id (block-start block-end message-id)
+  "Mark BLOCK-START to BLOCK-END as belonging to MESSAGE-ID.
+
+Only the part not carrying it yet.  A streamed message re-renders its
+block on every chunk and the block grows by a chunk each time, so
+stamping the whole of it re-walks every text-property interval accrued so
+far -- the per-chunk O(chunks so far) cost `agent-shell-ui.el' keeps a
+block cache to avoid (issue #757).  The stamped run always reached the
+previous block end, so searching back from the new one finds the boundary
+within the tail instead of crossing the block.
+
+A body only ever grows at the end, but a label rewrite (a subagent tag
+arriving, say) replaces text at the head, which that search would walk
+straight past.  An unstamped first char is what says so, and costs one
+property read to check.
+
+Rendered output carries `read-only t' from
+`agent-shell-ui--insert-fragment', so writing over it needs
+`inhibit-read-only' the same way the render calls do; without it this
+signals `text-read-only' and aborts the notification mid-way."
+  (let* ((stamped-head (equal (get-text-property block-start
+                                                 'agent-shell-message-id)
+                              message-id))
+         (from (if stamped-head
+                   (or (previous-single-property-change
+                        block-end 'agent-shell-message-id nil block-start)
+                       block-start)
+                 block-start))
+         (inhibit-read-only t))
+    (when (< from block-end)
+      (put-text-property from block-end 'agent-shell-message-id message-id))))
+
+(defun agent-shell--message-id-at-point ()
+  "Return the ACP `messageId' of the agent message fragment at point, or nil.
+Set by `agent-shell--update-fragment' via its MESSAGE-ID keyword; nil
+when point isn't on or after a rendered agent message, or the agent
+omitted the optional `messageId' on it.
+
+Falls back to the nearest preceding stamped message when point itself
+carries no stamp -- end of buffer and the blank-line padding
+`agent-shell-ui.el' inserts after a block both land here, the same gap
+`agent-shell-ui--previous-visible-navigatable' walks back across."
+  (or (get-text-property (point) 'agent-shell-message-id)
+      (save-excursion
+        (when-let* ((match (text-property-search-backward
+                            'agent-shell-message-id nil
+                            (lambda (_old new) new))))
+          (prop-match-value match)))))
+
+;;;###autoload
+(defun agent-shell-fork-at-point ()
+  "Fork the current session up to the agent message at point.
+
+Like `agent-shell-fork', but the new session's history stops right
+after the message at point instead of the session's latest turn.
+
+Signals a `user-error' when the agent never advertised claude-agent-acp's
+AIR extension, which is what carries the fork point.  Such an agent would
+ignore it and fork the latest turn, handing back a session that still
+remembers everything you meant to leave behind -- and saying so only
+turns up turns later.  Use `agent-shell-fork' when the latest turn is
+what you want.
+
+Point must be on a rendered agent message.  Works from both shell and
+viewport buffers: `agent-shell--update-fragment' stamps the ACP
+`messageId' on both copies of a message it renders."
+  (declare (modes agent-shell-mode
+                  agent-shell-viewport-view-mode))
+  (interactive)
+  (let* ((from-viewport (derived-mode-p 'agent-shell-viewport-view-mode))
+         (shell-buffer (or (agent-shell--current-shell)
+                           (user-error "Not in a shell or viewport buffer"))))
+    ;; Checked before point: an agent that never advertised the extension
+    ;; fails here regardless of point, and that is the more useful thing to
+    ;; tell the user -- "cannot fork from a specific message" over "no
+    ;; message at point" says why, not just what.
+    (unless (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                     :supports-fork-point)
+      (user-error "This agent cannot fork from a specific message"))
+    (let ((message-id (or (agent-shell--message-id-at-point)
+                          (user-error "No agent message at point to fork from"))))
+      (agent-shell--fork-shell-buffer
+       :shell-buffer shell-buffer
+       :message-id message-id
+       :from-viewport from-viewport))))
 
 ;;;###autoload
 (defun agent-shell-resume-session (session-id)
@@ -3912,7 +4011,8 @@ around this call to reflect whether the update arrived out of turn."
               :create-new new-message
               :append t
               :navigation 'never
-              :render-body-images t)
+              :render-body-images t
+              :message-id message-id)
              (when-let* ((row (agent-shell--subagent-row state))
                          ((agent-shell--note-subagent-activity
                            state `((:kind . message)
@@ -6581,7 +6681,8 @@ own banner, passing along their shell-maker config."
                                    (message "Thank you!")))
    "✨ (or ask your employer to).\n\n"))
 
-(cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id fork-session-id outgoing-request-decorator)
+(cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id
+                                   fork-session-id fork-message-id outgoing-request-decorator)
   "Programmatically start shell with CONFIG.
 
 See `agent-shell-make-agent-config' for config format.
@@ -6591,6 +6692,10 @@ Set NEW-SESSION to start a separate new session.
 SESSION-STRATEGY overrides `agent-shell-session-strategy' buffer-locally.
 SESSION-ID resumes an existing session by its id string.
 FORK-SESSION-ID forks an existing session by its id string.
+FORK-MESSAGE-ID, only meaningful alongside FORK-SESSION-ID, forks up to
+that message instead of the session's latest turn; ignored by agents
+that don't advertise claude-agent-acp's AIR fork-point extension (see
+`agent-shell--initiate-session-fork-by-id').
 OUTGOING-REQUEST-DECORATOR is passed through to `acp-make-client'."
   (unless (version<= agent-shell--shell-maker-minimum-version shell-maker-version)
     (error "Please update shell-maker to version %s or newer"
@@ -6720,6 +6825,8 @@ variable (see makunbound)"))
         (map-put! agent-shell--state :resume-session-id session-id))
       (when fork-session-id
         (map-put! agent-shell--state :fork-session-id fork-session-id))
+      (when fork-message-id
+        (map-put! agent-shell--state :fork-message-id fork-message-id))
       ;; Snapshot the strategy also in case it was dynamically re-bound
       (setq-local agent-shell-session-strategy
                   (or session-strategy agent-shell-session-strategy))
@@ -6934,13 +7041,13 @@ the reported range down to the newly inserted chars."
     (add-text-properties untagged end '(field output))))
 
 (cl-defun agent-shell--render-view-fragment (&key model navigation append create-new
-                                                    expanded render-body-images)
+                                                    expanded message-id render-body-images)
   "Render fragment MODEL into the current view buffer.
 
 For buffers that show fragments without being a shell: the viewport
 mirroring one, and a native subagent's own buffer.  NAVIGATION, APPEND,
 CREATE-NEW and EXPANDED are as in `agent-shell-ui-update-fragment', and
-RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
+MESSAGE-ID and RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
   (let ((buffer-undo-list t)
         (inhibit-read-only t)
         (auto-scroll (shell-maker--should-auto-scroll-p)))
@@ -6955,6 +7062,15 @@ RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
                 (padding-end (map-nested-elt range '(:padding :end)))
                 (block-start (map-nested-elt range '(:block :start)))
                 (block-end (map-nested-elt range '(:block :end))))
+      ;; Rendered output carries `read-only t' from
+      ;; `agent-shell-ui--insert-fragment', so stamping a property over
+      ;; it needs `inhibit-read-only' as the render calls below do.
+      ;; Without it this signals `text-read-only' and aborts the
+      ;; notification before `:last-agent-message-ids' and
+      ;; `:last-entry-type' advance, splitting one streamed message
+      ;; into one message per chunk.
+      (when message-id
+        (agent-shell--stamp-message-id block-start block-end message-id))
       ;; Restore point after narrowing to prevent scrolling
       (save-excursion
         ;; Apply markdown to body.
@@ -6987,7 +7103,7 @@ RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
 (cl-defun agent-shell--update-fragment (&key state namespace-id block-id label-left label-right
                                              body append create-new navigation expanded
                                              render-body-images above-last-prompt
-                                             group-id group-label (group-expanded t))
+                                             group-id group-label (group-expanded t) message-id)
   "Update fragment in the shell buffer.
 
 Creates or updates existing dialog using STATE's request count as namespace
@@ -7009,7 +7125,12 @@ Programmatic fragment updates do not enter undo history.
 
 GROUP-ID nests this block under a collapsible group header, materialized
 from GROUP-LABEL on first use (see `agent-shell-ui-make-fragment-model'),
-with GROUP-EXPANDED as the group's initial fold state."
+with GROUP-EXPANDED as the group's initial fold state.
+
+MESSAGE-ID, when given, is stamped across the block as the
+`agent-shell-message-id' text property, so `agent-shell--message-id-at-point'
+can recover the ACP `messageId' a rendered message came from (used by
+`agent-shell-fork-at-point')."
   ;; A persistent prompt is live for the whole turn, so there is always one
   ;; to render above and every write goes there.  Callers decide
   ;; ABOVE-LAST-PROMPT from whether the shell is busy, which only tells
@@ -7057,7 +7178,7 @@ with GROUP-EXPANDED as the group's initial fold state."
                :label-right label-right
                :body body)
        :navigation navigation :append append :create-new create-new
-       :expanded expanded
+       :expanded expanded :message-id message-id
        :render-body-images render-body-images))
     (cl-return-from agent-shell--update-fragment))
   (when-let* (((map-elt state :buffer))
@@ -7080,7 +7201,7 @@ with GROUP-EXPANDED as the group's initial fold state."
                :group-label group-label
                :group-expanded group-expanded)
        :navigation navigation :append append :create-new create-new
-       :expanded expanded
+       :expanded expanded :message-id message-id
        :render-body-images render-body-images)))
   (with-current-buffer (map-elt state :buffer)
     (unless (and (derived-mode-p 'agent-shell-mode)
@@ -7137,6 +7258,10 @@ with GROUP-EXPANDED as the group's initial fold state."
                                     (list part (copy-marker start) (copy-marker end t))))
                                 '(:padding :group-header :block :body
                                   :label-left :label-right)))))
+         ;; See the sibling branch above: this needs `inhibit-read-only'
+         ;; for the same reason the render calls below do.
+         (when message-id
+           (agent-shell--stamp-message-id block-start block-end message-id))
          (save-restriction
            ;; TODO: Move this to shell-maker?
            (let ((inhibit-read-only t))
@@ -8830,6 +8955,12 @@ Must provide ON-INITIATED (lambda ())."
                    ;; `agentCapabilities'.  See `agent-shell-steering-supported-p'.
                    (map-put! agent-shell--state :supports-steering
                              (eq (map-nested-elt acp-response '(_meta steering supported)) t))
+                   ;; A fork point rides the AIR extension's `_meta', so an
+                   ;; agent that never advertised the extension ignores it and
+                   ;; forks the latest turn instead.  See
+                   ;; `agent-shell--air-extension-supported-p'.
+                   (map-put! agent-shell--state :supports-fork-point
+                             (agent-shell--air-extension-supported-p acp-response))
                    (when-let* ((agent-capabilities (map-elt acp-response 'agentCapabilities)))
                      (map-put! agent-shell--state :supports-session-load
                                (eq (map-elt agent-capabilities 'loadSession) t))
@@ -9291,6 +9422,7 @@ Must provide ON-SESSION-INIT (lambda ())."
       (if (map-elt (agent-shell--state) :supports-session-fork)
           (agent-shell--initiate-session-fork-by-id
            :session-id fork-session-id
+           :message-id (map-elt (agent-shell--state) :fork-message-id)
            :shell-buffer shell-buffer
            :on-session-init on-session-init)
         ;; Forking not supported. Start a new session.
@@ -10010,8 +10142,40 @@ listing sessions to pick one to load."
                       :shell-buffer shell-buffer
                       :on-session-init on-session-init))))))
 
-(cl-defun agent-shell--initiate-session-fork-by-id (&key session-id shell-buffer on-session-init)
-  "Fork session SESSION-ID with SHELL-BUFFER and ON-SESSION-INIT."
+(defun agent-shell--fork-message-meta (message-id)
+  "Return an AIR `_meta' fragment forking up to MESSAGE-ID.
+
+This is claude-agent-acp's fork-point extension: without it, `session/fork'
+always forks from the session's latest turn.  Ignored by agents that
+don't implement it, which fork from the latest turn as usual.  The wire
+shape is `_meta.jetbrains.air.fork = {version: 1, messageId: MESSAGE-ID}'."
+  (list (cons 'jetbrains
+              (list (cons 'air
+                          (list (cons 'fork
+                                      (list (cons 'version 1)
+                                            (cons 'messageId message-id)))))))))
+
+(defun agent-shell--fork-request-meta (session-meta message-id)
+  "Return the `_meta' for a `session/fork' request.
+
+SESSION-META is the agent config's `:session-meta'.  MESSAGE-ID, when
+non-nil, adds the fork point; see `agent-shell--fork-message-meta'.
+
+Also asks the agent to title the fork after its own turns once it has
+taken one: left alone, claude-agent-acp names a fork after its parent,
+which says where it came from rather than what it went on to be about.
+The key is only sent when SESSION-META lacks it, so a config that already
+sets it is not repeated.  Agents that do not know it ignore it."
+  (append session-meta
+          (unless (assq 'generateSessionTitle session-meta)
+            (list (cons 'generateSessionTitle t)))
+          (when message-id (agent-shell--fork-message-meta message-id))))
+
+(cl-defun agent-shell--initiate-session-fork-by-id (&key session-id message-id shell-buffer
+                                                         on-session-init)
+  "Fork session SESSION-ID with SHELL-BUFFER and ON-SESSION-INIT.
+MESSAGE-ID, when given, forks up to that message rather than the
+session's latest turn; see `agent-shell--fork-message-meta'."
   (agent-shell--update-bootstrapping-fragment
    :state (agent-shell--state)
    :block-id "starting"
@@ -10024,7 +10188,9 @@ listing sessions to pick one to load."
              :session-id session-id
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
-             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+             :meta (agent-shell--fork-request-meta
+                    (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
+                    message-id))
    :buffer (current-buffer)
    :on-success (lambda (acp-fork-response)
                  (let ((new-session-id (map-elt acp-fork-response 'sessionId)))
