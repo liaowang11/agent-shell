@@ -1227,9 +1227,11 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-session-load nil)
         (cons :supports-session-resume nil)
         (cons :supports-session-fork nil)
+        (cons :supports-fork-point nil)
         (cons :supports-steering nil)
         (cons :resume-session-id nil)
         (cons :fork-session-id nil)
+        (cons :fork-message-id nil)
         (cons :pending-restore nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
@@ -1580,29 +1582,18 @@ Works from both shell and viewport buffers."
       (user-error "No active session to reload"))
     (agent-shell-restart :session-id session-id)))
 
-;;;###autoload
-(defun agent-shell-fork ()
-  "Fork the current session into a new shell.
-
-Creates a new shell that forks the current session's conversation,
-leaving the original shell intact.  The new shell shares conversation
-history with the original but diverges from this point forward.
-
-Works from both shell and viewport buffers."
-  (declare (modes agent-shell-mode
-                  agent-shell-viewport-view-mode
-                  agent-shell-viewport-edit-mode))
-  (interactive)
-  (let* ((from-viewport (or (derived-mode-p 'agent-shell-viewport-view-mode)
-                            (derived-mode-p 'agent-shell-viewport-edit-mode)))
-         (shell-buffer (or (agent-shell--current-shell)
-                           (user-error "Not in a shell or viewport buffer")))
-         (session-id (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                                     '(:session :id)))
-         (supports-fork (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                                 :supports-session-fork))
-         (config (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
-                          :agent-config)))
+(cl-defun agent-shell--fork-shell-buffer (&key shell-buffer message-id from-viewport)
+  "Start a new shell forking SHELL-BUFFER's session.
+MESSAGE-ID, when given, forks up to that message instead of the
+session's latest turn (see `agent-shell--fork-message-meta').
+FROM-VIEWPORT controls whether the new buffer is shown via the
+viewport or as a plain shell buffer.  Returns the new shell buffer."
+  (let ((session-id (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                                    '(:session :id)))
+        (supports-fork (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                                :supports-session-fork))
+        (config (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                         :agent-config)))
     (unless session-id
       (user-error "No active session to fork"))
     (unless supports-fork
@@ -1611,12 +1602,120 @@ Works from both shell and viewport buffers."
                              :config config
                              :session-strategy 'new
                              :fork-session-id session-id
+                             :fork-message-id message-id
                              :new-session t
                              :no-focus t)))
       (if (or from-viewport agent-shell-prefer-viewport-interaction)
           (agent-shell-viewport--show-buffer
            :shell-buffer new-shell-buffer)
-        (agent-shell--display-buffer new-shell-buffer)))))
+        (agent-shell--display-buffer new-shell-buffer))
+      new-shell-buffer)))
+
+;;;###autoload
+(defun agent-shell-fork ()
+  "Fork the current session into a new shell.
+
+Creates a new shell that forks the current session's conversation,
+leaving the original shell intact.  The new shell shares conversation
+history with the original but diverges from this point forward.
+
+Works from both shell and viewport buffers.  To fork up to a specific
+past message instead of the latest turn, use `agent-shell-fork-at-point'."
+  (declare (modes agent-shell-mode
+                  agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
+  (interactive)
+  (let* ((from-viewport (or (derived-mode-p 'agent-shell-viewport-view-mode)
+                            (derived-mode-p 'agent-shell-viewport-edit-mode)))
+         (shell-buffer (or (agent-shell--current-shell)
+                           (user-error "Not in a shell or viewport buffer"))))
+    (agent-shell--fork-shell-buffer :shell-buffer shell-buffer :from-viewport from-viewport)))
+
+(defun agent-shell--stamp-message-id (block-start block-end message-id)
+  "Mark BLOCK-START to BLOCK-END as belonging to MESSAGE-ID.
+
+Only the part not carrying it yet.  A streamed message re-renders its
+block on every chunk and the block grows by a chunk each time, so
+stamping the whole of it re-walks every text-property interval accrued so
+far -- the per-chunk O(chunks so far) cost `agent-shell-ui.el' keeps a
+block cache to avoid (issue #757).  The stamped run always reached the
+previous block end, so searching back from the new one finds the boundary
+within the tail instead of crossing the block.
+
+A body only ever grows at the end, but a label rewrite (a subagent tag
+arriving, say) replaces text at the head, which that search would walk
+straight past.  An unstamped first char is what says so, and costs one
+property read to check.
+
+Rendered output carries `read-only t' from
+`agent-shell-ui--insert-fragment', so writing over it needs
+`inhibit-read-only' the same way the render calls do; without it this
+signals `text-read-only' and aborts the notification mid-way."
+  (let* ((stamped-head (equal (get-text-property block-start
+                                                 'agent-shell-message-id)
+                              message-id))
+         (from (if stamped-head
+                   (or (previous-single-property-change
+                        block-end 'agent-shell-message-id nil block-start)
+                       block-start)
+                 block-start))
+         (inhibit-read-only t))
+    (when (< from block-end)
+      (put-text-property from block-end 'agent-shell-message-id message-id))))
+
+(defun agent-shell--message-id-at-point ()
+  "Return the ACP `messageId' of the agent message fragment at point, or nil.
+Set by `agent-shell--update-fragment' via its MESSAGE-ID keyword; nil
+when point isn't on or after a rendered agent message, or the agent
+omitted the optional `messageId' on it.
+
+Falls back to the nearest preceding stamped message when point itself
+carries no stamp -- end of buffer and the blank-line padding
+`agent-shell-ui.el' inserts after a block both land here, the same gap
+`agent-shell-ui--previous-visible-navigatable' walks back across."
+  (or (get-text-property (point) 'agent-shell-message-id)
+      (save-excursion
+        (when-let* ((match (text-property-search-backward
+                            'agent-shell-message-id nil
+                            (lambda (_old new) new))))
+          (prop-match-value match)))))
+
+;;;###autoload
+(defun agent-shell-fork-at-point ()
+  "Fork the current session up to the agent message at point.
+
+Like `agent-shell-fork', but the new session's history stops right
+after the message at point instead of the session's latest turn.
+
+Signals a `user-error' when the agent never advertised claude-agent-acp's
+AIR extension, which is what carries the fork point.  Such an agent would
+ignore it and fork the latest turn, handing back a session that still
+remembers everything you meant to leave behind -- and saying so only
+turns up turns later.  Use `agent-shell-fork' when the latest turn is
+what you want.
+
+Point must be on a rendered agent message.  Works from both shell and
+viewport buffers: `agent-shell--update-fragment' stamps the ACP
+`messageId' on both copies of a message it renders."
+  (declare (modes agent-shell-mode
+                  agent-shell-viewport-view-mode))
+  (interactive)
+  (let* ((from-viewport (derived-mode-p 'agent-shell-viewport-view-mode))
+         (shell-buffer (or (agent-shell--current-shell)
+                           (user-error "Not in a shell or viewport buffer"))))
+    ;; Checked before point: an agent that never advertised the extension
+    ;; fails here regardless of point, and that is the more useful thing to
+    ;; tell the user -- "cannot fork from a specific message" over "no
+    ;; message at point" says why, not just what.
+    (unless (map-elt (buffer-local-value 'agent-shell--state shell-buffer)
+                     :supports-fork-point)
+      (user-error "This agent cannot fork from a specific message"))
+    (let ((message-id (or (agent-shell--message-id-at-point)
+                          (user-error "No agent message at point to fork from"))))
+      (agent-shell--fork-shell-buffer
+       :shell-buffer shell-buffer
+       :message-id message-id
+       :from-viewport from-viewport))))
 
 ;;;###autoload
 (defun agent-shell-resume-session (session-id)
@@ -3422,7 +3521,8 @@ around this call to reflect whether the update arrived out of turn."
               :create-new new-message
               :append t
               :navigation 'never
-              :render-body-images t)
+              :render-body-images t
+              :message-id message-id)
              (agent-shell--set-last-agent-message-id state message-session-id message-id))
            (agent-shell--activity-group-note-entry-type state "agent_message_chunk"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
@@ -3644,13 +3744,11 @@ around this call to reflect whether the update arrived out of turn."
                   (name (map-nested-elt acp-notification '(params update name)))
                   (task (map-nested-elt acp-notification '(params update task))))
              (agent-shell--save-native-subagent state subagent-session-id name task)
-             (agent-shell--update-fragment
+             (agent-shell--render-tracked-work
               :state state
               :block-id (agent-shell--subagent-block-id subagent-session-id)
-              :label-left (format "%s %s"
-                                  (agent-shell--make-status-kind-label :status "running")
-                                  (propertize (or name "Subagent")
-                                              'font-lock-face 'agent-shell-section-heading))
+              :status "running"
+              :name (or name "Subagent")
               :body (agent-shell--format-subagent-body task)
               :expanded agent-shell-tool-use-expand-by-default))
            (agent-shell--activity-group-note-entry-type state "subagent_spawned"))
@@ -3658,13 +3756,11 @@ around this call to reflect whether the update arrived out of turn."
            (let* ((subagent-session-id (map-nested-elt acp-notification '(params update subagentSessionId)))
                   (subagent-state (map-nested-elt acp-notification '(params update state)))
                   (registered (agent-shell--native-subagent state subagent-session-id)))
-             (agent-shell--update-fragment
+             (agent-shell--render-tracked-work
               :state state
               :block-id (agent-shell--subagent-block-id subagent-session-id)
-              :label-left (format "%s %s"
-                                  (agent-shell--make-status-kind-label :status subagent-state)
-                                  (propertize (or (map-elt registered :name) "Subagent")
-                                              'font-lock-face 'agent-shell-section-heading))
+              :status subagent-state
+              :name (or (map-elt registered :name) "Subagent")
               :body (agent-shell--format-subagent-body (map-elt registered :task))))
            (agent-shell--activity-group-note-entry-type state "subagent_state_update"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "async_task_spawned")
@@ -3688,13 +3784,11 @@ around this call to reflect whether the update arrived out of turn."
              (agent-shell--save-async-task state async-task-id name task-type description
                                            can-stop show-in-transcript)
              (when show-in-transcript
-               (agent-shell--update-fragment
+               (agent-shell--render-tracked-work
                 :state state
                 :block-id (agent-shell--async-task-block-id async-task-id)
-                :label-left (format "%s %s"
-                                    (agent-shell--make-status-kind-label :status "running")
-                                    (propertize (or name task-type "Background task")
-                                                'font-lock-face 'agent-shell-section-heading))
+                :status "running"
+                :name (or name task-type "Background task")
                 :body (agent-shell--format-async-task-body description nil nil nil)
                 :expanded agent-shell-tool-use-expand-by-default)
                ;; Only when something was drawn: advancing this with nothing
@@ -3712,16 +3806,13 @@ around this call to reflect whether the update arrived out of turn."
              ;; A task that draws no card of its own is tracked but not
              ;; drawn, the same as when it spawned.
              (when (map-elt registered :show-in-transcript)
-               (agent-shell--update-fragment
+               (agent-shell--render-tracked-work
                 :state state
                 :block-id (agent-shell--async-task-block-id async-task-id)
-                :label-left (format "%s %s"
-                                    (agent-shell--make-status-kind-label
-                                     :status (or (map-elt registered :state) "running"))
-                                    (propertize (or (map-elt registered :name)
-                                                    (map-elt registered :task-type)
-                                                    "Background task")
-                                                'font-lock-face 'agent-shell-section-heading))
+                :status (or (map-elt registered :state) "running")
+                :name (or (map-elt registered :name)
+                          (map-elt registered :task-type)
+                          "Background task")
                 :body (agent-shell--format-async-task-body
                        (or (map-nested-elt acp-notification '(params update description))
                            (map-elt registered :description))
@@ -3736,15 +3827,13 @@ around this call to reflect whether the update arrived out of turn."
                   (registered (agent-shell--async-task state async-task-id)))
              (agent-shell--set-async-task-state state async-task-id task-state)
              (when (map-elt registered :show-in-transcript)
-               (agent-shell--update-fragment
+               (agent-shell--render-tracked-work
                 :state state
                 :block-id (agent-shell--async-task-block-id async-task-id)
-                :label-left (format "%s %s"
-                                    (agent-shell--make-status-kind-label :status task-state)
-                                    (propertize (or (map-elt registered :name)
-                                                    (map-elt registered :task-type)
-                                                    "Background task")
-                                                'font-lock-face 'agent-shell-section-heading))
+                :status task-state
+                :name (or (map-elt registered :name)
+                          (map-elt registered :task-type)
+                          "Background task")
                 :body (agent-shell--format-async-task-body
                        (or (map-nested-elt acp-notification '(params update summary))
                            (map-elt registered :description))
@@ -5052,15 +5141,46 @@ a `status' key and a `content' or `step' key."
   "Return the fragment block id for ASYNC-TASK-ID."
   (format "async-task-%s" async-task-id))
 
+(defun agent-shell--ensure-state-key (state key)
+  "Make sure STATE carries KEY, adding it with a nil value when it does not.
+
+`map-put!' refuses to add a key an alist does not already have, so a
+shell built before KEY existed -- a live session across a package
+upgrade -- would fail on the first write to it.  `nconc' extends the
+alist in place, which keeps every reference to STATE seeing the addition.
+
+Return STATE."
+  (unless (assq key state)
+    (nconc state (list (cons key nil))))
+  state)
+
+(cl-defun agent-shell--render-tracked-work (&key state block-id status name body expanded)
+  "Render tracked work as a fragment keyed by BLOCK-ID in STATE's shell.
+
+STATUS picks the status icon, NAME is the heading beside it, and BODY the
+text under it.  EXPANDED is the initial fold state.
+
+Subagents and background tasks each report a spawn and then a stream of
+updates, and every one of those redraws the same card: keying on
+BLOCK-ID is what makes an update replace the previous draw rather than
+stack another card.  The five notification branches that do this differ
+only in the four values above, so the shape lives here rather than in
+each of them."
+  (agent-shell--update-fragment
+   :state state
+   :block-id block-id
+   :label-left (format "%s %s"
+                       (agent-shell--make-status-kind-label :status status)
+                       (propertize name 'font-lock-face 'agent-shell-section-heading))
+   :body body
+   :expanded expanded))
+
 (defun agent-shell--save-native-subagent (state subagent-session-id name task)
   "Record SUBAGENT-SESSION-ID's NAME and TASK in STATE's registry.
 Only `subagent_spawned' calls this; later `subagent_state_update'
 notifications carry no name/task of their own and look this up by
 SUBAGENT-SESSION-ID instead."
-  ;; Migrate state for sessions created before :native-subagents existed.
-  ;; Without this, map-put! fails on mid-session package updates.
-  (unless (assq :native-subagents state)
-    (nconc state (list (cons :native-subagents nil))))
+  (agent-shell--ensure-state-key state :native-subagents)
   (map-put! state :native-subagents
             (cons (cons subagent-session-id (list :name name :task task))
                   (map-elt state :native-subagents))))
@@ -5113,10 +5233,7 @@ of continuing the first."
 
 (defun agent-shell--set-last-agent-message-id (state session-id message-id)
   "Record MESSAGE-ID as the last one rendered for SESSION-ID in STATE."
-  ;; Migrate state for sessions created before :last-agent-message-ids
-  ;; existed.  Without this, map-put! fails on mid-session package updates.
-  (unless (assq :last-agent-message-ids state)
-    (nconc state (list (cons :last-agent-message-ids nil))))
+  (agent-shell--ensure-state-key state :last-agent-message-ids)
   (map-put! state :last-agent-message-ids
             (cons (cons session-id message-id)
                   (assoc-delete-all session-id
@@ -5152,10 +5269,7 @@ card, so those later notifications can keep a hidden task hidden while
 still tracking its state.  Every task is registered regardless: the flag
 is about display, and `agent-shell-stop-async-task' can only offer what
 the registry holds."
-  ;; Migrate state for sessions created before :async-tasks existed.
-  ;; Without this, map-put! fails on mid-session package updates.
-  (unless (assq :async-tasks state)
-    (nconc state (list (cons :async-tasks nil))))
+  (agent-shell--ensure-state-key state :async-tasks)
   (map-put! state :async-tasks
             (cons (cons async-task-id (list :name name :task-type task-type
                                             :description description
@@ -5218,13 +5332,18 @@ updates the fragment once the task actually stops."
       (user-error "No stoppable background tasks in this session"))
     (let* ((chosen (if (= (length candidates) 1)
                        (car candidates)
-                     (let ((choice (completing-read
-                                   "Stop background task: "
-                                   (mapcar #'agent-shell--async-task-candidate-label candidates)
-                                   nil t)))
-                       (seq-find (lambda (entry)
-                                   (equal (agent-shell--async-task-candidate-label entry) choice))
-                                 candidates))))
+                     ;; Chosen by label through an alist, as every other
+                     ;; keyed pick in the package does (see
+                     ;; `agent-shell-prompt-queue-edit'), rather than
+                     ;; rebuilding every label to search for the one picked.
+                     (let ((choices (mapcar
+                                     (lambda (entry)
+                                       (cons (agent-shell--async-task-candidate-label entry)
+                                             entry))
+                                     candidates)))
+                       (cdr (assoc (completing-read "Stop background task: "
+                                                    choices nil t)
+                                   choices)))))
            (async-task-id (car chosen)))
       (agent-shell--send-request
        :state state
@@ -5370,7 +5489,8 @@ FUNCTION should be a function accepting keyword arguments (&key ...)."
                    (list (car pair) (cdr pair)))
                  alist)))
 
-(cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id fork-session-id outgoing-request-decorator)
+(cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id
+                                   fork-session-id fork-message-id outgoing-request-decorator)
   "Programmatically start shell with CONFIG.
 
 See `agent-shell-make-agent-config' for config format.
@@ -5380,6 +5500,10 @@ Set NEW-SESSION to start a separate new session.
 SESSION-STRATEGY overrides `agent-shell-session-strategy' buffer-locally.
 SESSION-ID resumes an existing session by its id string.
 FORK-SESSION-ID forks an existing session by its id string.
+FORK-MESSAGE-ID, only meaningful alongside FORK-SESSION-ID, forks up to
+that message instead of the session's latest turn; ignored by agents
+that don't advertise claude-agent-acp's AIR fork-point extension (see
+`agent-shell--initiate-session-fork-by-id').
 OUTGOING-REQUEST-DECORATOR is passed through to `acp-make-client'."
   (unless (version<= "0.91.2" shell-maker-version)
     (error "Please update shell-maker to version 0.91.2 or newer"))
@@ -5506,6 +5630,8 @@ variable (see makunbound)"))
         (map-put! agent-shell--state :resume-session-id session-id))
       (when fork-session-id
         (map-put! agent-shell--state :fork-session-id fork-session-id))
+      (when fork-message-id
+        (map-put! agent-shell--state :fork-message-id fork-message-id))
       ;; Snapshot the strategy also in case it was dynamically re-bound
       (setq-local agent-shell-session-strategy
                   (or session-strategy agent-shell-session-strategy))
@@ -5728,7 +5854,7 @@ the reported range down to the newly inserted chars."
 (cl-defun agent-shell--update-fragment (&key state namespace-id block-id label-left label-right
                                              body append create-new navigation expanded
                                              render-body-images above-last-prompt
-                                             group-id group-label (group-expanded t))
+                                             group-id group-label (group-expanded t) message-id)
   "Update fragment in the shell buffer.
 
 Creates or updates existing dialog using STATE's request count as namespace
@@ -5747,7 +5873,12 @@ turn).  Programmatic fragment updates do not enter undo history.
 
 GROUP-ID nests this block under a collapsible group header, materialized
 from GROUP-LABEL on first use (see `agent-shell-ui-make-fragment-model'),
-with GROUP-EXPANDED as the group's initial fold state."
+with GROUP-EXPANDED as the group's initial fold state.
+
+MESSAGE-ID, when given, is stamped across the block as the
+`agent-shell-message-id' text property, so `agent-shell--message-id-at-point'
+can recover the ACP `messageId' a rendered message came from (used by
+`agent-shell-fork-at-point')."
   (when label-right
     (setq label-right (string-trim label-right)))
   ;; Prefix this fragment with a native subagent's name rather than the root
@@ -5802,6 +5933,15 @@ with GROUP-EXPANDED as the group's initial fold state."
                     (padding-end (map-nested-elt range '(:padding :end)))
                     (block-start (map-nested-elt range '(:block :start)))
                     (block-end (map-nested-elt range '(:block :end))))
+          ;; Rendered output carries `read-only t' from
+          ;; `agent-shell-ui--insert-fragment', so stamping a property over
+          ;; it needs `inhibit-read-only' as the render calls below do.
+          ;; Without it this signals `text-read-only' and aborts the
+          ;; notification before `:last-agent-message-ids' and
+          ;; `:last-entry-type' advance, splitting one streamed message
+          ;; into one message per chunk.
+          (when message-id
+            (agent-shell--stamp-message-id block-start block-end message-id))
           ;; Restore point after narrowing to prevent scrolling
           (save-excursion
             ;; Apply markdown to body.
@@ -5887,6 +6027,10 @@ with GROUP-EXPANDED as the group's initial fold state."
                    (padding-end (map-nested-elt range '(:padding :end)))
                    (block-start (map-nested-elt range '(:block :start)))
                    (block-end (map-nested-elt range '(:block :end))))
+         ;; See the sibling branch above: this needs `inhibit-read-only'
+         ;; for the same reason the render calls below do.
+         (when message-id
+           (agent-shell--stamp-message-id block-start block-end message-id))
          (save-restriction
            ;; TODO: Move this to shell-maker?
            (let ((inhibit-read-only t))
@@ -7349,10 +7493,7 @@ Wraps `acp-send-request' so that REQUEST is pushed to
 
 CLIENT, REQUEST, BUFFER, ON-SUCCESS, ON-FAILURE, and SYNC are passed
 through to `acp-send-request'."
-  ;; Migrate state for sessions created before :active-requests existed.
-  ;; Without this, map-put! fails on mid-session package updates.
-  (unless (assq :active-requests state)
-    (nconc state (list (cons :active-requests nil))))
+  (agent-shell--ensure-state-key state :active-requests)
   (let ((remove-request
          (lambda ()
            (map-put! state :active-requests
@@ -7454,6 +7595,12 @@ Must provide ON-INITIATED (lambda ())."
                    ;; `agentCapabilities'.  See `agent-shell-steering-supported-p'.
                    (map-put! agent-shell--state :supports-steering
                              (eq (map-nested-elt acp-response '(_meta steering supported)) t))
+                   ;; A fork point rides the AIR extension's `_meta', so an
+                   ;; agent that never advertised the extension ignores it and
+                   ;; forks the latest turn instead.  See
+                   ;; `agent-shell--air-extension-supported-p'.
+                   (map-put! agent-shell--state :supports-fork-point
+                             (agent-shell--air-extension-supported-p acp-response))
                    (when-let* ((agent-capabilities (map-elt acp-response 'agentCapabilities)))
                      (map-put! agent-shell--state :supports-session-load
                                (eq (map-elt agent-capabilities 'loadSession) t))
@@ -7906,6 +8053,7 @@ Must provide ON-SESSION-INIT (lambda ())."
       (if (map-elt (agent-shell--state) :supports-session-fork)
           (agent-shell--initiate-session-fork-by-id
            :session-id fork-session-id
+           :message-id (map-elt (agent-shell--state) :fork-message-id)
            :shell-buffer shell-buffer
            :on-session-init on-session-init)
         ;; Forking not supported. Start a new session.
@@ -8601,8 +8749,24 @@ SESSION-TITLE is an optional display title for the resumed session."
                     :shell-buffer shell-buffer
                     :on-session-init on-session-init)))))
 
-(cl-defun agent-shell--initiate-session-fork-by-id (&key session-id shell-buffer on-session-init)
-  "Fork session SESSION-ID with SHELL-BUFFER and ON-SESSION-INIT."
+(defun agent-shell--fork-message-meta (message-id)
+  "Return an AIR `_meta' fragment forking up to MESSAGE-ID.
+
+This is claude-agent-acp's fork-point extension: without it, `session/fork'
+always forks from the session's latest turn.  Ignored by agents that
+don't implement it, which fork from the latest turn as usual.  The wire
+shape is `_meta.jetbrains.air.fork = {version: 1, messageId: MESSAGE-ID}'."
+  (list (cons 'jetbrains
+              (list (cons 'air
+                          (list (cons 'fork
+                                      (list (cons 'version 1)
+                                            (cons 'messageId message-id)))))))))
+
+(cl-defun agent-shell--initiate-session-fork-by-id (&key session-id message-id shell-buffer
+                                                         on-session-init)
+  "Fork session SESSION-ID with SHELL-BUFFER and ON-SESSION-INIT.
+MESSAGE-ID, when given, forks up to that message rather than the
+session's latest turn; see `agent-shell--fork-message-meta'."
   (agent-shell--update-bootstrapping-fragment
    :state (agent-shell--state)
    :block-id "starting"
@@ -8615,7 +8779,8 @@ SESSION-TITLE is an optional display title for the resumed session."
              :session-id session-id
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
-             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+             :meta (append (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
+                           (when message-id (agent-shell--fork-message-meta message-id))))
    :buffer (current-buffer)
    :on-success (lambda (acp-fork-response)
                  (let ((new-session-id (map-elt acp-fork-response 'sessionId)))

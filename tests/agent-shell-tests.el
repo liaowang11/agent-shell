@@ -7092,6 +7092,52 @@ itself; otherwise the next section header glues onto the restored prompt:
         (should session-init-called)
         (should-not (map-elt agent-shell--state :pending-restore))))))
 
+(ert-deftest agent-shell-stamp-message-id-covers-the-whole-block-test ()
+  "Every char of a streamed block carries its message id.
+
+The stamp runs per chunk over a block that grows per chunk, so it only
+writes the part not stamped yet (see `agent-shell--stamp-message-id').
+`agent-shell--message-id-at-point' has to answer from anywhere in the
+message regardless, including text written before the optimisation's
+starting point and a label rewritten after it."
+  (with-temp-buffer
+    (insert "padding")
+    (let ((block-start (point)))
+      (insert "first chunk")
+      (agent-shell--stamp-message-id block-start (point) "m1")
+      ;; A second chunk lands at the end, as streaming does.
+      (insert " second chunk")
+      (agent-shell--stamp-message-id block-start (point) "m1")
+      ;; A third, to prove the walk back keeps finding the boundary.
+      (insert " third chunk")
+      (agent-shell--stamp-message-id block-start (point) "m1")
+      (let ((block-end (point)))
+        (should (equal (buffer-substring-no-properties block-start block-end)
+                       "first chunk second chunk third chunk"))
+        (dolist (pos (number-sequence block-start (1- block-end)))
+          (should (equal (get-text-property pos 'agent-shell-message-id) "m1")))
+        ;; Text before the block is left alone.
+        (should-not (get-text-property (point-min) 'agent-shell-message-id))))))
+
+(ert-deftest agent-shell-stamp-message-id-restamps-a-rewritten-head-test ()
+  "A block whose head was rewritten is stamped from the start again.
+
+Only a body grows at the end; a label rewrite (a subagent tag arriving,
+say) replaces text at the head, leaving it unstamped while the tail still
+carries the id.  Walking back from the end would stop at that tail and
+miss the new head, so an unstamped first char forces a full stamp."
+  (with-temp-buffer
+    (let ((block-start (point)))
+      (insert "body")
+      (agent-shell--stamp-message-id block-start (point) "m1")
+      ;; Rewrite the head, as a label update does.
+      (goto-char block-start)
+      (insert "label ")
+      (let ((block-end (point-max)))
+        (agent-shell--stamp-message-id block-start block-end "m1")
+        (dolist (pos (number-sequence block-start (1- block-end)))
+          (should (equal (get-text-property pos 'agent-shell-message-id) "m1")))))))
+
 (ert-deftest agent-shell-prompt-begin-position-terminates-on-empty-match-test ()
   "The walk back to a real prompt always makes progress.
 
@@ -7178,6 +7224,73 @@ render the adjacent real interaction, and move the shell point to its prompt."
                 (should (string-match-p "show me the config" (buffer-string))))
               (with-current-buffer shell-buffer
                 (should (equal (point) second-prompt))))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-next-page-preserves-message-id-stamp-test ()
+  "Paging away and back keeps a response's `agent-shell-message-id' readable.
+
+`shell-maker--extract-history' is called with `:trimmed nil' from the
+real paging path, which extracts via `buffer-substring' rather than
+`buffer-substring-no-properties', and `agent-shell-viewport--initialize'
+only `insert's the result -- so a stamp set on the response text in the
+shell buffer survives into the viewport's copy without needing to be
+reapplied.  Point lands past the stamped run, on the blank-line padding
+`agent-shell-ui.el' adds after a block, so this also exercises
+`agent-shell--message-id-at-point''s padding fallback end to end."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (second-prompt nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (comint-mode)
+            (setq-local major-mode 'agent-shell-mode)
+            (setq-local shell-maker--config
+                        (make-shell-maker-config
+                         :name "agent"
+                         :prompt "Claude> "
+                         :prompt-regexp "Claude> "))
+            (setq-local comint-use-prompt-regexp t)
+            (setq-local comint-prompt-regexp "Claude> ")
+            (insert (propertize "Claude> "
+                                'font-lock-face 'comint-highlight-prompt)
+                    "first question"
+                    (propertize "<shell-maker-end-of-prompt>"
+                                'shell-maker--marker t)
+                    "\n")
+            (let ((response-start (point)))
+              (insert "first answer")
+              (put-text-property response-start (point)
+                                 'agent-shell-message-id "msg-1"))
+            ;; Unstamped padding, as `agent-shell-ui.el' inserts after a block.
+            (insert "\n\n")
+            (setq second-prompt (point))
+            (insert (propertize "Claude> "
+                                'font-lock-face 'comint-highlight-prompt)
+                    "second question"
+                    (propertize "<shell-maker-end-of-prompt>"
+                                'shell-maker--marker t)
+                    "\n"
+                    "second answer\n")
+            (goto-char second-prompt))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport--initialize
+               :prompt "second question<shell-maker-end-of-prompt>\n"
+               :response "second answer\n")
+              (agent-shell-viewport-next-page :backwards t)
+              (goto-char (point-max))
+              (should (equal (agent-shell--message-id-at-point) "msg-1")))))
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
 
@@ -9077,6 +9190,55 @@ refused, leaving the text recoverable from `minibuffer-history' alone."
                      (user-error (error-message-string error)))
                    "This agent does not support steering"))))
 
+(ert-deftest agent-shell-prompt-steer-confirms-a-blocked-shell-before-reading-test ()
+  "The blocked-shell question is asked before the prompt is composed.
+
+Same reason as the capability guard above: refusing after the prompt is
+typed leaves the text recoverable from `minibuffer-history' alone."
+  (let ((asked-before-read nil)
+        (read-called nil))
+    (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-steering-supported-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-status) (lambda (&rest _) 'blocked))
+              ((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (setq asked-before-read (not read-called)) nil))
+              ((symbol-function 'agent-shell--prompt-queue-read)
+               (lambda (&rest _) (setq read-called t) "prompt")))
+      (should (equal (condition-case error
+                         (agent-shell-prompt-steer)
+                       (user-error (error-message-string error)))
+                     "Steering cancelled"))
+      (should asked-before-read)
+      (should-not read-called))))
+
+(ert-deftest agent-shell-prompt-steer-asks-a-blocked-shell-only-once-test ()
+  "Confirming before the read must not be re-asked by the send.
+
+The command answers the question, so `agent-shell--prompt-steer' is told
+it is already confirmed; without that the user is asked twice for one
+steer."
+  (let ((asked 0))
+    (cl-letf (((symbol-function 'agent-shell--shell-buffer)
+               (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-steering-supported-p)
+               (lambda (&rest _) t))
+              ((symbol-function 'agent-shell-status) (lambda (&rest _) 'blocked))
+              ((symbol-function 'agent-shell--prompt-queue-migrate) #'ignore)
+              ((symbol-function 'agent-shell--prompt-queue-paused-p) #'ignore)
+              ((symbol-function 'agent-shell--state) (lambda (&rest _) nil))
+              ((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (setq asked (1+ asked)) t))
+              ((symbol-function 'agent-shell--prompt-queue-read)
+               (lambda (&rest _) "just the filenames"))
+              ((symbol-function 'agent-shell-experimental--send-steering)
+               (lambda (&rest _) 'steered)))
+      (should (eq (agent-shell-prompt-steer) 'steered))
+      (should (equal asked 1)))))
+
 (cl-defun agent-shell-tests--steer-outcome (&key outcome busy request-failed)
   "Steer a prompt, answer with OUTCOME, and return what became of it.
 
@@ -9528,6 +9690,27 @@ REQUEST-FAILED answers the request with an error instead."
       (agent-shell-prompt-queue-resume)
       (should-not (map-elt agent-shell--state :prompt-queue-paused)))))
 
+(ert-deftest agent-shell--prompt-queue-remove-at-reports-each-outcome-test ()
+  "Removing a pending prompt tells the three outcomes apart.
+
+Shares its splice with `agent-shell--prompt-queue-take-at' and differs
+only in announcing what happened, so a drained queue and one that shifted
+under us must still read differently: the first says the prompt is gone,
+the second that it was left alone."
+  (with-temp-buffer
+    (setq-local agent-shell--state (list (cons :pending-prompts (list "a" "b" "c"))))
+    (should (equal (agent-shell--prompt-queue-remove-at :index 1 :expected "b")
+                   "Prompt sent (2 pending)"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "c")))
+    ;; In range, but not the prompt we were told to remove.
+    (should (equal (agent-shell--prompt-queue-remove-at :index 1 :expected "moved")
+                   "Prompt queue changed; prompt left pending"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "c")))
+    ;; Past the end: the queue drained while we held the index.
+    (should (equal (agent-shell--prompt-queue-remove-at :index 9 :expected "a")
+                   "Prompt no longer pending"))
+    (should (equal (map-elt agent-shell--state :pending-prompts) '("a" "c")))))
+
 (ert-deftest agent-shell--prompt-queue-take-and-insert-test ()
   "Test claiming a pending prompt and putting it back at its position."
   (with-temp-buffer
@@ -9618,6 +9801,83 @@ DECLINED answers the steer with a decline rather than delivery."
                  (lambda (&rest _) (nth 1 case))))
         (should (equal (agent-shell-viewport--compose-disposition-label nil)
                        (nth 2 case)))))))
+
+(cl-defun agent-shell-tests--stream-message-chunks (&key message-id (chunks '("I" " found" " it")))
+  "Stream CHUNKS as agent message chunks into a real shell buffer.
+
+MESSAGE-ID is the ACP `messageId' carried by every chunk, or nil for an
+agent that omits it.  Renders through `agent-shell--update-fragment' for
+real, over output comint has already marked read-only.
+
+Returns the number of transcript headers written and the `:last-entry-type'
+left behind."
+  (let* ((buffer (generate-new-buffer " *agent-shell-chunk-stream-test*"))
+         (process (start-process "fake-agent" buffer "cat"))
+         (file (make-temp-file "agent-shell-transcript" nil ".md")))
+    (set-process-query-on-exit-flag process nil)
+    ;; The default sentinel reports the exit into read-only comint output,
+    ;; and a failing sentinel aborts the whole ERT batch.
+    (set-process-sentinel process #'ignore)
+    (unwind-protect
+        (with-current-buffer buffer
+          (comint-mode)
+          (setq-local major-mode 'agent-shell-mode)
+          (setq-local comint-prompt-regexp "^Claude> ")
+          (setq-local agent-shell--transcript-file file)
+          (setq-local agent-shell--state
+                      (list (cons :buffer (current-buffer))
+                            (cons :last-entry-type nil)
+                            (cons :last-agent-message-ids nil)
+                            (cons :chunked-group-count 0)
+                            (cons :activity-group-count 0)
+                            (cons :request-count 0)
+                            (cons :active-requests t)
+                            (cons :pending-restore nil)
+                            (cons :last-activity-time nil)
+                            (cons :agent-config '((:shell-prompt . "Claude> ")))))
+          (cl-letf (((symbol-function 'shell-maker--process) (lambda () process))
+                    ((symbol-function 'shell-maker-busy) (lambda (&rest _) t)))
+            ;; A turn in progress: the prompt comint already marked
+            ;; read-only, closed, with the answer about to stream under it.
+            (shell-maker--output-filter process "Claude> ")
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (insert "hi<shell-maker-end-of-prompt>\n"))
+            (dolist (chunk chunks)
+              (agent-shell--on-notification
+               :state agent-shell--state
+               :acp-notification
+               `((method . "session/update")
+                 (params (update (sessionUpdate . "agent_message_chunk")
+                                 ,@(when message-id `((messageId . ,message-id)))
+                                 (content (type . "text") (text . ,chunk))))))))
+          (list (cons :headers (with-temp-buffer
+                                 (insert-file-contents file)
+                                 (count-matches "^## Agent" (point-min) (point-max))))
+                (cons :last-entry-type (map-elt agent-shell--state :last-entry-type))))
+      (when (process-live-p process)
+        (delete-process process))
+      (kill-buffer buffer)
+      (delete-file file))))
+
+(ert-deftest agent-shell-message-chunks-with-a-message-id-stay-one-message-test ()
+  "Consecutive chunks of one agent message form one message, not one each.
+
+Streams through the real renderer rather than a stub, because the way
+this breaks is in the renderer: rendered output carries `read-only t', so
+stamping the ACP `messageId' on it without `inhibit-read-only' signals
+`text-read-only'.  That aborts the whole notification before
+`:last-agent-message-ids' and `:last-entry-type' advance, and every
+following chunk then reads as a fresh message -- a \"## Agent\" header per
+token in the transcript, one rendered message per token in the shell."
+  (let ((streamed (agent-shell-tests--stream-message-chunks :message-id "msg-1")))
+    (should (equal (map-elt streamed :headers) 1))
+    (should (equal (map-elt streamed :last-entry-type) "agent_message_chunk")))
+  ;; An agent that omits `messageId' never took the failing path, and must
+  ;; keep coalescing on the `:last-entry-type' heuristic.
+  (let ((streamed (agent-shell-tests--stream-message-chunks :message-id nil)))
+    (should (equal (map-elt streamed :headers) 1))
+    (should (equal (map-elt streamed :last-entry-type) "agent_message_chunk"))))
 
 (ert-deftest agent-shell-next-item-walks-into-and-out-of-a-table ()
   "Next item enters a table at its first cell, walks it, then moves on."

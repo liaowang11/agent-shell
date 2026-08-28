@@ -189,7 +189,7 @@ sessions drive the same STATE."
   (let ((state (list (cons :session (list (cons :id "root")))
                      (cons :native-subagents nil)
                      (cons :last-entry-type nil)
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :last-agent-message-block-ids nil)
                      (cons :chunked-group-count 0)
                      (cons :activity-group-sessions
@@ -225,7 +225,7 @@ sessions drive the same STATE."
   "A message interrupted by another session's message is not split in two.
 
 A subagent's chunks render into the root shell, so both sessions share
-one `:last-agent-message-id'.  Given child, root, child, the second child
+one entry per session.  Given child, root, child, the second child
 chunk compares its id against the root's and looks like a new message.
 `agent-shell-ui-update-fragment' only reuses an existing block when
 CREATE-NEW is nil, so the message gets a second block instead of
