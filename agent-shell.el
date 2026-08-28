@@ -1224,6 +1224,8 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :active-requests nil)
         (cons :prompt-queue-paused nil)
         (cons :pending-prompts nil)
+        (cons :native-subagents nil)
+        (cons :async-tasks nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
                            (cons :output-tokens 0)
@@ -2651,7 +2653,9 @@ may also arrive out of turn (e.g. background tasks streaming after
        (member (map-nested-elt acp-notification '(params update sessionUpdate))
                '("tool_call" "tool_call_update"
                  "agent_thought_chunk" "agent_message_chunk"
-                 "user_message_chunk" "plan"))))
+                 "user_message_chunk" "plan"
+                 "subagent_spawned" "subagent_state_update"
+                 "async_task_spawned" "async_task_progress" "async_task_state_update"))))
 
 (defvar agent-shell--out-of-turn-idle-seconds 2.0
   "Quiet period, in seconds, before the out-of-turn activity indicator clears.
@@ -3480,6 +3484,93 @@ around this call to reflect whether the update arrived out of turn."
             :body (agent-shell--format-plan (map-nested-elt acp-notification '(params update entries)))
             :expanded t)
            (map-put! state :last-entry-type "plan"))
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "subagent_spawned")
+           (let* ((subagent-session-id (map-nested-elt acp-notification '(params update subagentSessionId)))
+                  (name (map-nested-elt acp-notification '(params update name)))
+                  (task (map-nested-elt acp-notification '(params update task))))
+             (agent-shell--save-native-subagent state subagent-session-id name task)
+             (agent-shell--update-fragment
+              :state state
+              :block-id (agent-shell--subagent-block-id subagent-session-id)
+              :label-left (format "%s %s"
+                                  (agent-shell--make-status-kind-label :status "running")
+                                  (propertize (or name "Subagent")
+                                              'font-lock-face 'agent-shell-section-heading))
+              :body (agent-shell--format-subagent-body task)
+              :expanded agent-shell-tool-use-expand-by-default))
+           (map-put! state :last-entry-type "subagent_spawned"))
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "subagent_state_update")
+           (let* ((subagent-session-id (map-nested-elt acp-notification '(params update subagentSessionId)))
+                  (subagent-state (map-nested-elt acp-notification '(params update state)))
+                  (registered (agent-shell--native-subagent state subagent-session-id)))
+             (agent-shell--update-fragment
+              :state state
+              :block-id (agent-shell--subagent-block-id subagent-session-id)
+              :label-left (format "%s %s"
+                                  (agent-shell--make-status-kind-label :status subagent-state)
+                                  (propertize (or (map-elt registered :name) "Subagent")
+                                              'font-lock-face 'agent-shell-section-heading))
+              :body (agent-shell--format-subagent-body (map-elt registered :task))))
+           (map-put! state :last-entry-type "subagent_state_update"))
+          ;; `showInTranscript' is false for tasks already represented by their
+          ;; own card (e.g. a backgrounded Bash tool call) -- rendering it here
+          ;; too would just duplicate that card.
+          ((and (equal (map-nested-elt acp-notification '(params update sessionUpdate)) "async_task_spawned")
+                (map-nested-elt acp-notification '(params update showInTranscript)))
+           (let* ((async-task-id (map-nested-elt acp-notification '(params update asyncTaskId)))
+                  (name (map-nested-elt acp-notification '(params update name)))
+                  (task-type (map-nested-elt acp-notification '(params update taskType)))
+                  (description (map-nested-elt acp-notification '(params update description))))
+             (agent-shell--save-async-task state async-task-id name task-type description)
+             (agent-shell--update-fragment
+              :state state
+              :block-id (agent-shell--async-task-block-id async-task-id)
+              :label-left (format "%s %s"
+                                  (agent-shell--make-status-kind-label :status "running")
+                                  (propertize (or name task-type "Background task")
+                                              'font-lock-face 'agent-shell-section-heading))
+              :body (agent-shell--format-async-task-body description nil nil nil)
+              :expanded agent-shell-tool-use-expand-by-default))
+           (map-put! state :last-entry-type "async_task_spawned"))
+          ((and (equal (map-nested-elt acp-notification '(params update sessionUpdate)) "async_task_progress")
+                (agent-shell--async-task state (map-nested-elt acp-notification '(params update asyncTaskId))))
+           (let* ((async-task-id (map-nested-elt acp-notification '(params update asyncTaskId)))
+                  (registered (agent-shell--async-task state async-task-id)))
+             (agent-shell--update-fragment
+              :state state
+              :block-id (agent-shell--async-task-block-id async-task-id)
+              :label-left (format "%s %s"
+                                  (agent-shell--make-status-kind-label :status "running")
+                                  (propertize (or (map-elt registered :name)
+                                                  (map-elt registered :task-type)
+                                                  "Background task")
+                                              'font-lock-face 'agent-shell-section-heading))
+              :body (agent-shell--format-async-task-body
+                     (or (map-nested-elt acp-notification '(params update description))
+                         (map-elt registered :description))
+                     (map-nested-elt acp-notification '(params update summary))
+                     (map-nested-elt acp-notification '(params update lastToolName))
+                     (map-nested-elt acp-notification '(params update usage)))))
+           (map-put! state :last-entry-type "async_task_progress"))
+          ((and (equal (map-nested-elt acp-notification '(params update sessionUpdate)) "async_task_state_update")
+                (agent-shell--async-task state (map-nested-elt acp-notification '(params update asyncTaskId))))
+           (let* ((async-task-id (map-nested-elt acp-notification '(params update asyncTaskId)))
+                  (task-state (map-nested-elt acp-notification '(params update state)))
+                  (registered (agent-shell--async-task state async-task-id)))
+             (agent-shell--update-fragment
+              :state state
+              :block-id (agent-shell--async-task-block-id async-task-id)
+              :label-left (format "%s %s"
+                                  (agent-shell--make-status-kind-label :status task-state)
+                                  (propertize (or (map-elt registered :name)
+                                                  (map-elt registered :task-type)
+                                                  "Background task")
+                                              'font-lock-face 'agent-shell-section-heading))
+              :body (agent-shell--format-async-task-body
+                     (or (map-nested-elt acp-notification '(params update summary))
+                         (map-elt registered :description))
+                     nil nil nil)))
+           (map-put! state :last-entry-type "async_task_state_update"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call_update")
            (let* ((tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
                   (old-tool-call (map-nested-elt state `(:tool-calls ,tool-call-id)))
@@ -4773,6 +4864,61 @@ a `status' key and a `content' or `step' key."
                      (map-elt entry 'step))))
      :separator " "
      :joiner "\n"))))
+
+(defun agent-shell--subagent-block-id (subagent-session-id)
+  "Return the fragment block id for SUBAGENT-SESSION-ID."
+  (format "subagent-%s" subagent-session-id))
+
+(defun agent-shell--async-task-block-id (async-task-id)
+  "Return the fragment block id for ASYNC-TASK-ID."
+  (format "async-task-%s" async-task-id))
+
+(defun agent-shell--save-native-subagent (state subagent-session-id name task)
+  "Record SUBAGENT-SESSION-ID's NAME and TASK in STATE's registry.
+Only `subagent_spawned' calls this; later `subagent_state_update'
+notifications carry no name/task of their own and look this up by
+SUBAGENT-SESSION-ID instead."
+  (map-put! state :native-subagents
+            (cons (cons subagent-session-id (list :name name :task task))
+                  (map-elt state :native-subagents))))
+
+(defun agent-shell--native-subagent (state subagent-session-id)
+  "Return the `:name'/`:task' plist recorded for SUBAGENT-SESSION-ID, or nil."
+  (map-elt (map-elt state :native-subagents) subagent-session-id))
+
+(defun agent-shell--format-subagent-body (task)
+  "Format a native subagent fragment body for TASK."
+  (or task ""))
+
+(defun agent-shell--save-async-task (state async-task-id name task-type description)
+  "Record ASYNC-TASK-ID's NAME, TASK-TYPE, and DESCRIPTION in STATE's registry.
+Only `async_task_spawned' calls this; later `async_task_progress' and
+`async_task_state_update' notifications carry no name/type of their own
+and look this up by ASYNC-TASK-ID instead."
+  (map-put! state :async-tasks
+            (cons (cons async-task-id (list :name name :task-type task-type
+                                            :description description))
+                  (map-elt state :async-tasks))))
+
+(defun agent-shell--async-task (state async-task-id)
+  "Return the plist recorded for ASYNC-TASK-ID, or nil."
+  (map-elt (map-elt state :async-tasks) async-task-id))
+
+(defun agent-shell--format-async-task-body (description summary last-tool-name usage)
+  "Format an async task fragment body from DESCRIPTION, SUMMARY,
+LAST-TOOL-NAME, and USAGE (an alist with `totalTokens', `toolUses',
+and `durationMs')."
+  (string-join
+   (delq nil
+         (list
+          (or summary description)
+          (when last-tool-name (format "Last tool: %s" last-tool-name))
+          (when usage
+            (format "%s tokens · %s tool uses"
+                    (agent-shell--format-number-compact
+                     (or (map-elt usage 'totalTokens) 0))
+                    (or (map-elt usage 'toolUses) 0)))))
+   "\n"))
 
 (cl-defun agent-shell--make-button (&key text help kind action keymap properties (boxed t))
   "Make button with TEXT, HELP text, KIND, KEYMAP, ACTION, and PROPERTIES.
@@ -6774,6 +6920,21 @@ the original EVENT as :idle-event."
 
 ;;; Initialization
 
+(defun agent-shell--air-capabilities-meta (&rest capabilities)
+  "Build the AIR `_meta' payload for the initialize request's `clientCapabilities'.
+
+CAPABILITIES is a list of capability name strings (e.g. \"asyncTasks\").
+This is claude-agent-acp's JetBrains AIR extension format
+(`_meta.jetbrains.air.capabilities'), for capabilities that have no
+canonical ACP `clientCapabilities' field yet.  Nest the result inside
+`clientCapabilities': that is where agents read it (claude-agent-acp,
+codex-acp), while a request-level `_meta' goes unnoticed.  Agents that
+don't implement the extension ignore the unrecognized `_meta' key."
+  (list (cons 'jetbrains
+              (list (cons 'air
+                          (list (cons 'version 1)
+                                (cons 'capabilities (vconcat capabilities))))))))
+
 (cl-defun agent-shell--initialize-client ()
   "Initialize ACP client."
   (agent-shell--update-bootstrapping-fragment
@@ -6879,7 +7040,16 @@ Must provide ON-INITIATED (lambda ())."
                             (title . "Emacs Agent Shell")
                             (version . ,agent-shell--version))
              :read-text-file-capability agent-shell-text-file-capabilities
-             :write-text-file-capability agent-shell-text-file-capabilities)
+             :write-text-file-capability agent-shell-text-file-capabilities
+             ;; `subagents' is the draft ACP field (agent-client-protocol#1992);
+             ;; `asyncTasks' has no canonical field yet, so it only exists as
+             ;; claude-agent-acp's AIR `_meta' extension.  The AIR payload rides
+             ;; inside `clientCapabilities' because that is where agents read it
+             ;; (claude-agent-acp, codex-acp): a request-level `_meta' goes
+             ;; unnoticed and every gated feature silently falls back.  Unknown
+             ;; capabilities and `_meta' keys are ignored per the ACP spec.
+             :client-capabilities `((subagents . ())
+                                    (_meta . ,(agent-shell--air-capabilities-meta "asyncTasks"))))
    :on-success (lambda (acp-response)
                  (with-current-buffer shell-buffer
                    (let ((acp-session-capabilities (or (map-elt acp-response 'sessionCapabilities)
