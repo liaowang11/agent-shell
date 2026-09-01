@@ -20,7 +20,9 @@ jobs:
 
       - name: Clone dependencies
         run: |
-          git clone --depth 1 https://github.com/xenodium/acp.el ../acp
+          # The acp.el fork's initialize request accepts extra client
+          # capabilities and _meta; agent-shell's AIR features test against it.
+          git clone --depth 1 https://github.com/liaowang11/acp.el ../acp
           git clone --depth 1 https://github.com/xenodium/shell-maker ../shell-maker
 
       - name: Run tests
