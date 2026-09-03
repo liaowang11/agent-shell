@@ -5731,6 +5731,135 @@ nothing to page forward to."
               (should-error (agent-shell-viewport-previous-page) :type 'user-error))))
       (kill-buffer viewport-buffer))))
 
+(defun agent-shell-viewport-tests--with-pages (current total body)
+  "Run BODY in a view-mode viewport starting at page CURRENT of TOTAL.
+BODY is called with no arguments.  History entries are named
+\"page one\", \"page two\", ...  Navigating updates the stubbed position
+the way real navigation does, so BODY can page more than once.  Returns
+an alist of :index (the page `agent-shell--prompt-begin-position-at-index'
+was asked for last), :initialized (the keyword plist passed to
+`agent-shell-viewport--initialize'), :cursor (the resulting
+`agent-shell-viewport--page-cursor') and :entered-compose (whether the
+compose page was opened)."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (requested-index nil)
+        (initialized nil)
+        (entered-compose nil)
+        (pages '(("page one" . "one")
+                 ("page two" . "two")
+                 ("page three" . "three")
+                 ("page four" . "four"))))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) `((:current . ,current) (:total . ,total))))
+                      ((symbol-function 'shell-maker-prompt-regexp)
+                       (lambda (_config) "prompt"))
+                      ((symbol-function 'shell-maker--extract-history)
+                       (lambda (&rest _) pages))
+                      ((symbol-function 'agent-shell--prompt-begin-position-at-index)
+                       (lambda (index)
+                         (setq requested-index index)
+                         ;; Landing on a page is what moves the position.
+                         (setq current index)
+                         1))
+                      ((symbol-function 'agent-shell-viewport-edit-mode)
+                       (lambda () (setq entered-compose t)))
+                      ((symbol-function 'agent-shell-viewport--initialize)
+                       (lambda (&rest args)
+                         (setq initialized args)))
+                      ((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda () nil)))
+              (funcall body)
+              `((:index . ,requested-index)
+                (:initialized . ,initialized)
+                (:cursor . ,agent-shell-viewport--page-cursor)
+                (:entered-compose . ,entered-compose)))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport-next-page-jumps-n-pages-test ()
+  "Test `agent-shell-viewport-next-page' jumps N pages.
+
+On page 1 of 4, N=2 shows page 3.  A numeric prefix argument is the
+same N."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 1 4 (lambda () (agent-shell-viewport-next-page :n 2)))))
+    (should (equal (map-elt result :index) 3))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page three" :response "three")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 3)))
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 1 4 (lambda ()
+                        (let ((current-prefix-arg 2))
+                          (call-interactively #'agent-shell-viewport-next-page))))))
+    (should (equal (map-elt result :index) 3))
+    (should (equal (map-elt (map-elt result :cursor) :index) 3))))
+
+(ert-deftest agent-shell-viewport-previous-page-jumps-n-pages-test ()
+  "Test `agent-shell-viewport-previous-page' jumps N pages.
+
+On page 4 of 4, N=2 shows page 2.  A numeric prefix argument is the
+same N."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 4 4 (lambda () (agent-shell-viewport-previous-page 2)))))
+    (should (equal (map-elt result :index) 2))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page two" :response "two")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 2)))
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 4 4 (lambda ()
+                        (let ((current-prefix-arg 2))
+                          (call-interactively #'agent-shell-viewport-previous-page))))))
+    (should (equal (map-elt result :index) 2))))
+
+(ert-deftest agent-shell-viewport-next-page-n-past-last-enters-compose-test ()
+  "Test jumping forward past the last history page enters compose.
+
+On page 3 of 4, N=2 has no fifth history page, so it enters compose the
+same way a single step from page 4 does.  The jump passes through the
+newest page on its way, so that is the page compose remembers -- what
+pressing the key twice would have left behind."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 3 4 (lambda () (agent-shell-viewport-next-page :n 2)))))
+    (should (map-elt result :entered-compose))
+    (should (equal (map-elt (map-elt result :cursor) :index) 4))))
+
+(ert-deftest agent-shell-viewport-next-page-n-past-last-remembers-newest-page-test ()
+  "Test a long jump into compose still remembers the newest page.
+
+On page 2 of 4, N=3 overshoots by two pages.  Pressing the key three
+times would show pages 3 and 4 and then enter compose, leaving page 4
+recorded, so the jump must record page 4 too rather than the page it
+started from."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 2 4 (lambda () (agent-shell-viewport-next-page :n 3)))))
+    (should (map-elt result :entered-compose))
+    (should (equal (map-elt (map-elt result :cursor) :index) 4))))
+
+(ert-deftest agent-shell-viewport-previous-page-n-clamps-to-first-page-test ()
+  "Test jumping backward past the first page lands on page 1.
+
+On page 3 of 4, N=5 has no page before 1, so it shows page 1 rather
+than erroring.  Already being on page 1 still errors (see
+`agent-shell-viewport-previous-page-first-page-error-test')."
+  (let ((result (agent-shell-viewport-tests--with-pages
+                 3 4 (lambda () (agent-shell-viewport-previous-page 5)))))
+    (should (equal (map-elt result :index) 1))
+    (should (equal (map-elt result :initialized)
+                   '(:prompt "page one" :response "one")))
+    (should (equal (map-elt (map-elt result :cursor) :index) 1))))
+
 (defun agent-shell-viewport-tests--insert-interaction (prompt response)
   "Insert a real PROMPT/RESPONSE interaction at point, comint style.
 Return the buffer position where the prompt began."
