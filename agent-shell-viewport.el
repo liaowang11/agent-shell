@@ -1226,77 +1226,94 @@ can return to it."
   (insert "continue")
   (agent-shell-viewport-compose-send))
 
-(defun agent-shell-viewport-previous-page ()
-  "Go back one page.
+(defun agent-shell-viewport-previous-page (&optional n)
+  "Go back N pages (default 1).
 
-From a history page, shows the preceding interaction.  From the compose
+From a history page, shows the Nth preceding interaction.  From the compose
 page, returns to the page last read (or the newest page, when none was
-recorded), snapshotting the draft first."
+recorded), snapshotting the draft first.  A prefix argument supplies N.
+
+On page 4 of 4, N=2 shows page 2.  On page 3 of 4, N=5 shows page 1."
   (declare (modes agent-shell-viewport-view-mode
                   agent-shell-viewport-edit-mode))
-  (interactive)
+  (interactive "p")
   (agent-shell-viewport--ensure-buffer)
   (if (derived-mode-p 'agent-shell-viewport-edit-mode)
       (agent-shell-viewport--leave-compose-page)
-    (agent-shell-viewport-next-page :backwards t :start-at-top t)))
+    (agent-shell-viewport-next-page :backwards t :start-at-top t :n n)))
 
-(cl-defun agent-shell-viewport-next-page (&key backwards start-at-top)
+(cl-defun agent-shell-viewport-next-page (&key backwards start-at-top n)
   "Show next interaction (request / response).
 
 If BACKWARDS is non-nil, go to previous interaction.
 If START-AT-TOP is non-nil, position at point-min regardless of direction.
+N (default 1) is how many pages to jump; a prefix argument supplies it.
 
 Paging forward past the newest interaction enters the compose page.
-Called from the compose page itself, there is no next page to show."
+Paging backward past the first page lands on the first page, or signals
+a user-error when already there.
+Called from the compose page itself, there is no next page to show.
+
+On page 1 of 4, N=2 shows page 3.  On page 3 of 4, N=2 enters compose."
   (declare (modes agent-shell-viewport-view-mode
                   agent-shell-viewport-edit-mode))
-  (interactive)
+  (interactive (list :n (prefix-numeric-value current-prefix-arg)))
   (agent-shell-viewport--ensure-buffer)
   (when (derived-mode-p 'agent-shell-viewport-edit-mode)
     (user-error "No next page"))
-  (let* ((shell-buffer (agent-shell-viewport--shell-buffer))
-         (pos (agent-shell-viewport--position :force-refresh t)))
+  (let ((shell-buffer (agent-shell-viewport--shell-buffer))
+        (pos (agent-shell-viewport--position :force-refresh t)))
     (unless pos
       (user-error "No history"))
-    (cond
-     ((and (not backwards) (= (map-elt pos :current) (map-elt pos :total)))
-      (agent-shell-viewport--enter-compose-page))
-     ((and backwards (= (map-elt pos :current) 1))
-      (user-error "First page"))
-     (t
-      (when-let* ((next (with-current-buffer shell-buffer
-                          ;; Index-based, rather than a relative
-                          ;; comint-previous-prompt/next-prompt step, so a
-                          ;; tool result that echoes the prompt string
-                          ;; inside a response is never mistaken for a real
-                          ;; prompt (comint-prompt-regexp is unanchored).
-                          ;; `target' is already known in-range by the
-                          ;; surrounding cond, so no boundary error remains
-                          ;; to raise here.
-                          (let* ((target (+ (map-elt pos :current)
-                                            (if backwards -1 1)))
-                                 (entry (seq-elt
-                                         (shell-maker--extract-history
-                                          (shell-maker-prompt-regexp
-                                           shell-maker--config)
-                                          :trimmed nil)
-                                         (1- target)))
-                                 (prompt-position
-                                  (agent-shell--prompt-begin-position-at-index
-                                   target)))
-                            (unless prompt-position
-                              (error "Page %d not found" target))
-                            (goto-char prompt-position)
-                            entry))))
-        (agent-shell-viewport--initialize
-         :prompt (car next) :response (cdr next))
-        (goto-char (if start-at-top
-                       (point-min)
-                     (if backwards (point-max) (point-min))))
-        (setq agent-shell-viewport--page-cursor
-              `((:index . ,(+ (map-elt pos :current) (if backwards -1 1)))
-                (:point . ,(point))))
-        next)))))
+    (let* ((n (max 1 (or n 1)))
+           (current (map-elt pos :current))
+           (total (map-elt pos :total))
+           (target (+ current (if backwards (- n) n))))
+      (cond
+       ((and (not backwards) (> target total))
+        ;; A jump reaching past the newest interaction still travels
+        ;; through it, so land there before opening compose.  That is the
+        ;; page compose remembers, and leaving it returns to where paging
+        ;; one page at a time would have left off.
+        (unless (= current total)
+          (agent-shell-viewport-next-page :start-at-top start-at-top
+                                          :n (- total current)))
+        (agent-shell-viewport--enter-compose-page))
+       ((and backwards (= current 1))
+        (user-error "First page"))
+       (t
+        (when-let* ((target (max 1 target))
+                    (next (with-current-buffer shell-buffer
+                            ;; Index-based, rather than a relative
+                            ;; comint-previous-prompt/next-prompt step, so a
+                            ;; tool result that echoes the prompt string
+                            ;; inside a response is never mistaken for a real
+                            ;; prompt (comint-prompt-regexp is unanchored).
+                            ;; `target' is already known in-range by the
+                            ;; surrounding cond, so no boundary error remains
+                            ;; to raise here.
+                            (let ((entry (seq-elt
+                                          (shell-maker--extract-history
+                                           (shell-maker-prompt-regexp
+                                            shell-maker--config)
+                                           :trimmed nil)
+                                          (1- target)))
+                                  (prompt-position
+                                   (agent-shell--prompt-begin-position-at-index
+                                    target)))
+                              (unless prompt-position
+                                (error "Page %d not found" target))
+                              (goto-char prompt-position)
+                              entry))))
+          (agent-shell-viewport--initialize
+           :prompt (car next) :response (cdr next))
+          (goto-char (if start-at-top
+                         (point-min)
+                       (if backwards (point-max) (point-min))))
+          (setq agent-shell-viewport--page-cursor
+                `((:index . ,target)
+                  (:point . ,(point))))
+          next))))))
 
 (defun agent-shell-viewport-set-session-model ()
   "Set session model."
