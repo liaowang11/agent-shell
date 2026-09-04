@@ -108,6 +108,20 @@ For example:
       (when (zerop (apply #'process-file "git" nil '(t nil) nil args))
         (string-trim (buffer-string))))))
 
+(defun agent-shell-worktree--git-path (&rest args)
+  "Return the directory git names when run with ARGS, or nil on failure.
+
+git runs on the host `default-directory' points at and prints a path in
+that host's own terms, which isn't a file name this machine can open, so
+the host is carried over to name a directory on a remote repository.
+
+For example, with `default-directory' at \"/ssh:host:/repo/\":
+
+  (agent-shell-worktree--git-path \"rev-parse\" \"--show-toplevel\")
+  => \"/ssh:host:/repo\""
+  (when-let* ((path (apply #'agent-shell-worktree--git args)))
+    (concat (file-remote-p default-directory) path)))
+
 (defun agent-shell-worktree--main-worktree-root ()
   "Return the main worktree root, or nil outside a Git repository.
 
@@ -124,8 +138,9 @@ When the parent repository is bare, or git is too old to support
                               "\0" t)))
     (if (or (not fields)
             (equal (seq-elt fields 1) "bare"))
-        (agent-shell-worktree--git "rev-parse" "--show-toplevel")
-      (string-remove-prefix "worktree " (seq-first fields)))))
+        (agent-shell-worktree--git-path "rev-parse" "--show-toplevel")
+      (concat (file-remote-p default-directory)
+              (string-remove-prefix "worktree " (seq-first fields))))))
 
 ;;;###autoload
 (defun agent-shell-new-worktree-shell ()
@@ -134,7 +149,8 @@ When the parent repository is bare, or git is too old to support
 The worktree is created under <main-worktree>/.agent-shell/worktrees/,
 using a randomly generated name (e.g., \"adoring-hawking\").
 
-The user is prompted to confirm or edit the worktree path before creation."
+The user is prompted to confirm or edit the worktree path before creation.
+The path must stay on the repository's host, which is where git runs."
   (interactive)
   (let* ((root (or (agent-shell-worktree--main-worktree-root)
                    (user-error "Not in a git repository")))
@@ -145,13 +161,20 @@ The user is prompted to confirm or edit the worktree path before creation."
          (worktree-path (expand-file-name (read-directory-name
                                            "Worktree directory: "
                                            default-path))))
+    ;; git creates the worktree on the repository's host whatever host the
+    ;; path names, so a path edited onto another one cannot be honored.
+    (unless (equal (file-remote-p worktree-path) (file-remote-p default-directory))
+      (user-error "Worktree must be on the same host as the repository: %s"
+                  worktree-path))
     (when (file-exists-p worktree-path)
       (user-error "Directory already exists: %s" worktree-path))
     (make-directory (file-name-directory worktree-path) t)
     ;; Create the worktree
+    ;; git runs on the host holding the repository, where the name of that
+    ;; host is not part of a path it can resolve.
     (let ((output (shell-command-to-string
                    (format "git worktree add %s 2>&1"
-                           (shell-quote-argument worktree-path)))))
+                           (shell-quote-argument (file-local-name worktree-path))))))
       (unless (file-exists-p worktree-path)
         (user-error "Failed to create worktree: %s" output))
       (let ((default-directory worktree-path))
