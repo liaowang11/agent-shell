@@ -8,6 +8,8 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'agent-shell)
+;; For `agent-shell-tests--with-remote-default-directory'.
+(require 'agent-shell-mock-remote)
 
 (defun agent-shell-worktree-test--git (directory &rest arguments)
   "Run Git with ARGUMENTS in DIRECTORY, returning its output."
@@ -123,4 +125,90 @@
       (when (file-in-directory-p directory temporary-file-directory)
         (delete-directory directory t)))))
 
+(ert-deftest agent-shell-worktree--main-worktree-root-local-test ()
+  "Test the root of a local repository is the directory it lives in."
+  (let* ((directory (make-temp-file "agent-shell-worktree-root-local " t))
+         (repo (file-truename (expand-file-name "repo" directory))))
+    (unwind-protect
+        (progn
+          (agent-shell-worktree-test--repository repo)
+          (let ((default-directory (file-name-as-directory repo)))
+            (should (file-equal-p (agent-shell-worktree--main-worktree-root) repo))))
+      (delete-directory directory t))))
+
+(ert-deftest agent-shell-worktree--main-worktree-root-remote-test ()
+  "Test the root of a remote repository names the host it lives on.
+
+git runs on that host and prints a path in its own terms, which isn't a
+file name this machine can open."
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((directory (make-temp-file "agent-shell-worktree-root-remote " t))
+           (repo (file-truename (expand-file-name "repo" directory)))
+           (remote-repo (file-name-as-directory
+                         (concat (file-remote-p default-directory) repo))))
+      (unwind-protect
+          (progn
+            (agent-shell-worktree-test--repository repo)
+            (let* ((default-directory remote-repo)
+                   (root (agent-shell-worktree--main-worktree-root)))
+              (should (equal (file-remote-p root) (file-remote-p remote-repo)))
+              (should (file-directory-p (expand-file-name ".git" root)))))
+        (delete-directory directory t)))))
+
+(ert-deftest agent-shell-new-worktree-shell-creates-remote-worktree-test ()
+  "Test a worktree for a remote repository is created on that host.
+
+The path handed to git named the host as well as the directory, which
+git on that host can't resolve."
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((directory (make-temp-file "agent-shell-worktree-remote " t))
+           (repo (file-truename (expand-file-name "repo" directory)))
+           (remote-repo (file-name-as-directory
+                         (concat (file-remote-p default-directory) repo)))
+           (worktree-path (concat remote-repo "worktree"))
+           (started-in nil))
+      (unwind-protect
+          (progn
+            (agent-shell-worktree-test--repository repo)
+            (let ((default-directory remote-repo))
+              (cl-letf (((symbol-function 'read-directory-name)
+                         (lambda (&rest _args) worktree-path))
+                        ((symbol-function 'agent-shell)
+                         (lambda (&rest _args) (setq started-in default-directory))))
+                (agent-shell-new-worktree-shell))
+              (should (file-directory-p worktree-path))
+              (should (file-exists-p (expand-file-name ".git" worktree-path)))
+              (should (equal started-in worktree-path))))
+        (delete-directory directory t)))))
+
+(ert-deftest agent-shell-new-worktree-shell-refuses-a-path-on-another-host-test ()
+  "Test a worktree path edited onto another host is refused before git runs.
+
+git runs on the repository's host and creates the worktree there, so a
+path typed for this machine (say `~/wt/foo') made a worktree on the
+remote host while the check for it looked here and reported failure."
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((directory (make-temp-file "agent-shell-worktree-other-host " t))
+           (repo (file-truename (expand-file-name "repo" directory)))
+           (remote-repo (file-name-as-directory
+                         (concat (file-remote-p default-directory) repo)))
+           (local-path (expand-file-name "worktree" repo))
+           (started nil))
+      (unwind-protect
+          (progn
+            (agent-shell-worktree-test--repository repo)
+            (let ((default-directory remote-repo))
+              (cl-letf (((symbol-function 'read-directory-name)
+                         (lambda (&rest _args) local-path))
+                        ((symbol-function 'agent-shell)
+                         (lambda (&rest _args) (setq started t))))
+                (should (string-match-p
+                         "same host"
+                         (cadr (should-error (agent-shell-new-worktree-shell)
+                                             :type 'user-error)))))
+              (should-not started)
+              (should-not (file-exists-p local-path))))
+        (delete-directory directory t)))))
+
+(provide 'agent-shell-worktree-tests)
 ;;; agent-shell-worktree-tests.el ends here
