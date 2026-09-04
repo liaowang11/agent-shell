@@ -483,7 +483,8 @@ block is left as literal text."
            :image-cache-directory image-cache-directory
            :complete (or force complete))
           (agent-shell-markdown--replace-image-file-paths
-           :avoid-ranges avoid-ranges))
+           :avoid-ranges avoid-ranges
+           :image-cache-directory image-cache-directory))
         ;; After the markup passes, so a URL already consumed as a
         ;; `[title](url)' destination or an image's is not seen again.
         (agent-shell-markdown--linkify-urls :avoid-ranges avoid-ranges)
@@ -1460,13 +1461,18 @@ For example, the buffer \"see ![logo](logo.png)\" becomes
                  (path (agent-shell-markdown--resolve-image-url
                         url
                         :image-cache-directory image-cache-directory
-                        :allow-bare-relative t)))
+                        :allow-bare-relative t))
+                 (display-path nil))
             (cond
              ((and path
                    (image-supported-file-p path)
-                   (display-graphic-p))
+                   (display-graphic-p)
+                   ;; A file on another host is displayed from a copy here.
+                   ;; PATH stays as it is, so opening reaches the original.
+                   (setq display-path (agent-shell-markdown--localize-image-file
+                                       path image-cache-directory)))
               (let ((image (create-image
-                            path nil nil
+                            display-path nil nil
                             :max-width (or (map-elt attributes :max-width)
                                            (agent-shell-markdown--image-max-width))
                             :max-height (map-elt attributes :max-height))))
@@ -1525,8 +1531,12 @@ For example, the buffer \"see ![logo](logo.png)\" becomes
                     (put-text-property markup-start end
                                        'agent-shell-markdown-source source)))))))))))))
 
-(cl-defun agent-shell-markdown--replace-image-file-paths (&key avoid-ranges)
+(cl-defun agent-shell-markdown--replace-image-file-paths (&key avoid-ranges image-cache-directory)
   "Render bare image-path lines as displayed images.
+
+A path on another host is displayed from a copy in IMAGE-CACHE-DIRECTORY
+\(see `agent-shell-markdown--localize-image-file'), and left as text when
+there is nowhere to copy it to.
 
 A line that is solely a local path or `file://' URI ending in a
 supported image extension is treated like an `![alt](url)' image:
@@ -1558,11 +1568,16 @@ renders the image in place of that text."
                  (path-end (match-end 1))
                  (raw (buffer-substring-no-properties path-start path-end))
                  (resolved (agent-shell-markdown--resolve-image-url raw)))
-            (when (and resolved
-                       (image-supported-file-p resolved)
-                       (display-graphic-p))
+            (when-let* (((and resolved
+                              (image-supported-file-p resolved)
+                              (display-graphic-p)))
+                        ;; A file on another host is displayed from a copy
+                        ;; here.  RESOLVED stays as it is, so opening
+                        ;; reaches the original.
+                        (display-path (agent-shell-markdown--localize-image-file
+                                       resolved image-cache-directory)))
               (let* ((image (create-image
-                             resolved nil nil
+                             display-path nil nil
                              :max-width (agent-shell-markdown--image-max-width)))
                      (open-action (lambda () (interactive)
                                     (agent-shell-markdown-visit-file :file resolved)))
@@ -5109,6 +5124,45 @@ an image."
                                            :file cache-path
                                            :content-type-prefix "image/"))))
 
+(defun agent-shell-markdown--localize-image-file (file-path cache-directory)
+  "Return a copy of FILE-PATH on this machine, or FILE-PATH when local.
+
+`create-image' opens the file itself and can't read a name on another
+host, so a file living on one is copied into CACHE-DIRECTORY first.
+Returns nil when there's nowhere to copy it to or the copy fails, which
+leaves the caller rendering markup it can't display as text.
+
+Only the display needs the copy.  Callers keep FILE-PATH for opening the
+file, so RET lands on the file itself rather than on a copy that edits
+lead nowhere.
+
+The copy is named after the file's name, size and modification time, so
+an unchanged file is copied once while a changed one is copied again.
+Noticing a change made outside Emacs follows TRAMP's own attribute
+cache, which `remote-file-name-inhibit-cache' governs."
+  (cond
+   ((not (file-remote-p file-path))
+    file-path)
+   ((not (stringp cache-directory))
+    nil)
+   (t
+    (when-let* ((attributes (file-attributes file-path))
+                (cache-path (expand-file-name
+                             (format "%s.%s"
+                                     (md5 (format "%s-%s-%s"
+                                                  file-path
+                                                  (file-attribute-size attributes)
+                                                  (file-attribute-modification-time attributes)))
+                                     (or (file-name-extension file-path) "img"))
+                             cache-directory)))
+      (condition-case nil
+          (progn
+            (unless (file-exists-p cache-path)
+              (make-directory cache-directory t)
+              (copy-file file-path cache-path t))
+            cache-path)
+        (error nil))))))
+
 (cl-defun agent-shell-markdown--resolve-image-url (url &key image-cache-directory allow-bare-relative)
   "Resolve image URL to an absolute local file path, or nil.
 Handles http(s) URLs (downloaded into IMAGE-CACHE-DIRECTORY and cached via
@@ -5125,7 +5179,10 @@ scheme (`data:', `mailto:') is never taken for a path.
 
 For example, with URL \"logo.png\" and a logo.png in `default-directory',
 ALLOW-BARE-RELATIVE nil returns nil while non-nil returns its absolute
-path."
+path.
+
+In a remote `default-directory', a path without a host is taken to be on
+that host, since that is where the agent printing it runs."
   (if (string-match-p "\\`https?://" url)
       (agent-shell-markdown--fetch-remote-image url image-cache-directory)
     (when-let* ((path (cond
@@ -5145,7 +5202,17 @@ path."
                                                       ":")
                                                   url)))
                         url)))
-                (expanded (expand-file-name path))
+                (expanded (expand-file-name
+                           ;; In a shell on another host the agent prints
+                           ;; paths as that host sees them, so an absolute
+                           ;; or `~' path names a file there, not here.
+                           ;; Relative paths already get the host from
+                           ;; `default-directory'.
+                           (if-let* ((host (file-remote-p default-directory))
+                                     ((not (file-remote-p path)))
+                                     ((file-name-absolute-p path)))
+                               (concat host path)
+                             path)))
                 ((file-exists-p expanded)))
       expanded)))
 
