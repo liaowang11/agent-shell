@@ -1646,6 +1646,10 @@ For example, the buffer \"see ![logo](logo.png)\" becomes
 (cl-defun agent-shell-markdown--replace-image-file-paths (&key avoid-ranges image-cache-directory)
   "Render bare image-path lines as displayed images.
 
+A path on another host is displayed from a copy in IMAGE-CACHE-DIRECTORY
+\(see `agent-shell-markdown--local-image-path'), and left as text when
+there is nowhere to copy it to.
+
 A line that is solely a local path or `file://' URI ending in a
 supported image extension is treated like an `![alt](url)' image:
 when the path resolves to an existing image-supported file and a
@@ -1678,7 +1682,8 @@ renders the image in place of that text."
           (let* ((path-start (match-beginning 1))
                  (path-end (match-end 1))
                  (raw (buffer-substring-no-properties path-start path-end))
-                 (resolved (agent-shell-markdown--resolve-image-url raw)))
+                 (resolved (agent-shell-markdown--resolve-image-url
+                            raw :image-cache-directory image-cache-directory)))
             (when-let* (((and resolved
                               (image-supported-file-p resolved)
                               (display-graphic-p)))
@@ -5925,8 +5930,10 @@ an image."
 Returns PATH itself when it is local.  A remote PATH (say, over TRAMP)
 is copied into IMAGE-CACHE-DIRECTORY, since `create-image' only reads
 local files, and the copy's path is returned instead.  The copy is named
-from the md5 of PATH and its modification time, so a re-render reuses it
-while an edited image is copied afresh.  Returns nil for a remote PATH
+from the md5 of PATH, its modification time and its size, so a re-render
+reuses it while an edited image is copied afresh.  The size catches an
+edit within the same second, since remote modification times are often
+whole seconds.  Returns nil for a remote PATH
 when IMAGE-CACHE-DIRECTORY is nil or the copy fails.
 
 For example, \"/tmp/a.png\" returns \"/tmp/a.png\", whereas
@@ -5935,11 +5942,12 @@ For example, \"/tmp/a.png\" returns \"/tmp/a.png\", whereas
   (if (not (file-remote-p path))
       path
     (when-let* (((stringp image-cache-directory))
-                (modified (file-attribute-modification-time
-                           (ignore-errors (file-attributes path))))
+                (attributes (ignore-errors (file-attributes path)))
+                (modified (file-attribute-modification-time attributes))
                 (cache-path (expand-file-name
                              (format "%s%s"
-                                     (md5 (format "%s|%s" path modified))
+                                     (md5 (format "%s|%s|%s" path modified
+                                                  (file-attribute-size attributes)))
                                      (file-name-extension path t))
                              image-cache-directory)))
       (if (file-exists-p cache-path)
@@ -5969,7 +5977,11 @@ scheme (`data:', `mailto:') is never taken for a path.
 
 For example, with URL \"logo.png\" and a logo.png in `default-directory',
 ALLOW-BARE-RELATIVE nil returns nil while non-nil returns its absolute
-path."
+path.
+
+In a remote `default-directory', a path without a host is taken to be on
+that host, since that is where the agent printing it runs, unless it lies
+in IMAGE-CACHE-DIRECTORY, which is local."
   (if (string-match-p "\\`https?://" url)
       (agent-shell-markdown--fetch-remote-image url image-cache-directory)
     (when-let* ((path (cond
@@ -5989,7 +6001,23 @@ path."
                                                       ":")
                                                   url)))
                         url)))
-                (expanded (expand-file-name path))
+                (expanded (expand-file-name
+                           ;; In a shell on another host the agent prints
+                           ;; paths as that host sees them, so an absolute
+                           ;; or `~' path names a file there, not here.
+                           ;; Relative paths already get the host from
+                           ;; `default-directory'.  IMAGE-CACHE-DIRECTORY
+                           ;; is on this machine, whatever the shell's host.
+                           (if-let* ((host (file-remote-p default-directory))
+                                     ((not (file-remote-p path)))
+                                     ((file-name-absolute-p path))
+                                     ((not (and image-cache-directory
+                                                (string-prefix-p
+                                                 (file-name-as-directory
+                                                  (expand-file-name image-cache-directory))
+                                                 (expand-file-name path))))))
+                               (concat host path)
+                             path)))
                 ;; Rendering must never open a connection: one to an
                 ;; unreachable host signals, and one wanting a password
                 ;; blocks on a prompt mid-render.
