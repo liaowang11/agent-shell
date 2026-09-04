@@ -1458,11 +1458,14 @@ Always prompts for agent selection, even if existing shells are available."
 (cl-defun agent-shell-new-temp-shell (&key config no-display)
   "Start a new agent shell in a temporary directory.
 
+The directory is created on the host of `default-directory', so a temp
+shell started from a remote directory runs the agent on that host.
+
 The directory is trashed when the shell buffer is killed.
 When CONFIG is non-nil, use it instead of prompting for an agent.
 When NO-DISPLAY is non-nil, don't display the shell buffer."
   (interactive)
-  (let* ((location (make-temp-file "temp-" t))
+  (let* ((location (make-nearby-temp-file "temp-" t))
          (shell-buffer (agent-shell--new-shell :location location
                                                :config config
                                                :no-display no-display)))
@@ -1470,14 +1473,37 @@ When NO-DISPLAY is non-nil, don't display the shell buffer."
       (setq-local agent-shell--pending-directory-cleanup location))
     shell-buffer))
 
+(defun agent-shell--nearby-home-subdirectory (name)
+  "Return NAME under the home directory of `default-directory's host.
+
+A leading \"~\" makes a file name absolute, so `expand-file-name'
+ignores the directory it's given and always resolves the home directory
+locally.  Carrying the remote part over keeps the name on the same host.
+
+For example, with a local `default-directory':
+
+  (agent-shell--nearby-home-subdirectory \"Downloads\")
+  => \"/home/user/Downloads\"
+
+and with `default-directory' at \"/ssh:host:/tmp/\":
+
+  (agent-shell--nearby-home-subdirectory \"Downloads\")
+  => \"/ssh:host:/home/user/Downloads\""
+  (expand-file-name (concat (or (file-remote-p default-directory) "")
+                            "~/" name)))
+
 ;;;###autoload
 (cl-defun agent-shell-new-downloads-shell (&key config no-display)
   "Start a new agent shell in ~/Downloads.
 
+The home directory is resolved on the host of `default-directory', so a
+Downloads shell started from a remote directory runs the agent on that
+host.
+
 When CONFIG is non-nil, use it instead of prompting for an agent.
 When NO-DISPLAY is non-nil, don't display the shell buffer."
   (interactive)
-  (agent-shell--new-shell :location (expand-file-name "~/Downloads")
+  (agent-shell--new-shell :location (agent-shell--nearby-home-subdirectory "Downloads")
                           :config config
                           :no-display no-display))
 
@@ -4826,9 +4852,14 @@ For example, shut down ACP client."
                 (buffer-live-p viewport-buffer))
       (kill-buffer viewport-buffer))
     ;; Last, so the agent is gone before its working directory can be.
-    (when (and agent-shell--pending-directory-cleanup
-               (file-directory-p agent-shell--pending-directory-cleanup))
-      (delete-directory agent-shell--pending-directory-cleanup t t))))
+    ;;
+    ;; Errors are demoted because this runs from `kill-buffer-hook', where
+    ;; an error aborts the kill.  A shell whose directory lives on a host
+    ;; that went away would leave a buffer that can't be killed.
+    (with-demoted-errors "Failed to delete shell directory: %S"
+      (when (and agent-shell--pending-directory-cleanup
+                 (file-directory-p agent-shell--pending-directory-cleanup))
+        (delete-directory agent-shell--pending-directory-cleanup t t)))))
 
 (defun agent-shell--shutdown ()
   "Shut down shell activity."
@@ -4869,18 +4900,44 @@ For example:
   (expand-file-name (file-name-concat ".agent-shell" subdir)
                     (agent-shell-cwd)))
 
-(defun agent-shell--dot-subdir (subdir)
+(defun agent-shell--remote-data-key (directory)
+  "Return a single file name naming DIRECTORY's host and path.
+
+Flattens a remote directory into one path component, so data kept for
+two hosts, or for two projects on one host, can't land in the same
+place.
+
+For example:
+
+  (agent-shell--remote-data-key \"/ssh:me@host:/srv/proj/\")
+  => \"ssh-me@host-srv-proj\""
+  (string-trim (replace-regexp-in-string "[/:]+" "-" directory) "-+" "-+"))
+
+(cl-defun agent-shell--dot-subdir (subdir &key local)
   "Return path to SUBDIR for `agent-shell' data, creating it if needed.
 Calls `agent-shell-dot-subdir-function' to resolve the path.
 When the directory is first created under the project .agent-shell/ directory
 inside a git repo and .agent-shell/ is not yet ignored, automatically add it
 to .gitignore.  This gitignore update is a one-time operation: if the entry is
-later removed from .gitignore it will not be re-added."
+later removed from .gitignore it will not be re-added.
+
+When LOCAL is non-nil and the resolved path is on a remote host, return
+a directory on this machine instead, named after the remote project.
+Use it for data `agent-shell' keeps for itself: transcripts are appended
+once per streamed chunk and read by Emacs, so writing them next to a
+remote project would cost a round trip per chunk for data that host
+never reads.  Set `agent-shell-transcript-file-path-function' to choose
+the location yourself."
   (unless (functionp agent-shell-dot-subdir-function)
     (error "Set agent-shell-dot-subdir-function to a function"))
   (let ((dir (funcall agent-shell-dot-subdir-function subdir)))
     (unless (and (stringp dir) (not (string-empty-p (string-trim dir))))
       (error "Failed to resolve agent-shell data directory (subdir: %s).  Resulting directory is not a non-empty string (dir: %s)" subdir dir))
+    (when (and local (file-remote-p dir))
+      (setq dir (agent-shell-cache-dir
+                 "remote"
+                 (agent-shell--remote-data-key (agent-shell-cwd))
+                 subdir)))
     (unless (file-directory-p dir)
       (make-directory dir t)
       (when (agent-shell--dot-subdir-in-repo-p dir)
@@ -4924,6 +4981,28 @@ For example:
           (write-region nil nil exclude-file)))
     (error nil)))
 
+(cl-defun agent-shell--capture-nearby-file (&key file-path capture)
+  "Return FILE-PATH after CAPTURE has written it.
+
+CAPTURE is called with the path to write to and must signal on failure.
+
+The screen and the clipboard belong to this machine, so the tools that
+read them run here and can't write to a remote FILE-PATH.  When
+FILE-PATH is remote, CAPTURE writes to a local staging file which is
+then copied across, so CAPTURE's own errors are reported before any
+copy is attempted."
+  (if (file-remote-p file-path)
+      (let ((staging-dir (make-temp-file "agent-shell-capture-" t)))
+        (unwind-protect
+            (let ((staging-path (expand-file-name
+                                 (file-name-nondirectory file-path) staging-dir)))
+              (funcall capture staging-path)
+              (copy-file staging-path file-path t)
+              file-path)
+          (delete-directory staging-dir t)))
+    (funcall capture file-path)
+    file-path))
+
 (cl-defun agent-shell--capture-screenshot (&key destination-dir)
   "Capture a screenshot and save it to DESTINATION-DIR.
 
@@ -4933,24 +5012,25 @@ Signals an error on failure.
 DESTINATION-DIR is required and must be provided."
   (unless destination-dir
     (error "Destination-dir is required"))
-  (let* ((file-path (expand-file-name
-                     (format "screenshot-%s.png"
-                             (format-time-string "%Y%m%d-%H%M%S"))
-                     destination-dir))
-         (command (car agent-shell-screenshot-command))
-         (args (append (cdr agent-shell-screenshot-command)
-                       (list file-path))))
-    (redisplay) ;; Give redisplay a chance before blocking call-process
-    (let ((exit-code (apply #'call-process command nil nil nil args)))
-      (cond
-       ((not (zerop exit-code))
-        (error "Screenshot command failed with exit code %d" exit-code))
-       ((not (file-exists-p file-path))
-        (error "Screenshot file was not created"))
-       ((zerop (nth 7 (file-attributes file-path)))
-        (error "Screenshot file is empty"))
-       (t
-        file-path)))))
+  (agent-shell--capture-nearby-file
+   :file-path (expand-file-name
+               (format "screenshot-%s.png"
+                       (format-time-string "%Y%m%d-%H%M%S"))
+               destination-dir)
+   :capture
+   (lambda (path)
+     (let ((command (car agent-shell-screenshot-command))
+           (args (append (cdr agent-shell-screenshot-command)
+                         (list path))))
+       (redisplay) ;; Give redisplay a chance before blocking call-process
+       (let ((exit-code (apply #'call-process command nil nil nil args)))
+         (cond
+          ((not (zerop exit-code))
+           (error "Screenshot command failed with exit code %d" exit-code))
+          ((not (file-exists-p path))
+           (error "Screenshot file was not created"))
+          ((zerop (nth 7 (file-attributes path)))
+           (error "Screenshot file is empty"))))))))
 
 (cl-defun agent-shell--save-clipboard-image (&key destination-dir no-error)
   "Save clipboard image to DESTINATION-DIR.
@@ -4977,20 +5057,20 @@ for details."
                           agent-shell-clipboard-image-handlers ", "))))
      (t
       (condition-case err
-          (funcall (map-elt handler :save) file-path)
+          (agent-shell--capture-nearby-file
+           :file-path file-path
+           :capture
+           (lambda (path)
+             (funcall (map-elt handler :save) path)
+             (cond
+              ((not (file-exists-p path))
+               (error "Clipboard image file was not created"))
+              ((zerop (nth 7 (file-attributes path)))
+               (delete-file path)
+               (error "No image found in clipboard")))))
         (error
          (unless no-error
-           (signal (car err) (cdr err)))))
-      (cond
-       ((not (file-exists-p file-path))
-        (unless no-error
-          (error "Clipboard image file was not created")))
-       ((zerop (nth 7 (file-attributes file-path)))
-        (delete-file file-path)
-        (unless no-error
-          (error "No image found in clipboard")))
-       (t
-        file-path))))))
+           (signal (car err) (cdr err)))))))))
 
 (defcustom agent-shell-status-kind-label-function
   #'agent-shell--icon-and-kind-status-kind-label
@@ -8286,14 +8366,21 @@ Falls back to latest session in batch mode (e.g. tests)."
                (kill-buffer bootstrapping-shell)
                :other-shell))
             (:downloads-shell
-             (let ((config (map-elt (agent-shell--state) :agent-config)))
+             ;; Read the directory before the kill: afterwards
+             ;; `default-directory' belongs to whatever buffer Emacs falls
+             ;; back to, which would start the shell on another host.
+             (let ((config (map-elt (agent-shell--state) :agent-config))
+                   (shell-directory default-directory))
                (kill-buffer (map-elt (agent-shell--state) :buffer))
-               (agent-shell-new-downloads-shell :config config))
+               (let ((default-directory shell-directory))
+                 (agent-shell-new-downloads-shell :config config)))
              :other-shell)
             (:temp-shell
-             (let ((config (map-elt (agent-shell--state) :agent-config)))
+             (let ((config (map-elt (agent-shell--state) :agent-config))
+                   (shell-directory default-directory))
                (kill-buffer (map-elt (agent-shell--state) :buffer))
-               (agent-shell-new-temp-shell :config config))
+               (let ((default-directory shell-directory))
+                 (agent-shell-new-temp-shell :config config)))
              :other-shell)
             (choice choice)))))))
 
@@ -9142,14 +9229,21 @@ Returns an alist with:
   "Load image from FILE-PATH and return the image object.
 
 MAX-WIDTH specifies the maximum width in pixels for the image (default 200).
-If FILE-PATH is not an image, returns nil."
+If FILE-PATH is not an image, returns nil.
+
+An image on another host is displayed from a copy in the cache
+directory, `create-image' being unable to read a remote name."
   (when-let* (((display-graphic-p))
               (metadata (agent-shell--read-file-content :file-path file-path :shallow t))
               (mime-type (map-elt metadata :mime-type))
               ;; Check if it's an image type
               (is-image (string-prefix-p "image/" mime-type))
-              (type-supported (image-supported-file-p file-path)))
-    (create-image file-path nil nil :max-width max-width)))
+              (type-supported (image-supported-file-p file-path))
+              (display-path (if (file-remote-p file-path)
+                                (agent-shell-markdown--localize-image-file
+                                 file-path (agent-shell-cache-dir "content"))
+                              file-path)))
+    (create-image display-path nil nil :max-width max-width)))
 
 (defun agent-shell--data-to-cache-file (data extension)
   "Decode base64 DATA to a cache file named by its md5 with EXTENSION.
@@ -11862,8 +11956,11 @@ When nil, transcript saving is disabled."
 
 For example:
 
- project/.agent-shell/transcripts/."
-  (let* ((dir (agent-shell--dot-subdir "transcripts"))
+ project/.agent-shell/transcripts/.
+
+A remote project's transcripts are written on this machine instead, so
+streaming a turn doesn't append to a file over the network."
+  (let* ((dir (agent-shell--dot-subdir "transcripts" :local t))
          (filename (format-time-string "%F-%H-%M-%S.md"))
          (filepath (expand-file-name filename dir)))
     filepath))

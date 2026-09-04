@@ -2,6 +2,7 @@
 
 (require 'ert)
 (require 'agent-shell)
+(require 'agent-shell-mock-remote)
 (require 'subr-x)
 
 ;;; Code:
@@ -9225,6 +9226,395 @@ shell is left working in a directory that was just deleted."
         (kill-buffer new-shell-buffer))
       (when (file-directory-p temp-dir)
         (delete-directory temp-dir t)))))
+
+;;; Tests for shell locations
+
+(defmacro agent-shell-tests--capturing-new-shell (dir-var buffer-var &rest body)
+  "Run BODY with `agent-shell--start' stubbed, binding what it saw.
+
+DIR-VAR is set to the `default-directory' the new shell was started
+in, and BUFFER-VAR to the buffer standing in for the shell.  Both are
+cleaned up afterwards."
+  (declare (indent 2) (debug t))
+  `(let ((,dir-var nil)
+         (,buffer-var nil))
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell--start)
+                    (lambda (&rest _args)
+                      (setq ,dir-var default-directory)
+                      (setq ,buffer-var
+                            (generate-new-buffer " *agent-shell-location-test*")))))
+           ,@body)
+       (when (buffer-live-p ,buffer-var)
+         (kill-buffer ,buffer-var)))))
+
+(ert-deftest agent-shell-new-temp-shell-creates-local-directory-test ()
+  "Test a temp shell started locally works in a local directory."
+  (agent-shell-tests--capturing-new-shell shell-dir shell-buffer
+    (unwind-protect
+        (progn
+          (agent-shell-new-temp-shell :config 'test-config :no-display t)
+          (should-not (file-remote-p shell-dir))
+          (should (file-directory-p shell-dir))
+          (should (file-in-directory-p shell-dir temporary-file-directory))
+          (should (equal (buffer-local-value 'agent-shell--pending-directory-cleanup
+                                             shell-buffer)
+                         shell-dir)))
+      (when (and shell-dir (file-directory-p shell-dir))
+        (delete-directory shell-dir t)))))
+
+(ert-deftest agent-shell-new-temp-shell-creates-remote-directory-test ()
+  "Test a temp shell started remotely works on the remote host.
+
+`make-temp-file' ignores a remote `default-directory' and always
+creates its directory locally, which would start the agent on the
+wrong machine."
+  (agent-shell-tests--with-remote-default-directory
+    (agent-shell-tests--capturing-new-shell shell-dir shell-buffer
+      (unwind-protect
+          (progn
+            (agent-shell-new-temp-shell :config 'test-config :no-display t)
+            (should (equal (file-remote-p shell-dir)
+                           (file-remote-p default-directory)))
+            (should (file-directory-p shell-dir))
+            (should (equal (buffer-local-value 'agent-shell--pending-directory-cleanup
+                                               shell-buffer)
+                           shell-dir)))
+        (when (and shell-dir (file-directory-p shell-dir))
+          (delete-directory shell-dir t))))))
+
+(ert-deftest agent-shell-new-downloads-shell-uses-local-home-test ()
+  "Test a Downloads shell started locally uses the local home."
+  (agent-shell-tests--capturing-new-shell shell-dir _shell-buffer
+    (agent-shell-new-downloads-shell :config 'test-config :no-display t)
+    (should-not (file-remote-p shell-dir))
+    (should (equal shell-dir (expand-file-name "~/Downloads")))))
+
+(ert-deftest agent-shell-new-downloads-shell-uses-remote-home-test ()
+  "Test a Downloads shell started remotely uses the remote home.
+
+A leading \"~\" makes the name absolute, so `expand-file-name' ignores
+the directory argument and resolves the home directory locally."
+  (agent-shell-tests--with-remote-default-directory
+    (agent-shell-tests--capturing-new-shell shell-dir _shell-buffer
+      (agent-shell-new-downloads-shell :config 'test-config :no-display t)
+      (should (equal (file-remote-p shell-dir)
+                     (file-remote-p default-directory)))
+      (should (string-suffix-p "/Downloads" shell-dir)))))
+
+(ert-deftest agent-shell--clean-up-deletes-remote-pending-directory-test ()
+  "Test killing a remote temp shell deletes its remote directory."
+  (agent-shell-tests--with-remote-default-directory
+    (let ((temp-dir (make-nearby-temp-file "temp-" t))
+          (delete-by-moving-to-trash nil))
+      (unwind-protect
+          (progn
+            (should (file-remote-p temp-dir))
+            (with-current-buffer (generate-new-buffer " *agent-shell-cleanup-test*")
+              (setq major-mode 'agent-shell-mode)
+              (setq-local agent-shell--state (agent-shell--make-state))
+              (setq-local agent-shell--pending-directory-cleanup temp-dir)
+              (add-hook 'kill-buffer-hook #'agent-shell--clean-up nil t)
+              (kill-buffer))
+            (should-not (file-directory-p temp-dir)))
+        (when (file-directory-p temp-dir)
+          (delete-directory temp-dir t))))))
+
+(ert-deftest agent-shell--clean-up-survives-failing-directory-delete-test ()
+  "Test a directory that won't delete still lets the shell buffer die.
+
+Cleanup runs from `kill-buffer-hook', where an error aborts the kill.
+A temp shell whose host went away would otherwise leave a buffer that
+can't be killed."
+  (let ((temp-dir (make-temp-file "temp-" t))
+        (messages nil)
+        (buffer (generate-new-buffer " *agent-shell-cleanup-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq major-mode 'agent-shell-mode)
+            (setq-local agent-shell--state (agent-shell--make-state))
+            (setq-local agent-shell--pending-directory-cleanup temp-dir)
+            (add-hook 'kill-buffer-hook #'agent-shell--clean-up nil t))
+          (cl-letf (((symbol-function 'delete-directory)
+                     (lambda (&rest _args) (error "Connection is gone")))
+                    ((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (push (apply #'format format-string args) messages))))
+            (kill-buffer buffer))
+          (should-not (buffer-live-p buffer))
+          ;; Reported rather than swallowed.
+          (should (seq-find (lambda (text)
+                              (string-match-p "Connection is gone" text))
+                            messages)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (when (file-directory-p temp-dir)
+        (delete-directory temp-dir t)))))
+
+(cl-defun agent-shell-tests--select-session-choice (&key choice shell-directory)
+  "Pick CHOICE in the session prompt from a shell in SHELL-DIRECTORY.
+
+Returns the `default-directory' the picked command ran in."
+  (let ((captured nil)
+        (shell-buffer (generate-new-buffer " *agent-shell-picker-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq major-mode 'agent-shell-mode)
+            (setq-local default-directory (file-name-as-directory shell-directory))
+            (setq-local shell-maker--config 'test-config)
+            (setq-local agent-shell--state (agent-shell--make-state))
+            (map-put! agent-shell--state :buffer shell-buffer)
+            (map-put! agent-shell--state :agent-config 'test-config)
+            (let ((noninteractive nil))
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (&rest _args) choice))
+                        ((symbol-function 'agent-shell-new-temp-shell)
+                         (lambda (&rest _args) (setq captured default-directory)))
+                        ((symbol-function 'agent-shell-new-downloads-shell)
+                         (lambda (&rest _args) (setq captured default-directory))))
+                (agent-shell--prompt-select-session nil))))
+          captured)
+      (when (buffer-live-p shell-buffer)
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell--prompt-select-session-temp-shell-keeps-directory-test ()
+  "Test picking a temp shell starts it in the shell's own directory.
+
+The choice kills the bootstrapping shell first, so `default-directory'
+would otherwise come from whatever buffer Emacs falls back to."
+  (let ((shell-directory (make-temp-file "agent-shell-picker" t)))
+    (unwind-protect
+        (should (equal (agent-shell-tests--select-session-choice
+                        :choice "New temp shell"
+                        :shell-directory shell-directory)
+                       (file-name-as-directory shell-directory)))
+      (delete-directory shell-directory t))))
+
+(ert-deftest agent-shell--prompt-select-session-downloads-shell-keeps-directory-test ()
+  "Test picking a Downloads shell starts it in the shell's own directory."
+  (let ((shell-directory (make-temp-file "agent-shell-picker" t)))
+    (unwind-protect
+        (should (equal (agent-shell-tests--select-session-choice
+                        :choice "New Downloads shell"
+                        :shell-directory shell-directory)
+                       (file-name-as-directory shell-directory)))
+      (delete-directory shell-directory t))))
+
+;;; Tests for where agent-shell keeps its own data
+
+(defmacro agent-shell-tests--with-cache-directory (directory &rest body)
+  "Run BODY with `agent-shell-cache-dir' rooted at DIRECTORY."
+  (declare (indent 1) (debug t))
+  `(let ((process-environment
+          (cons (concat "XDG_CACHE_HOME=" ,directory) process-environment)))
+     ,@body))
+
+(ert-deftest agent-shell--remote-data-key-test ()
+  "Test `agent-shell--remote-data-key' names a host and its directory."
+  (should (equal (agent-shell--remote-data-key "/ssh:me@host:/srv/proj/")
+                 "ssh-me@host-srv-proj"))
+  ;; Two projects on one host, and one project on two hosts, stay apart.
+  (should-not (equal (agent-shell--remote-data-key "/ssh:host:/srv/one/")
+                     (agent-shell--remote-data-key "/ssh:host:/srv/two/")))
+  (should-not (equal (agent-shell--remote-data-key "/ssh:one:/srv/proj/")
+                     (agent-shell--remote-data-key "/ssh:two:/srv/proj/"))))
+
+(ert-deftest agent-shell--dot-subdir-local-keeps-local-project-path-test ()
+  "Test asking for local data in a local project changes nothing."
+  (let* ((project-dir (make-temp-file "agent-shell-project" t))
+         (cache-dir (make-temp-file "agent-shell-cache" t))
+         (agent-shell-cwd-function (lambda () project-dir)))
+    (unwind-protect
+        (agent-shell-tests--with-cache-directory cache-dir
+          (should (equal (agent-shell--dot-subdir "transcripts" :local t)
+                         (agent-shell--dot-subdir "transcripts"))))
+      (delete-directory project-dir t)
+      (delete-directory cache-dir t))))
+
+(ert-deftest agent-shell--dot-subdir-local-redirects-remote-project-test ()
+  "Test asking for local data in a remote project writes on this machine.
+
+Transcripts are appended once per streamed chunk and read by Emacs, not
+by the agent, so keeping them next to a remote project would cost a
+round trip per write for data the remote host never looks at."
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((cache-dir (make-temp-file "agent-shell-cache" t))
+           (project-dir default-directory)
+           (agent-shell-cwd-function (lambda () project-dir)))
+      (unwind-protect
+          (agent-shell-tests--with-cache-directory cache-dir
+            (let ((dir (agent-shell--dot-subdir "transcripts" :local t)))
+              (should-not (file-remote-p dir))
+              (should (file-directory-p dir))
+              (should (file-in-directory-p dir cache-dir))
+              ;; Named after the remote project, so two of them can't collide.
+              (should (string-match-p (regexp-quote (agent-shell--remote-data-key project-dir))
+                                      dir))))
+        (delete-directory cache-dir t)))))
+
+(ert-deftest agent-shell--default-transcript-file-path-is-local-for-remote-project-test ()
+  "Test a remote project's transcript is written on this machine."
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((cache-dir (make-temp-file "agent-shell-cache" t))
+           (project-dir default-directory)
+           (agent-shell-cwd-function (lambda () project-dir)))
+      (unwind-protect
+          (agent-shell-tests--with-cache-directory cache-dir
+            (let ((path (agent-shell--default-transcript-file-path)))
+              (should-not (file-remote-p path))
+              (should (file-in-directory-p (file-name-directory path) cache-dir))))
+        (delete-directory cache-dir t)))))
+
+(ert-deftest agent-shell--load-image-previews-remote-file-test ()
+  "Test an image on another host is previewed from a copy on this machine.
+
+Attaching a file to a prompt shows it inline, and `create-image' can't
+read a name on another host."
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((image-file (file-truename (make-temp-file "agent-shell-test" nil ".svg" "<svg/>")))
+           (remote-file (concat (file-remote-p default-directory) image-file))
+           (cache-dir (make-temp-file "agent-shell-cache" t))
+           (image-source nil))
+      (unwind-protect
+          (agent-shell-tests--with-cache-directory cache-dir
+            (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _d) t))
+                      ((symbol-function 'image-supported-file-p) (lambda (_f) 'svg))
+                      ((symbol-function 'create-image)
+                       (lambda (source &rest _)
+                         (setq image-source source)
+                         '(image :fake t))))
+              (should (agent-shell--load-image :file-path remote-file))
+              (should-not (file-remote-p image-source))
+              (should (file-in-directory-p image-source cache-dir))))
+        (delete-file image-file)
+        (delete-directory cache-dir t)))))
+
+;;; Tests for capturing screen and clipboard files
+
+(defun agent-shell-tests--file-contents (file-path)
+  "Return the contents of FILE-PATH as a string."
+  (with-temp-buffer
+    (insert-file-contents file-path)
+    (buffer-string)))
+
+(ert-deftest agent-shell--capture-nearby-file-writes-local-destination-test ()
+  "Test capturing to a local destination writes it in place."
+  (let* ((destination-dir (make-temp-file "agent-shell-capture" t))
+         (file-path (expand-file-name "shot.png" destination-dir))
+         (captured-path nil))
+    (unwind-protect
+        (progn
+          (should (equal (agent-shell--capture-nearby-file
+                          :file-path file-path
+                          :capture (lambda (path)
+                                     (setq captured-path path)
+                                     (write-region "shot" nil path nil 'no-message)))
+                         file-path))
+          ;; Written straight to the destination, with nothing staged.
+          (should (equal captured-path file-path))
+          (should (equal (agent-shell-tests--file-contents file-path) "shot")))
+      (delete-directory destination-dir t))))
+
+(ert-deftest agent-shell--capture-nearby-file-copies-to-remote-destination-test ()
+  "Test capturing to a remote destination stages the file locally.
+
+Screen and clipboard tools run on this machine, so they can't write to
+a remote path."
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((destination-dir (make-nearby-temp-file "agent-shell-capture" t))
+           (file-path (expand-file-name "shot.png" destination-dir))
+           (captured-path nil))
+      (unwind-protect
+          (progn
+            (should (equal (agent-shell--capture-nearby-file
+                            :file-path file-path
+                            :capture (lambda (path)
+                                       (setq captured-path path)
+                                       (write-region "shot" nil path nil 'no-message)))
+                           file-path))
+            (should-not (file-remote-p captured-path))
+            ;; Staging file doesn't outlive the capture.
+            (should-not (file-exists-p captured-path))
+            (should (equal (agent-shell-tests--file-contents file-path) "shot")))
+        (delete-directory destination-dir t)))))
+
+(ert-deftest agent-shell--capture-nearby-file-reports-capture-failure-test ()
+  "Test a failed capture reports its own error rather than a copy failure."
+  (agent-shell-tests--with-remote-default-directory
+    (let ((destination-dir (make-nearby-temp-file "agent-shell-capture" t)))
+      (unwind-protect
+          (should (equal (should-error
+                          (agent-shell--capture-nearby-file
+                           :file-path (expand-file-name "shot.png" destination-dir)
+                           :capture (lambda (_path)
+                                      (error "Screenshot file was not created"))))
+                         '(error "Screenshot file was not created")))
+        (delete-directory destination-dir t)))))
+
+(ert-deftest agent-shell--capture-screenshot-reaches-remote-destination-test ()
+  "Test a screenshot taken for a remote project lands on that host."
+  (agent-shell-tests--with-remote-default-directory
+    (let ((destination-dir (make-nearby-temp-file "agent-shell-screenshots" t))
+          (agent-shell-screenshot-command '("sh" "-c" "printf shot > \"$0\"")))
+      (unwind-protect
+          (let ((file-path (agent-shell--capture-screenshot
+                            :destination-dir destination-dir)))
+            (should (equal (file-remote-p file-path)
+                           (file-remote-p destination-dir)))
+            (should (equal (agent-shell-tests--file-contents file-path) "shot")))
+        (delete-directory destination-dir t)))))
+
+(ert-deftest agent-shell--capture-screenshot-keeps-its-own-errors-test ()
+  "Test a screenshot command that writes nothing is still reported as such."
+  (agent-shell-tests--with-remote-default-directory
+    (let ((destination-dir (make-nearby-temp-file "agent-shell-screenshots" t))
+          (agent-shell-screenshot-command '("sh" "-c" "true")))
+      (unwind-protect
+          (should (equal (should-error (agent-shell--capture-screenshot
+                                        :destination-dir destination-dir))
+                         '(error "Screenshot file was not created")))
+        (delete-directory destination-dir t)))))
+
+(ert-deftest agent-shell--save-clipboard-image-reaches-remote-destination-test ()
+  "Test a clipboard image saved for a remote project lands on that host."
+  (agent-shell-tests--with-remote-default-directory
+    (let ((destination-dir (make-nearby-temp-file "agent-shell-screenshots" t))
+          (agent-shell-clipboard-image-handlers
+           (list (list (cons :command "sh")
+                       ;; Like the real handlers: a local tool writing
+                       ;; to whatever path it's handed.
+                       (cons :save (lambda (file-path)
+                                     (call-process "sh" nil nil nil
+                                                   "-c" "printf clip > \"$0\"" file-path)))))))
+      (unwind-protect
+          (let ((file-path (agent-shell--save-clipboard-image
+                            :destination-dir destination-dir)))
+            (should (equal (file-remote-p file-path)
+                           (file-remote-p destination-dir)))
+            (should (equal (agent-shell-tests--file-contents file-path) "clip")))
+        (delete-directory destination-dir t)))))
+
+(ert-deftest agent-shell--save-clipboard-image-without-image-stays-quiet-test ()
+  "Test an empty clipboard reports no image and leaves nothing behind."
+  (agent-shell-tests--with-remote-default-directory
+    (let ((destination-dir (make-nearby-temp-file "agent-shell-screenshots" t))
+          (agent-shell-clipboard-image-handlers
+           (list (list (cons :command "sh")
+                       (cons :save (lambda (file-path)
+                                     (call-process "sh" nil nil nil
+                                                   "-c" "printf \"\" > \"$0\"" file-path)))))))
+      (unwind-protect
+          (progn
+            (should (equal (should-error (agent-shell--save-clipboard-image
+                                          :destination-dir destination-dir))
+                           '(error "No image found in clipboard")))
+            (should-not (agent-shell--save-clipboard-image
+                         :destination-dir destination-dir :no-error t))
+            (should-not (directory-files destination-dir nil "clipboard-")))
+        (delete-directory destination-dir t)))))
+
 (ert-deftest agent-shell-experimental--make-session-steering-request-test ()
   "Test `agent-shell-experimental--make-session-steering-request'."
   (let ((request (agent-shell-experimental--make-session-steering-request

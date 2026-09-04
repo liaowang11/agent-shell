@@ -97,12 +97,16 @@ Returns a string like \"adoring-hawking\" or \"focused-turing\"."
 
 (defun agent-shell-worktree--git-repo-root ()
   "Return the root directory of the current git repository.
-Or nil if not in a repo."
+Or nil if not in a repo.
+
+git runs on the host `default-directory' points at and prints a path in
+that host's own terms, so the host is carried over to name the root of a
+remote repository."
   (when-let* ((output (shell-command-to-string
                        "git rev-parse --show-toplevel 2>/dev/null")))
     (let ((trimmed (string-trim output)))
       (unless (string-empty-p trimmed)
-        trimmed))))
+        (concat (file-remote-p default-directory) trimmed)))))
 
 ;;;###autoload
 (defun agent-shell-new-worktree-shell ()
@@ -125,9 +129,11 @@ The user is prompted to confirm or edit the worktree path before creation."
       (user-error "Directory already exists: %s" worktree-path))
     (make-directory (file-name-directory worktree-path) t)
     ;; Create the worktree
+    ;; git runs on the host holding the repository, where the name of that
+    ;; host is not part of a path it can resolve.
     (let ((output (shell-command-to-string
                    (format "git worktree add %s 2>&1"
-                           (shell-quote-argument worktree-path)))))
+                           (shell-quote-argument (file-local-name worktree-path))))))
       (unless (file-exists-p worktree-path)
         (user-error "Failed to create worktree: %s" output))
       (let ((default-directory worktree-path))

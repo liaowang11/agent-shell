@@ -18,6 +18,11 @@
                              (file-name-directory
                               (or load-file-name buffer-file-name))))
 
+;; For `agent-shell-tests--with-remote-default-directory'.
+(load-file (expand-file-name "agent-shell-mock-remote.el"
+                             (file-name-directory
+                              (or load-file-name buffer-file-name))))
+
 (ert-deftest agent-shell-markdown-convert-bold ()
   (should (equal (agent-shell-markdown--deconstruct
                   (agent-shell-markdown-convert "hello **world**"))
@@ -4593,6 +4598,130 @@ for a fully-selected buffer."
     (goto-char (point-min))
     (search-forward "⧉")
     (should-not (agent-shell-markdown-source-block-at-point (1- (point))))))
+
+
+(ert-deftest agent-shell-markdown--localize-image-file-keeps-local-file ()
+  ;; A file already on this machine is displayed where it is.
+  (let ((image-file (make-temp-file "agent-shell-test" nil ".svg" "<svg/>"))
+        (cache-directory (make-temp-file "agent-shell-image-cache" t)))
+    (unwind-protect
+        (should (equal (agent-shell-markdown--localize-image-file image-file cache-directory)
+                       image-file))
+      (delete-file image-file)
+      (delete-directory cache-directory t))))
+
+(ert-deftest agent-shell-markdown--localize-image-file-copies-remote-file ()
+  ;; `create-image' opens the file itself, so a file on another host has to
+  ;; be copied here before it can be displayed.
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((image-file (file-truename (make-temp-file "agent-shell-test" nil ".svg" "<svg/>")))
+           (remote-file (concat (file-remote-p default-directory) image-file))
+           (cache-directory (make-temp-file "agent-shell-image-cache" t)))
+      (unwind-protect
+          (let ((local-file (agent-shell-markdown--localize-image-file
+                             remote-file cache-directory)))
+            (should-not (file-remote-p local-file))
+            (should (file-in-directory-p local-file cache-directory))
+            (should (equal (with-temp-buffer
+                             (insert-file-contents local-file)
+                             (buffer-string))
+                           "<svg/>"))
+            ;; Extension carried over, so the image type is still recognizable.
+            (should (equal (file-name-extension local-file) "svg"))
+            ;; An unchanged file is copied once.
+            (should (equal (agent-shell-markdown--localize-image-file
+                            remote-file cache-directory)
+                           local-file)))
+        (delete-file image-file)
+        (delete-directory cache-directory t)))))
+
+(ert-deftest agent-shell-markdown--localize-image-file-follows-changed-file ()
+  ;; A remote file that changed is copied again, rather than displayed from
+  ;; a stale copy.
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((image-file (file-truename (make-temp-file "agent-shell-test" nil ".svg" "<svg/>")))
+           (remote-file (concat (file-remote-p default-directory) image-file))
+           (cache-directory (make-temp-file "agent-shell-image-cache" t)))
+      (unwind-protect
+          (let ((first (agent-shell-markdown--localize-image-file
+                        remote-file cache-directory)))
+            ;; Written through the connection, so TRAMP's attribute cache
+            ;; sees the change the way it would a write on the host.
+            (write-region "<svg id=\"second\"/>" nil remote-file nil 'no-message)
+            (let ((second (agent-shell-markdown--localize-image-file
+                           remote-file cache-directory)))
+              (should-not (equal first second))
+              (should (equal (with-temp-buffer
+                               (insert-file-contents second)
+                               (buffer-string))
+                             "<svg id=\"second\"/>"))))
+        (delete-file image-file)
+        (delete-directory cache-directory t)))))
+
+(ert-deftest agent-shell-markdown--localize-image-file-without-cache-directory ()
+  ;; Nowhere to copy it to means it can't be displayed.
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((image-file (file-truename (make-temp-file "agent-shell-test" nil ".svg" "<svg/>")))
+           (remote-file (concat (file-remote-p default-directory) image-file)))
+      (unwind-protect
+          (should-not (agent-shell-markdown--localize-image-file remote-file nil))
+        (delete-file image-file)))))
+
+(ert-deftest agent-shell-markdown-image-markup-displays-remote-file ()
+  ;; `![alt](path)' naming a file on another host renders, with the copy on
+  ;; this machine handed to `create-image'.
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((image-file (file-truename (make-temp-file "agent-shell-test" nil ".svg" "<svg/>")))
+           (remote-file (concat (file-remote-p default-directory) image-file))
+           (cache-directory (make-temp-file "agent-shell-image-cache" t))
+           (image-source nil)
+           (visited nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _d) t))
+                    ((symbol-function 'image-supported-file-p) (lambda (_f) 'svg))
+                    ((symbol-function 'create-image)
+                     (lambda (source &rest _) (setq image-source source) '(image :fake t)))
+                    ((symbol-function 'image-flush) (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-markdown-visit-file)
+                     (lambda (&rest args) (setq visited (plist-get args :file)))))
+            (with-temp-buffer
+              (insert (format "![diagram](%s)" remote-file))
+              (agent-shell-markdown-replace-markup
+               :render-images t :complete t
+               :image-cache-directory cache-directory)
+              (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                             "diagram"))
+              (should-not (file-remote-p image-source))
+              (should (file-in-directory-p image-source cache-directory))
+              ;; Opening it goes to the file itself, not to the copy.
+              (funcall (keymap-lookup (get-text-property (point-min) 'keymap) "RET"))
+              (should (equal visited remote-file))))
+        (delete-file image-file)
+        (delete-directory cache-directory t)))))
+
+(ert-deftest agent-shell-markdown-image-path-line-displays-remote-file ()
+  ;; A bare line naming a file on another host renders the same way.
+  (agent-shell-tests--with-remote-default-directory
+    (let* ((image-file (file-truename (make-temp-file "agent-shell-test" nil ".svg" "<svg/>")))
+           (remote-file (concat (file-remote-p default-directory) image-file))
+           (cache-directory (make-temp-file "agent-shell-image-cache" t))
+           (image-source nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _d) t))
+                    ((symbol-function 'image-supported-file-p) (lambda (_f) 'svg))
+                    ((symbol-function 'create-image)
+                     (lambda (source &rest _) (setq image-source source) '(image :fake t)))
+                    ((symbol-function 'image-flush) (lambda (&rest _) nil)))
+            (with-temp-buffer
+              (insert remote-file)
+              (agent-shell-markdown-replace-markup
+               :render-images t :complete t
+               :image-cache-directory cache-directory)
+              (should (eq 'image (car-safe (get-text-property (point-min) 'display))))
+              (should-not (file-remote-p image-source))
+              (should (file-in-directory-p image-source cache-directory))))
+        (delete-file image-file)
+        (delete-directory cache-directory t)))))
 
 (provide 'agent-shell-markdown-tests)
 
