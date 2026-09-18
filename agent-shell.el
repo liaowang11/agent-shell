@@ -1282,6 +1282,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :pending-prompts nil)
         (cons :native-subagents nil)
         (cons :async-tasks nil)
+        (cons :plan-signals nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
                            (cons :output-tokens 0)
@@ -3763,14 +3764,17 @@ around this call to reflect whether the update arrived out of turn."
             :data (list (cons :tool-call-id tool-call-id)
                         (cons :tool-call (map-nested-elt state (list :tool-calls tool-call-id)))))
            (agent-shell--render-tool-call-fragment :state state :tool-call-id tool-call-id)
-             ;; Display plan as markdown block if present
-             (when (map-nested-elt acp-notification '(params update rawInput plan))
-               (agent-shell--update-fragment
-                :state state
-                :block-id (concat tool-call-id "-plan")
-                :label-left (propertize "Proposed plan" 'font-lock-face 'agent-shell-section-heading)
-                :body (agent-shell--format-plan (map-nested-elt acp-notification '(params update rawInput plan)))
-                :expanded t)))
+           ;; Display plan as markdown block if present
+           (when-let* ((raw-plan (map-nested-elt acp-notification '(params update rawInput plan)))
+                       (block-id (concat tool-call-id "-plan"))
+                       (text (agent-shell--plan-content-text raw-plan))
+                       ((agent-shell--plan-signal-new-p state block-id text)))
+             (agent-shell--update-fragment
+              :state state
+              :block-id block-id
+              :label-left (propertize "Proposed plan" 'font-lock-face 'agent-shell-section-heading)
+              :body (agent-shell--format-plan raw-plan)
+              :expanded t)))
            (agent-shell--activity-group-note-entry-type state "tool_call"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_thought_chunk")
            (let ((new-thought-p
@@ -3928,12 +3932,15 @@ around this call to reflect whether the update arrived out of turn."
               :append t
               :above-last-prompt t))))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "plan")
-           (agent-shell--update-fragment
-            :state state
-            :block-id "plan"
-            :label-left (propertize "Plan" 'font-lock-face 'agent-shell-section-heading)
-            :body (agent-shell--format-plan (map-nested-elt acp-notification '(params update entries)))
-            :expanded t)
+           (let* ((entries (map-nested-elt acp-notification '(params update entries)))
+                  (text (agent-shell--plan-content-text entries)))
+             (when (agent-shell--plan-signal-new-p state "plan" text)
+               (agent-shell--update-fragment
+                :state state
+                :block-id "plan"
+                :label-left (propertize "Plan" 'font-lock-face 'agent-shell-section-heading)
+                :body (agent-shell--format-plan entries)
+                :expanded t)))
            (agent-shell--activity-group-note-entry-type state "plan"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "subagent_spawned")
            (let* ((subagent-session-id (map-nested-elt acp-notification '(params update subagentSessionId)))
@@ -4263,12 +4270,15 @@ around this call to reflect whether the update arrived out of turn."
                                                        :tool-call-id tool-call-id)
                                                       t)))))))
            (unless permission-handled
-             (when (map-nested-elt acp-request '(params toolCall rawInput plan))
+             (when-let* ((raw-plan (map-nested-elt acp-request '(params toolCall rawInput plan)))
+                         (block-id (concat tool-call-id "-plan"))
+                         (text (agent-shell--plan-content-text raw-plan))
+                         ((agent-shell--plan-signal-new-p state block-id text)))
                (agent-shell--update-fragment
                 :state state
-                :block-id (concat tool-call-id "-plan")
+                :block-id block-id
                 :label-left (propertize "Proposed plan" 'font-lock-face 'agent-shell-section-heading)
-                :body (agent-shell--format-plan (map-nested-elt acp-request '(params toolCall rawInput plan)))
+                :body (agent-shell--format-plan raw-plan)
                 :expanded t
                 :above-last-prompt (not (agent-shell--active-requests-p state))))
              ;; block-id must be the same as the one used
@@ -5376,6 +5386,23 @@ a `status' key and a `content' or `step' key."
      :separator " "
      :joiner "\n"))))
 
+(defun agent-shell--plan-content-text (source)
+  "Return SOURCE's plan text stripped of status decoration.
+
+SOURCE has the shape `agent-shell--format-plan' accepts: a string, or a
+sequence of alists with a `content' or `step' key.  Used to compare a
+tool call's raw markdown plan against a native `plan' sessionUpdate's
+step entries for equivalence, independent of how each is formatted for
+display."
+  (cond
+   ((stringp source) (string-trim source))
+   ((or (vectorp source) (listp source))
+    (string-trim
+     (mapconcat (lambda (entry)
+                  (or (map-elt entry 'content) (map-elt entry 'step) ""))
+                source "\n")))
+   (t "")))
+
 (defun agent-shell--subagent-block-id (subagent-session-id)
   "Return the fragment block id for SUBAGENT-SESSION-ID."
   (format "subagent-%s" subagent-session-id))
@@ -5421,6 +5448,31 @@ somewhere."
                        (propertize name 'font-lock-face 'agent-shell-section-heading))
    :body body
    :expanded expanded))
+
+(defun agent-shell--plan-signal-new-p (state block-id text)
+  "Return non-nil the first time TEXT is recorded for BLOCK-ID this turn.
+
+Return nil (and record nothing) when some *other* block already recorded
+the same TEXT in STATE's current turn (keyed by `:request-count'),
+meaning it is an equivalent plan already visible to the user under a
+different heading -- see `agent-shell--plan-content-text'.  Recording
+under BLOCK-ID, not just TEXT, lets the same signal keep updating its own
+block across a turn (e.g. native step-status progress, where BLOCK-ID is
+always \"plan\") without ever comparing itself against its own prior
+value.  A blank TEXT is never recorded or treated as a duplicate."
+  (agent-shell--ensure-state-key state :plan-signals)
+  (let* ((turn-key (map-elt state :request-count))
+         (turn-entries (map-elt (map-elt state :plan-signals) turn-key))
+         (duplicate (seq-some (lambda (entry)
+                                 (and (not (equal (car entry) block-id))
+                                      (equal (cdr entry) text)))
+                               turn-entries)))
+    (unless (or duplicate (string-empty-p text))
+      (map-put! state :plan-signals
+                (cons (cons turn-key (cons (cons block-id text)
+                                            (assoc-delete-all block-id turn-entries)))
+                      (assoc-delete-all turn-key (map-elt state :plan-signals)))))
+    (not duplicate)))
 
 (defun agent-shell--save-native-subagent (state subagent-session-id name task)
   "Record SUBAGENT-SESSION-ID's NAME and TASK in STATE's registry.

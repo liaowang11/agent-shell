@@ -193,6 +193,52 @@
   ;; Test empty entries
   (should (equal (agent-shell--format-plan []) "")))
 
+(ert-deftest agent-shell--plan-content-text-test ()
+  "Test `agent-shell--plan-content-text' function."
+  ;; A string (Claude Code's ExitPlanMode rawInput.plan shape) is
+  ;; returned trimmed.
+  (should (equal (agent-shell--plan-content-text "  Do the thing  ")
+                 "Do the thing"))
+  ;; A vector of alists (native `plan' sessionUpdate entries) joins
+  ;; each entry's content by newline, ignoring status.
+  (should (equal (agent-shell--plan-content-text
+                  [((status . "pending") (content . "Step one"))
+                   ((status . "completed") (content . "Step two"))])
+                 "Step one\nStep two"))
+  ;; codex-acp uses `step' instead of `content'.
+  (should (equal (agent-shell--plan-content-text
+                  [((status . "pending") (step . "Step one"))])
+                 "Step one"))
+  ;; Empty entries yield an empty string, not an error.
+  (should (equal (agent-shell--plan-content-text []) "")))
+
+(ert-deftest agent-shell--plan-signal-new-p-test ()
+  "Test `agent-shell--plan-signal-new-p' function."
+  (let ((state (agent-shell--make-state)))
+    ;; First block to show a given text this turn is never a duplicate.
+    (should (agent-shell--plan-signal-new-p state "plan" "Do X"))
+    ;; A different block showing the same text is a duplicate.
+    (should-not (agent-shell--plan-signal-new-p state "A-plan" "Do X"))
+    ;; The same block re-recording its own text (e.g. native plan
+    ;; step-status progress with unchanged content) is not a duplicate
+    ;; of itself.
+    (should (agent-shell--plan-signal-new-p state "plan" "Do X"))
+    ;; Different text from either block is not a duplicate.
+    (should (agent-shell--plan-signal-new-p state "plan" "Do Y"))
+    ;; A blank text is never treated as a duplicate, and is not recorded
+    ;; (so it can't cause a false-positive match against another blank).
+    (should (agent-shell--plan-signal-new-p state "B-plan" ""))
+    (should (agent-shell--plan-signal-new-p state "C-plan" ""))))
+
+(ert-deftest agent-shell--plan-signal-new-p-scoped-to-turn-test ()
+  "A new turn's plan text does not collide with the previous turn's."
+  (let ((state (agent-shell--make-state)))
+    (should (agent-shell--plan-signal-new-p state "plan" "Do X"))
+    (map-put! state :request-count 1)
+    ;; Same text, next turn, different block: not a duplicate, because
+    ;; the previous turn's plan is no longer relevant.
+    (should (agent-shell--plan-signal-new-p state "A-plan" "Do X"))))
+
 (ert-deftest agent-shell--make-button-test ()
   "Test `agent-shell--make-button' brackets in terminal mode."
   ;; Graphical mode: spaces with box styling
@@ -8570,6 +8616,122 @@ completion) and renders no lasting interleaved content."
       ;; A and B are consecutive with no interleaved content — one group.
       (should (equal (map-nested-elt state '(:tool-calls "A" :group-id))
                      (map-nested-elt state '(:tool-calls "B" :group-id)))))
+      (kill-buffer buffer))))
+
+(ert-deftest agent-shell--plan-not-duplicated-across-tool-call-and-native-update-test ()
+  "The same ExitPlanMode plan renders once, not once per ACP signal.
+Regression: a tool call's `rawInput.plan' (rendered as \"Proposed plan\")
+and a native `plan' sessionUpdate's entries (rendered as \"Plan\") can
+both describe the same plan for one `ExitPlanMode' call; only the first
+to arrive should render -- see `agent-shell--plan-signal-new-p'."
+  (let* ((buffer (generate-new-buffer " *plan-duplicate-test*"))
+         (state (agent-shell--make-state :buffer buffer))
+         (rendered-plan-block-ids nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                   (lambda (&rest args)
+                     (let ((block-id (plist-get args :block-id)))
+                       (when (or (equal block-id "plan")
+                                 (string-suffix-p "-plan" block-id))
+                         (push block-id rendered-plan-block-ids)))))
+                  ((symbol-function 'agent-shell--refresh-activity-group-header) #'ignore)
+                  ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell-make-tool-call-label)
+                   (lambda (&rest _) '((:status . "s") (:title . "t")))))
+      (cl-flet ((notify (update)
+                  (agent-shell--on-notification
+                   :state state
+                   :acp-notification `((method . "session/update")
+                                       (params (update . ,update))))))
+        ;; The tool call announces the plan first.
+        (notify '((sessionUpdate . "tool_call") (toolCallId . "A")
+                  (title . "ExitPlanMode") (kind . "other") (status . "pending")
+                  (rawInput (plan . "Do X"))))
+        ;; The agent also emits a native plan update describing the same
+        ;; plan as a single-step entry.
+        (notify '((sessionUpdate . "plan")
+                  (entries . [((status . "pending") (content . "Do X"))]))))
+      ;; Only the tool call's "Proposed plan" rendered; the native
+      ;; "Plan" update was recognized as the same plan and skipped.
+      (should (equal rendered-plan-block-ids '("A-plan"))))
+      (kill-buffer buffer))))
+
+(ert-deftest agent-shell--plan-not-suppressed-when-genuinely-different-test ()
+  "Genuinely different plan content from each signal both render.
+Guards against over-suppression: a native `plan' update tracking
+different steps than a tool call's markdown plan is real, distinct
+information and must not be dropped."
+  (let* ((buffer (generate-new-buffer " *plan-distinct-test*"))
+         (state (agent-shell--make-state :buffer buffer))
+         (rendered-plan-block-ids nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                   (lambda (&rest args)
+                     (let ((block-id (plist-get args :block-id)))
+                       (when (or (equal block-id "plan")
+                                 (string-suffix-p "-plan" block-id))
+                         (push block-id rendered-plan-block-ids)))))
+                  ((symbol-function 'agent-shell--refresh-activity-group-header) #'ignore)
+                  ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell-make-tool-call-label)
+                   (lambda (&rest _) '((:status . "s") (:title . "t")))))
+      (cl-flet ((notify (update)
+                  (agent-shell--on-notification
+                   :state state
+                   :acp-notification `((method . "session/update")
+                                       (params (update . ,update))))))
+        (notify '((sessionUpdate . "tool_call") (toolCallId . "B")
+                  (title . "ExitPlanMode") (kind . "other") (status . "pending")
+                  (rawInput (plan . "Do Y"))))
+        (notify '((sessionUpdate . "plan")
+                  (entries . [((status . "pending") (content . "Step 1"))
+                              ((status . "pending") (content . "Step 2"))]))))
+      (should (equal (sort (copy-sequence rendered-plan-block-ids) #'string<)
+                     '("B-plan" "plan"))))
+      (kill-buffer buffer))))
+
+(ert-deftest agent-shell--plan-not-duplicated-across-native-update-and-permission-request-test ()
+  "The same ExitPlanMode plan is not duplicated via a permission request.
+Regression: `session/request_permission' can carry the same `rawInput.plan'
+as an already-rendered native `plan' sessionUpdate when the agent asks to
+leave plan mode."
+  (let* ((buffer (generate-new-buffer " *plan-duplicate-permission-test*"))
+         (state (agent-shell--make-state :buffer buffer))
+         (rendered-plan-block-ids nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                   (lambda (&rest args)
+                     (let ((block-id (plist-get args :block-id)))
+                       (when (or (equal block-id "plan")
+                                 (string-suffix-p "-plan" block-id))
+                         (push block-id rendered-plan-block-ids)))))
+                  ((symbol-function 'agent-shell--make-permission-actions) (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell--make-tool-call-permission-text)
+                   (lambda (&rest _) ""))
+                  ((symbol-function 'agent-shell-make-tool-call-label)
+                   (lambda (&rest _) '((:status . "s") (:title . "t"))))
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+                  ((symbol-function 'agent-shell--start-idle-timer) #'ignore))
+      (cl-flet ((notify (update)
+                  (agent-shell--on-notification
+                   :state state
+                   :acp-notification `((method . "session/update")
+                                       (params (update . ,update)))))
+                (request (obj)
+                  (agent-shell--on-request :state state :acp-request obj)))
+        ;; The native plan update arrives first.
+        (notify '((sessionUpdate . "plan")
+                  (entries . [((status . "pending") (content . "Do Z"))])))
+        ;; The permission request to leave plan mode carries the same plan.
+        (request '((method . "session/request_permission") (id . 5)
+                   (params (options . [])
+                           (toolCall (toolCallId . "C") (title . "ExitPlanMode")
+                                     (kind . "other")
+                                     (rawInput (plan . "Do Z")))))))
+      (should (equal rendered-plan-block-ids '("plan"))))
       (kill-buffer buffer))))
 
 (ert-deftest agent-shell--activity-group-header-label-test ()
