@@ -3151,19 +3151,23 @@ work, so runs there would only repeat what the row summarizes."
 (defun agent-shell--activity-group-advance (state)
   "Return the root session's current activity group id in STATE.
 
-Advances the run counter unless the last entry keeps the run open.  Only
-the root reaches here: a subagent's content is claimed by its row before
-this is called (see `agent-shell--activity-group-current-id').  The
+Advances the run counter at a turn boundary or when the last entry no longer
+keeps the run open.  Only the root reaches here: a subagent's content is
+claimed by its row before this is called (see
+`agent-shell--activity-group-current-id').  The
 per-session record is still read and written, because the root's run
 boundary must not move when a subagent renders between two of its
 entries."
   (let* ((session-state (agent-shell--activity-group-session-state state))
          (last-entry-type (agent-shell--activity-group-session-entry-type state))
          (group-id (map-elt session-state :group-id))
+         (turn-key (list (map-elt state :request-count)
+                         (and (agent-shell--active-requests-p state) t)))
          (group-count (or (map-elt session-state :group-count)
                           (map-elt state :activity-group-count)
                           0)))
     (if (and group-id
+             (equal turn-key (map-elt session-state :turn-key))
              (member last-entry-type agent-shell--activity-group-run-entry-types))
         group-id
       (let* ((new-group-count (1+ group-count))
@@ -3173,6 +3177,7 @@ entries."
         (map-put! state :activity-group-count new-group-count)
         (agent-shell--activity-group-set-session-fields
          state (cons :group-count new-group-count)
+         (cons :turn-key turn-key)
          (cons :group-id new-group-id))
         new-group-id))))
 
@@ -3821,18 +3826,14 @@ around this call to reflect whether the update arrived out of turn."
               :expanded t)))
            (agent-shell--activity-group-note-entry-type state "tool_call"))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_thought_chunk")
-           (let* ((new-thought-p
-                   (not (equal (agent-shell--activity-group-session-entry-type state)
-                               "agent_thought_chunk")))
+           (let* ((group-id (agent-shell--activity-group-current-id state))
+                  (new-thought-p
+                   (or (not (equal (agent-shell--activity-group-session-entry-type state)
+                                   "agent_thought_chunk"))
+                       (not (agent-shell--group-has-thought-p state group-id))))
                   (content (agent-shell--content-block-to-markdown
                             (map-nested-elt acp-notification '(params update content))))
                   (row (agent-shell--subagent-row state))
-                  ;; Share the tool-call run counter so a thought lands in
-                  ;; the same activity group as the surrounding tool calls.
-                  ;; Read before `:last-entry-type' is advanced below;
-                  ;; stable across a thought's streamed chunks since
-                  ;; "agent_thought_chunk" keeps the run open.
-                  (group-id (agent-shell--activity-group-current-id state))
                   ;; A subagent's thoughts all share its row's group, so
                   ;; tell them apart by how many came before.
                   (thought-index (when row
@@ -3848,15 +3849,10 @@ around this call to reflect whether the update arrived out of turn."
               :file-path agent-shell--transcript-file)
              (agent-shell--update-fragment
               :state state
-              ;; Out of turn, key under a dedicated namespace so the
-              ;; thought forms its own fragment rather than coalescing
-              ;; into the previous turn's final thought (same request-count
-              ;; and group-count).  ACP's ContentChunk.messageId is the
-              ;; spec's intended discriminator here, but it is optional and
-              ;; only populated by newer agents, so we group by turn
-              ;; boundary instead.  A subagent's thought resolves to its
-              ;; row instead.
-              :namespace-id (agent-shell--fragment-namespace-id state)
+              ;; Thoughts share their activity group's namespace with tools.
+              ;; A turn boundary starts a new run, not a second namespace for
+              ;; the same group.  Subagents keep their pinned row namespace.
+              :namespace-id (map-elt row :namespace-id)
               ;; The activity group is globally unique and remains stable
               ;; across a thought's streamed chunks, including when another
               ;; session starts a thought between them.
@@ -3880,8 +3876,7 @@ around this call to reflect whether the update arrived out of turn."
                      content
                      'face 'agent-shell-thought-body
                      'font-lock-face 'agent-shell-thought-body)
-              :append (equal (agent-shell--activity-group-session-entry-type state)
-                             "agent_thought_chunk")
+              :append (not new-thought-p)
               :expanded agent-shell-thought-process-expand-by-default
               :group-id (unless row group-id)
               :group-label agent-shell--activity-group-label
@@ -3902,8 +3897,7 @@ around this call to reflect whether the update arrived out of turn."
                    (agent-shell--refresh-subagent-row state row)
                  (agent-shell--refresh-activity-group-header state group-id)
                  (agent-shell--sync-activity-group-fold
-                  :state state :group-id group-id
-                  :namespace-id (agent-shell--fragment-namespace-id state)))))
+                  :state state :group-id group-id))))
            (agent-shell--activity-group-note-entry-type state "agent_thought_chunk"))
           ((and (equal (map-nested-elt acp-notification '(params update sessionUpdate)) "user_message_chunk")
                 (agent-shell--subagent-row state))
@@ -5794,11 +5788,10 @@ registered.
 (defun agent-shell--fragment-namespace-id (state)
   "Return the fragment namespace the dispatching session renders into.
 
-For writers whose fragment must not coalesce with the previous turn's:
-streamed messages and thoughts, which are keyed by run rather than by an
-id of their own.  Everything else lets `agent-shell--update-fragment'
-settle it.  Nil means its default applies, which is STATE's
-`:request-count'.
+For streamed messages, which must not coalesce with the previous turn's
+answer.  Activity fragments instead share their group's request namespace
+and start a new run at a turn boundary.  Nil means the default applies,
+which is STATE's `:request-count'.
 
 A native subagent's content goes to the namespace pinned on its row at
 spawn, so its fragments keep one address for as long as it runs: across

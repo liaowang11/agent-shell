@@ -678,8 +678,9 @@ the buffer, which a captured argument list cannot show."
       (when (process-live-p process)
         (delete-process process))
       (with-current-buffer buffer
-        (agent-shell-subagents--kill-buffers agent-shell--state))
-      (kill-buffer buffer))))
+        (let ((kill-buffer-query-functions nil))
+          (agent-shell-subagents--kill-buffers agent-shell--state)
+          (kill-buffer buffer))))))
 
 (defun agent-shell-tests--subagent-buffer-report (buffer)
   "Return BUFFER's `:blocks', `:groups', `:text' and `:mode', or nil.
@@ -1036,6 +1037,76 @@ content to a page it does not belong to."
     (should (agent-shell--latest-page-namespace-p state 2))
     (should (agent-shell--latest-page-namespace-p state "out-of-turn"))
     (should-not (agent-shell--latest-page-namespace-p state 1))))
+
+(ert-deftest agent-shell-root-after-turn-activity-shares-one-group-test ()
+  "Late root commands and thoughts share a labelled, folding group."
+  (dolist (thought-first '(nil t))
+    (let* ((agent-shell-activity-group-expand-by-default 'latest)
+           (hidden nil)
+           (rendered
+            (agent-shell-tests--subagent-shell
+             (lambda (send end-turn _prompt)
+               (funcall send "root" '(sessionUpdate . "agent_message_chunk")
+                        '(content (type . "text") (text . "Waiting.")))
+               (funcall end-turn)
+               (when thought-first
+                 (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                          '(content (type . "text") (text . "Checking."))))
+               (funcall send "root" '(sessionUpdate . "tool_call")
+                        '(toolCallId . "late") '(title . "Late command")
+                        '(kind . "execute") '(status . "in_progress"))
+               (unless thought-first
+                 (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                          '(content (type . "text") (text . "Checking."))))
+               (funcall send "root" '(sessionUpdate . "tool_call_update")
+                        '(toolCallId . "late") '(status . "completed"))
+               (funcall send "root" '(sessionUpdate . "agent_message_chunk")
+                        '(content (type . "text") (text . "Finished.")))
+               (setq hidden
+                     (mapcar (lambda (text)
+                               (save-excursion
+                                 (goto-char (point-min))
+                                 (search-forward text)
+                                 (and (get-text-property (match-beginning 0) 'invisible) t)))
+                             '("Late command" "Checking."))))))
+           (groups (map-elt rendered :groups))
+           (tool-parent (map-elt groups "1-late"))
+           (thought (seq-find (lambda (entry)
+                                (string-suffix-p "agent_thought_chunk" (car entry)))
+                              groups)))
+      (should thought)
+      (should (equal hidden '(t t)))
+      (should (= 1 (seq-count (lambda (entry) (equal (car entry) "1-late")) groups)))
+      (should (equal tool-parent (cdr thought)))
+      (should (= 1 (seq-count (lambda (entry)
+                               (and (null (cdr entry))
+                                    (string-match-p "activity-" (car entry))))
+                             groups)))
+      (should (string-match-p "▶ Thought, ran a command" (map-elt rendered :text)))
+      (should-not (string-match-p "[▶▼] Activity" (map-elt rendered :text))))))
+
+(ert-deftest agent-shell-root-after-turn-thought-starts-new-run-test ()
+  "A late thought cannot append into the preceding turn's last thought."
+  (let* ((rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send end-turn _prompt)
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . "Before turn end.")))
+             (funcall end-turn)
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . "After turn end.")))
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . " Still thinking."))))))
+         (thoughts (seq-filter (lambda (entry)
+                                (string-suffix-p "agent_thought_chunk" (car entry)))
+                              (map-elt rendered :groups))))
+    (should (= 2 (length thoughts)))
+    (should (string-match-p "After turn end\\. Still thinking\\." (map-elt rendered :text)))
+    (should (seq-every-p (lambda (entry) (= 1 (cdr entry)))
+                        (map-nested-elt rendered '(:state :activity-thoughts))))
+    (should-not (equal (cdar thoughts) (cdr (cadr thoughts))))
+    (should (seq-every-p (lambda (entry) (string-prefix-p "1-activity-" (cdr entry)))
+                        thoughts))))
 
 (defun agent-shell-tests--file-text (file)
   "Return FILE's contents, or nil when it does not exist."

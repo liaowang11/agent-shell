@@ -1000,10 +1000,11 @@ ordinary streaming output stays in the normal flow."
       (should-not above-flag))))
 
 (ert-deftest agent-shell--on-notification-out-of-turn-thought-is-separate-test ()
-  "An out-of-turn thought renders above the prompt in a separate namespace."
+  "An out-of-turn thought renders above the prompt in its activity namespace."
   (let ((state (list (cons :chunked-group-count 0)
                      (cons :activity-group-count 0)
                      (cons :activity-thoughts nil)
+                     (cons :expanded-activity-group nil)
                      (cons :last-entry-type "agent_thought_chunk")
                      (cons :active-requests nil)
                      (cons :last-activity-time nil)))
@@ -1027,7 +1028,8 @@ ordinary streaming output stays in the normal flow."
                              (content (type . "text") (text . "still working"))))))
       (should (equal (plist-get captured :body) "still working"))
       (should above-flag)
-      (should (equal (plist-get captured :namespace-id) "out-of-turn")))))
+      (should-not (plist-get captured :namespace-id))
+      (should (equal (plist-get captured :group-id) "activity-1")))))
 
 (ert-deftest agent-shell--on-notification-out-of-turn-user-message-reports-anomaly-test ()
   "An out-of-turn user message reports an anomaly without inserting a prompt."
@@ -9216,13 +9218,7 @@ Drives an ACP `session/update' notification through
 `agent-shell--on-notification' and asserts the body reaching the renderer
 carries `agent-shell-thought-body', and that markdown rendered on top of
 such a body layers its own faces ahead of the base one."
-  (let ((state (list (cons :chunked-group-count 0)
-                     (cons :activity-group-count 0)
-                     ;; Pre-set so the new-thought branches (transcript
-                     ;; header, group relabel) are skipped; the test only
-                     ;; exercises content rendering.
-                     (cons :last-entry-type "agent_thought_chunk")
-                     (cons :last-activity-time nil)))
+  (let ((state (agent-shell--make-state))
         (rendered nil))
     (cl-letf (((symbol-function 'agent-shell--active-requests-p)
                (lambda (_state) t))
@@ -9231,7 +9227,9 @@ such a body layers its own faces ahead of the base one."
               ((symbol-function 'agent-shell--emit-event)
                #'ignore)
               ((symbol-function 'agent-shell--update-fragment)
-               (lambda (&rest args) (setq rendered (plist-get args :body)))))
+               (lambda (&rest args)
+                 (when (plist-get args :body)
+                   (setq rendered (plist-get args :body))))))
       (agent-shell--on-notification
        :state state
        :acp-notification '((method . "session/update")
