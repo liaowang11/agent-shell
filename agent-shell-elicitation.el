@@ -614,23 +614,50 @@ control resolves back to it either way."
 
 ;;; Rendering
 
+(defvar agent-shell-elicitation-form-map
+  (let ((map (make-sparse-keymap)))
+    (dotimes (n 9)
+      (define-key map (number-to-string (1+ n)) #'agent-shell-elicitation-pick-option))
+    ;; y as a permission dialog allows with.  Not n to decline: the
+    ;; viewport moves to the next item with n, and walking down through
+    ;; a form would decline it.
+    (define-key map "y" #'agent-shell-elicitation-submit)
+    (define-key map "d" #'agent-shell-elicitation-decline)
+    (define-key map (kbd "C-c C-c") #'agent-shell-elicitation-interrupt)
+    (define-key map [remap self-insert-command] #'ignore)
+    map)
+  "Keymap active anywhere on a pending elicitation form.
+
+Applied as a `keymap' text property over the whole form, question and
+headings included, rather than on its controls alone: a form arrives
+with point on its question, which is not a control, and answering from
+there is the point of having keys at all.  Outside the form nothing is
+shadowed.
+
+\\<agent-shell-elicitation-form-map>A digit picks that option of the question at point, or of the first
+question when point is above them all.  From anywhere in the form,
+\\[agent-shell-elicitation-submit] submits, \\[agent-shell-elicitation-decline] declines and \\[agent-shell-elicitation-interrupt] cancels.  Typing
+runs `ignore' rather than erroring, since the text is read-only.
+
+Parent of `agent-shell-elicitation-map', so rebinding a key here
+reaches the controls too.  Rebind with `define-key' rather than `setq':
+already rendered forms hold on to this keymap object.")
+
 (defvar agent-shell-elicitation-map
   (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map agent-shell-elicitation-form-map)
     (define-key map (kbd "RET") #'agent-shell-elicitation-act)
     (define-key map [mouse-1] #'agent-shell-elicitation-act)
-    (define-key map [remap self-insert-command] #'ignore)
-    (define-key map (kbd "C-c C-c") #'agent-shell-elicitation-interrupt)
     map)
   "Keymap active on an elicitation form's controls.
 
 Applied as a `keymap' text property by
 `agent-shell-elicitation--make-control', so it reaches the options,
-fields and buttons and nothing else.  Scoping the keys to that text is
-what leaves the rest of the buffer alone: RET still submits the prompt
-and typing still inserts everywhere outside a control.
+fields and buttons and nothing else.  Scoping RET to that text is what
+leaves the rest of the buffer alone: RET still submits the prompt
+everywhere outside a control.
 
-Typing on a control runs `ignore' rather than erroring, since that text
-is read-only.
+Everything else comes from its parent, `agent-shell-elicitation-form-map'.
 
 Rebind with `define-key' rather than `setq': already rendered forms hold
 on to this keymap object.")
@@ -710,6 +737,50 @@ which is the only place \\`?' should be taken over."
     (when navigable
       (put-text-property 0 1 'agent-shell-elicitation-navigable t control))
     control))
+
+(cl-defun agent-shell-elicitation--make-form-text (&key text id key)
+  "Return TEXT carrying the form keys for elicitation ID's field KEY.
+
+Wherever TEXT has no keymap of its own, `agent-shell-elicitation-form-map'
+is applied, so a control keeps its own map, which inherits from that one
+anyway.  All of TEXT records ID and KEY as
+`agent-shell-elicitation-scope', which is how a digit pressed on a
+heading or description knows which question it answers.  KEY is nil for
+text belonging to no question, such as the form's own question line."
+  (let ((text (copy-sequence text))
+        (start 0))
+    (while (< start (length text))
+      (let ((end (next-single-property-change start 'keymap text (length text))))
+        (unless (get-text-property start 'keymap text)
+          (put-text-property start end 'keymap agent-shell-elicitation-form-map text))
+        (setq start end)))
+    (add-text-properties 0 (length text)
+                         (list 'agent-shell-elicitation-scope
+                               (list (cons :id id) (cons :key key))
+                               'rear-nonsticky t)
+                         text)
+    text))
+
+(defun agent-shell-elicitation--key-label (text command)
+  "Return TEXT followed by the key running COMMAND on a form, when it has one.
+
+Read from `agent-shell-elicitation-form-map' rather than written out, so
+a rebound key is what the label names.
+
+For example, \"Submit\" with `agent-shell-elicitation-submit' returns
+\"Submit (y)\" with the default bindings."
+  (if-let* ((key (seq-find (lambda (key) (not (mouse-event-p (aref key 0))))
+                           (where-is-internal
+                            command (list agent-shell-elicitation-form-map)))))
+      (format "%s (%s)" text (key-description key))
+    text))
+
+(defun agent-shell-elicitation--number-title (number title)
+  "Return TITLE prefixed with the digit picking it, when NUMBER has one.
+Only 1 to 9 are bound, so any other NUMBER leaves TITLE alone."
+  (if (<= 1 number 9)
+      (format "%d. %s" number title)
+    title))
 
 (defun agent-shell-elicitation--box (text)
   "Return TEXT drawn as a button, matching `agent-shell--make-button'.
@@ -835,29 +906,33 @@ whatever has been typed into it.  It renders as one more option of this
 field rather than as a field of its own, and shows what was typed, since
 for that option the answer is the option."
   (append
-   (seq-map (lambda (option)
-              (agent-shell-elicitation--make-option-line
-               :id id :field field
-               :value (map-elt option :value)
-               :title (map-elt option :title)
-               :description (map-elt option :description)
-               :action (if multi 'toggle 'select)
-               :multi multi
-               :selected (if multi
-                             (and (member (map-elt option :value) value) t)
-                           (equal (map-elt option :value) value))
-               :preview (map-elt option :preview)
-               :preview-open (agent-shell-elicitation--preview-open-p
-                              elicitation (map-elt field :key) (map-elt option :value))))
-            (map-elt field :options))
+   (seq-map-indexed
+    (lambda (option index)
+      (agent-shell-elicitation--make-option-line
+       :id id :field field
+       :value (map-elt option :value)
+       :title (agent-shell-elicitation--number-title
+               (1+ index) (map-elt option :title))
+       :description (map-elt option :description)
+       :action (if multi 'toggle 'select)
+       :multi multi
+       :selected (if multi
+                     (and (member (map-elt option :value) value) t)
+                   (equal (map-elt option :value) value))
+       :preview (map-elt option :preview)
+       :preview-open (agent-shell-elicitation--preview-open-p
+                      elicitation (map-elt field :key) (map-elt option :value))))
+    (map-elt field :options))
    (when custom
      (list (agent-shell-elicitation--make-option-line
             :id id :field custom
-            :title (if custom-value
-                       (format "%s: %s"
-                               (agent-shell-elicitation--field-heading custom)
-                               custom-value)
-                     (agent-shell-elicitation--field-heading custom))
+            :title (agent-shell-elicitation--number-title
+                    (1+ (length (map-elt field :options)))
+                    (if custom-value
+                        (format "%s: %s"
+                                (agent-shell-elicitation--field-heading custom)
+                                custom-value)
+                      (agent-shell-elicitation--field-heading custom)))
             :description (map-elt custom :description)
             :action 'custom
             :multi multi
@@ -880,8 +955,8 @@ For example, a single-select renders as:
 
     Colour
     Pick one.
-    (*) Red
-    ( ) Blue"
+    (*) 1. Red
+    ( ) 2. Blue"
   (let ((heading (agent-shell-elicitation--field-heading field))
         (description (map-elt field :description)))
     (string-join
@@ -975,12 +1050,16 @@ missing field rather than sending an invalid response."
              agent-shell-elicitation--indent
              (unless unanswerable
                (concat (agent-shell-elicitation--make-control
-                        :text (agent-shell-elicitation--box "Submit")
+                        :text (agent-shell-elicitation--box
+                               (agent-shell-elicitation--key-label
+                                "Submit" #'agent-shell-elicitation-submit))
                         :id (map-elt elicitation :id) :action 'submit
                         :hint "submit this form")
                        " "))
              (agent-shell-elicitation--make-control
-              :text (agent-shell-elicitation--box "Decline")
+              :text (agent-shell-elicitation--box
+                     (agent-shell-elicitation--key-label
+                      "Decline" #'agent-shell-elicitation-decline))
               :id (map-elt elicitation :id) :action 'decline
               :hint "decline this form"))))
      "\n\n")))
@@ -1018,17 +1097,23 @@ settled form stays on screen showing what was sent."
   "Return ELICITATION's questions, one rendered block each.
 
 Companions are left out: each renders inside the select it belongs to,
-so walking both would render one question twice."
+so walking both would render one question twice.
+
+Each block carries the form keys scoped to its question, so a digit
+pressed on its heading picks from its options."
   (seq-map (lambda (field)
-             (agent-shell-elicitation--make-field-text
+             (agent-shell-elicitation--make-form-text
+              :text (agent-shell-elicitation--make-field-text
+                     :id (map-elt elicitation :id)
+                     :field field
+                     :value (map-nested-elt elicitation (list :values (map-elt field :key)))
+                     :custom (agent-shell-elicitation--field
+                              elicitation (map-elt field :custom-key))
+                     :custom-value (map-nested-elt
+                                    elicitation (list :values (map-elt field :custom-key)))
+                     :elicitation elicitation)
               :id (map-elt elicitation :id)
-              :field field
-              :value (map-nested-elt elicitation (list :values (map-elt field :key)))
-              :custom (agent-shell-elicitation--field
-                       elicitation (map-elt field :custom-key))
-              :custom-value (map-nested-elt
-                             elicitation (list :values (map-elt field :custom-key)))
-              :elicitation elicitation))
+              :key (map-elt field :key)))
            (agent-shell-elicitation--answerable (map-elt elicitation :fields))))
 
 (defun agent-shell-elicitation--mark-form-start (text)
@@ -1064,20 +1149,29 @@ For example:
        Which approach should I take?
 
        Approach
-       (*) Refactor first
-       ( ) Add first
+       (*) 1. Refactor first
+       ( ) 2. Add first
 
-        Submit   Decline
+        Submit (y)   Decline (d)
 
    ╰─"
-  (let* ((question (when-let* ((message (map-elt elicitation :message)))
+  (let* ((pending (eq (map-elt elicitation :status) 'pending))
+         (question (when-let* ((message (map-elt elicitation :message)))
                      (propertize (concat agent-shell-elicitation--indent message)
                                  'font-lock-face 'agent-shell-input)))
-         (sections (if (eq (map-elt elicitation :status) 'pending)
+         (sections (if pending
                        (append (agent-shell-elicitation--make-field-texts elicitation)
-                               (list (agent-shell-elicitation--make-buttons elicitation)))
+                               (list (agent-shell-elicitation--make-form-text
+                                      :text (agent-shell-elicitation--make-buttons elicitation)
+                                      :id (map-elt elicitation :id))))
                      (list (agent-shell-elicitation--make-settled-text elicitation))))
-         (body (delq nil (cons question sections))))
+         (body (delq nil (cons (if (and question pending)
+                                   ;; Where a form arrives, so its keys
+                                   ;; have to work from here.
+                                   (agent-shell-elicitation--make-form-text
+                                    :text question :id (map-elt elicitation :id))
+                                 question)
+                               sections))))
     (format "╭─
 
     %s %s %s
@@ -1462,26 +1556,26 @@ one never binds the key.  Reaching this command anyway -- through
     (with-current-buffer acted-in
       (agent-shell-elicitation--goto-control control))))
 
-(defun agent-shell-elicitation-act ()
-  "Act on the elicitation control at point.
+(defun agent-shell-elicitation--pending (state id)
+  "Return elicitation ID's entry in STATE, or signal when it is not pending."
+  (let ((elicitation (agent-shell-elicitation--get state id)))
+    (unless (and elicitation (eq (map-elt elicitation :status) 'pending))
+      (user-error "This question is no longer awaiting an answer"))
+    elicitation))
 
-Reads which elicitation, field and option the control names from its
-text properties, then mutates the authoritative entry in the variable
-`agent-shell--state' and re-renders.  Named rather than a per-control
-closure so it stays rebindable (see issue #759)."
-  (declare (modes agent-shell-mode))
-  (interactive)
-  (let ((control (agent-shell-elicitation--control-at-point))
-        (shell-buffer (agent-shell-elicitation--shell-buffer))
+(defun agent-shell-elicitation--perform (control)
+  "Do what CONTROL says, then return point to it.
+
+CONTROL names an elicitation, field, option and action, the way the
+`agent-shell-elicitation-control' property of rendered text does, so
+every command drives the form the same way whether it read CONTROL at
+point or built it from a key."
+  (let ((shell-buffer (agent-shell-elicitation--shell-buffer))
         (acted-in (current-buffer)))
-    (unless control
-      (user-error "No question control at point"))
     (with-current-buffer shell-buffer
       (let* ((state (agent-shell--state))
              (id (map-elt control :id))
-             (elicitation (agent-shell-elicitation--get state id)))
-        (unless (and elicitation (eq (map-elt elicitation :status) 'pending))
-          (user-error "This question is no longer awaiting an answer"))
+             (elicitation (agent-shell-elicitation--pending state id)))
         (pcase (map-elt control :action)
           ('select
            (agent-shell-elicitation--set-values
@@ -1519,6 +1613,106 @@ closure so it stays rebindable (see issue #759)."
            (message "Declined")))))
     (with-current-buffer acted-in
       (agent-shell-elicitation--goto-control control))))
+
+(defun agent-shell-elicitation-act ()
+  "Act on the elicitation control at point.
+
+Reads which elicitation, field and option the control names from its
+text properties, then mutates the authoritative entry in the variable
+`agent-shell--state' and re-renders.  Named rather than a per-control
+closure so it stays rebindable (see issue #759)."
+  (declare (modes agent-shell-mode))
+  (interactive)
+  (agent-shell-elicitation--perform
+   (or (agent-shell-elicitation--control-at-point)
+       (user-error "No question control at point"))))
+
+(defun agent-shell-elicitation--scope-at-point ()
+  "Return the elicitation and field the form text at point belongs to.
+The result has `:id' and `:key', and is nil outside a pending form."
+  (or (agent-shell-elicitation--control-at-point)
+      (get-text-property (point) 'agent-shell-elicitation-scope)))
+
+(defun agent-shell-elicitation--question-key (elicitation key)
+  "Return the key of the question in ELICITATION a digit at KEY picks from.
+
+That is KEY's own select, the select KEY is the free-text answer of,
+or, from anywhere else in the form, its first select.  Nil when the
+form asks no multiple-choice question at all."
+  (let ((field (agent-shell-elicitation--field elicitation key))
+        (select-p (lambda (field)
+                    (memq (map-elt field :type) '(single-select multi-select)))))
+    (cond ((map-elt field :folded-into))
+          ((funcall select-p field) key)
+          (t (map-elt (seq-find select-p (map-elt elicitation :fields)) :key)))))
+
+(defun agent-shell-elicitation--option-controls (elicitation key)
+  "Return the controls of select KEY in ELICITATION, in numbered order.
+
+One per option, then one for the free-text answer when the question has
+one, built the way `agent-shell-elicitation--make-option-line' renders
+them, so point can find the one just picked."
+  (let* ((id (map-elt elicitation :id))
+         (field (agent-shell-elicitation--field elicitation key))
+         (action (if (eq (map-elt field :type) 'multi-select) 'toggle 'select)))
+    (append
+     (seq-map (lambda (option)
+                (list (cons :id id) (cons :key key)
+                      (cons :value (map-elt option :value)) (cons :action action)))
+              (map-elt field :options))
+     (when-let* ((custom-key (map-elt field :custom-key))
+                 ((agent-shell-elicitation--field elicitation custom-key)))
+       (list (list (cons :id id) (cons :key custom-key)
+                   (cons :value nil) (cons :action 'custom)))))))
+
+(defun agent-shell-elicitation-pick-option (number)
+  "Pick option NUMBER of the question at point.
+
+Bound to the digits in `agent-shell-elicitation-form-map', which name
+the option they pick.  Point above every question, on the form's own
+question line where it arrives, picks from the first one.  In a
+multi-select, picking an option again unticks it, and the number after
+the last option is the free-text answer, when there is one.
+
+Run from a key other than a digit, NUMBER is read from the minibuffer."
+  (declare (modes agent-shell-mode))
+  (interactive (list (if (and (characterp last-command-event)
+                              (<= ?1 last-command-event ?9))
+                         (- last-command-event ?0)
+                       (read-number "Option: "))))
+  (let ((scope (or (agent-shell-elicitation--scope-at-point)
+                   (user-error "No question at point"))))
+    (agent-shell-elicitation--perform
+     (with-current-buffer (agent-shell-elicitation--shell-buffer)
+       (let* ((elicitation (agent-shell-elicitation--pending
+                            (agent-shell--state) (map-elt scope :id)))
+              (key (or (agent-shell-elicitation--question-key
+                        elicitation (map-elt scope :key))
+                       (user-error "No options to pick in this form"))))
+         (or (and (> number 0)
+                  (nth (1- number)
+                       (agent-shell-elicitation--option-controls elicitation key)))
+             (user-error "No option %d" number)))))))
+
+(defun agent-shell-elicitation--form-command (action)
+  "Run the form-wide ACTION, `submit' or `decline', for the form at point."
+  (agent-shell-elicitation--perform
+   (list (cons :id (map-elt (or (agent-shell-elicitation--scope-at-point)
+                                (user-error "No question at point"))
+                            :id))
+         (cons :key nil) (cons :value nil) (cons :action action))))
+
+(defun agent-shell-elicitation-submit ()
+  "Submit the form at point, as its Submit button does."
+  (declare (modes agent-shell-mode))
+  (interactive)
+  (agent-shell-elicitation--form-command 'submit))
+
+(defun agent-shell-elicitation-decline ()
+  "Decline the form at point, as its Decline button does."
+  (declare (modes agent-shell-mode))
+  (interactive)
+  (agent-shell-elicitation--form-command 'decline))
 
 (cl-defun agent-shell-elicitation--submit (&key state id)
   "Submit elicitation ID in STATE, or say why it cannot be submitted."
