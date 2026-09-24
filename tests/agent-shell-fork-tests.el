@@ -181,5 +181,53 @@ FROM-VIEWPORT, so `agent-shell--fork-shell-buffer' falls back to
                        :type 'user-error))
       (kill-buffer shell-buffer))))
 
+(cl-defun agent-shell-tests--fork-request-meta (&key session-meta message-id)
+  "Return the `_meta' `agent-shell--initiate-session-fork-by-id' sends.
+
+SESSION-META is the agent config's `:session-meta'.  MESSAGE-ID, when
+given, is the fork point."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                (list (cons :agent-config (list (cons :session-meta session-meta)))))
+    (let ((request nil))
+      (cl-letf (((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                 #'ignore)
+                ((symbol-function 'agent-shell--mcp-servers) #'ignore)
+                ((symbol-function 'agent-shell--send-request)
+                 (lambda (&rest args) (setq request (plist-get args :request)))))
+        (agent-shell--initiate-session-fork-by-id :session-id "session-1"
+                                                  :message-id message-id))
+      (map-nested-elt request '(:params _meta)))))
+
+(ert-deftest agent-shell-fork-request-asks-for-a-title-of-its-own-test ()
+  "A fork asks the agent to title it after its own turns.
+
+Otherwise claude-agent-acp names every fork after its parent, which says
+where the conversation came from rather than what it went on to be about.
+Forking at a message asks the same, next to the fork point."
+  (should (eq (map-elt (agent-shell-tests--fork-request-meta)
+                       'generateSessionTitle)
+              t))
+  (let ((meta (agent-shell-tests--fork-request-meta
+               :session-meta '((claudeCode . ((options . nil))))
+               :message-id "msg-1")))
+    (should (eq (map-elt meta 'generateSessionTitle) t))
+    (should (equal (map-nested-elt meta '(jetbrains air fork messageId)) "msg-1"))
+    (should (assq 'claudeCode meta))))
+
+(ert-deftest agent-shell-fork-request-does-not-repeat-a-configured-title-request-test ()
+  "A config that already asks for a generated title is not asked twice.
+
+agent-shell-side puts `generateSessionTitle' in the config's
+`:session-meta' itself, and a repeated key in `_meta' serializes twice."
+  (let ((meta (agent-shell-tests--fork-request-meta
+               :session-meta '((generateSessionTitle . t)
+                               (sessionTitle . "Side question")))))
+    (should (= (seq-count (lambda (entry) (eq (car entry) 'generateSessionTitle))
+                          meta)
+               1))
+    (should (equal (map-elt meta 'sessionTitle) "Side question"))))
+
 (provide 'agent-shell-fork-tests)
 ;;; agent-shell-fork-tests.el ends here

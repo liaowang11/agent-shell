@@ -9700,6 +9700,22 @@ shape is `_meta.jetbrains.air.fork = {version: 1, messageId: MESSAGE-ID}'."
                                       (list (cons 'version 1)
                                             (cons 'messageId message-id)))))))))
 
+(defun agent-shell--fork-request-meta (session-meta message-id)
+  "Return the `_meta' for a `session/fork' request.
+
+SESSION-META is the agent config's `:session-meta'.  MESSAGE-ID, when
+non-nil, adds the fork point; see `agent-shell--fork-message-meta'.
+
+Also asks the agent to title the fork after its own turns once it has
+taken one: left alone, claude-agent-acp names a fork after its parent,
+which says where it came from rather than what it went on to be about.
+The key is only sent when SESSION-META lacks it, so a config that already
+sets it is not repeated.  Agents that do not know it ignore it."
+  (append session-meta
+          (unless (assq 'generateSessionTitle session-meta)
+            (list (cons 'generateSessionTitle t)))
+          (when message-id (agent-shell--fork-message-meta message-id))))
+
 (cl-defun agent-shell--initiate-session-fork-by-id (&key session-id message-id shell-buffer
                                                          on-session-init)
   "Fork session SESSION-ID with SHELL-BUFFER and ON-SESSION-INIT.
@@ -9717,8 +9733,9 @@ session's latest turn; see `agent-shell--fork-message-meta'."
              :session-id session-id
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
-             :meta (append (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
-                           (when message-id (agent-shell--fork-message-meta message-id))))
+             :meta (agent-shell--fork-request-meta
+                    (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
+                    message-id))
    :buffer (current-buffer)
    :on-success (lambda (acp-fork-response)
                  (let ((new-session-id (map-elt acp-fork-response 'sessionId)))
