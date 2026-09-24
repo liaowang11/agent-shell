@@ -210,8 +210,8 @@ answered alongside the first in contradictory ways."
     (let ((body (substring-no-properties (car bodies))))
       ;; One question, one list, with the free-text answer among the options.
       (should (string-match-p "Colour" body))
-      (should (string-match-p "( ) Red" body))
-      (should (string-match-p "( ) Other" body))
+      (should (string-match-p "( ) 1\\. Red" body))
+      (should (string-match-p "( ) 3\\. Other" body))
       ;; Not also standing alone as a `Other: (empty)' text field.
       (should-not (string-match-p "Other: (empty)" body)))))
 
@@ -231,13 +231,13 @@ They are alternatives, so exactly one of them is ever sent."
       (set-to "question_0" "Red")
       (should (equal (map-elt (agent-shell-elicitation--get state 5) :values)
                      '(("question_0" . "Red"))))
-      (should (string-match-p "(\\*) Red" (substring-no-properties (car bodies))))
+      (should (string-match-p "(\\*) 1\\. Red" (substring-no-properties (car bodies))))
       (set-to "question_0_custom" "teal, actually")
       (should (equal (map-elt (agent-shell-elicitation--get state 5) :values)
                      '(("question_0_custom" . "teal, actually"))))
       (let ((body (substring-no-properties (car bodies))))
-        (should (string-match-p "( ) Red" body))
-        (should (string-match-p "(\\*) Other: teal, actually" body)))
+        (should (string-match-p "( ) 1\\. Red" body))
+        (should (string-match-p "(\\*) 3\\. Other: teal, actually" body)))
       (set-to "question_0" "Blue")
       (should (equal (map-elt (agent-shell-elicitation--get state 5) :values)
                      '(("question_0" . "Blue")))))))
@@ -268,10 +268,10 @@ companion folds in as one more checkbox rather than a field of its own."
      :acp-request (agent-shell-elicitation-tests--request
                    :id 5 :schema agent-shell-elicitation-tests--multi-ask-schema))
     (let ((body (substring-no-properties (car bodies))))
-      (should (string-match-p "\\[ \\] Red" body))
-      (should (string-match-p "\\[ \\] Green" body))
+      (should (string-match-p "\\[ \\] 1\\. Red" body))
+      (should (string-match-p "\\[ \\] 3\\. Green" body))
       ;; A checkbox, not a radio button, and not standing alone.
-      (should (string-match-p "\\[ \\] Other" body))
+      (should (string-match-p "\\[ \\] 4\\. Other" body))
       (should-not (string-match-p "Other: (empty)" body)))
     (cl-flet ((set-to (key value)
                 (agent-shell-elicitation--set-values
@@ -287,9 +287,9 @@ companion folds in as one more checkbox rather than a field of its own."
                                    '(:values "question_0_custom"))
                    "teal"))
     (let ((body (substring-no-properties (car bodies))))
-      (should (string-match-p "\\[x\\] Red" body))
-      (should (string-match-p "\\[x\\] Blue" body))
-      (should (string-match-p "\\[x\\] Other: teal" body)))))
+      (should (string-match-p "\\[x\\] 1\\. Red" body))
+      (should (string-match-p "\\[x\\] 2\\. Blue" body))
+      (should (string-match-p "\\[x\\] 4\\. Other: teal" body)))))
 
 (ert-deftest agent-shell-elicitation-multi-select-wire-encoding-test ()
   "Ticks alone travel as an array; ticks plus typed text as one string.
@@ -466,8 +466,8 @@ queue steers a prompt into a turn that is sitting on a question."
       (should (eq (agent-shell-status) 'blocked)))
     (let ((body (substring-no-properties (car bodies))))
       (should (string-match-p "Pick one" body))
-      (should (string-match-p "( ) Apple" body))
-      (should (string-match-p "( ) Banana" body))
+      (should (string-match-p "( ) 1\\. Apple" body))
+      (should (string-match-p "( ) 2\\. Banana" body))
       (should (string-match-p "Submit" body))
       (should (string-match-p "Decline" body)))
     ;; Tracked as active so out-of-turn gating treats it as in-turn content.
@@ -486,7 +486,7 @@ queue steers a prompt into a turn that is sitting on a question."
                              (properties . ((pick . ((type . "string")
                                                      (oneOf . [((const . "a") (title . "Apple"))]))))))))
     (agent-shell-elicitation--set-value state 5 "pick" "a")
-    (should (string-match-p "(\\*) Apple" (substring-no-properties (car bodies))))
+    (should (string-match-p "(\\*) 1\\. Apple" (substring-no-properties (car bodies))))
     (agent-shell-elicitation--submit :state state :id 5)
     (should (equal (seq-first sent)
                    '((:request-id . 5)
@@ -1071,7 +1071,7 @@ them and a keyboard user would have to walk back up by line."
       (should (agent-shell-elicitation-next-field))
       (should (equal (buffer-substring-no-properties
                       (point) (line-end-position))
-                     "( ) Refactor first"))))
+                     "( ) 1. Refactor first"))))
 
   ;; With no message of its own, the form lands on its first heading
   ;; instead -- a questionnaire whose question is already the tool
@@ -1114,6 +1114,219 @@ so the same control still matches once its value has changed."
       ;; A control that is gone (a settled form) leaves point alone.
       (should-not (agent-shell-elicitation--goto-control
                    (map-insert control :value "gone"))))))
+
+
+;;; Shortcut keys
+
+(cl-defmacro agent-shell-elicitation-tests--with-rendered-form ((state-var sent-var schema
+                                                                    &key (message "Pick one"))
+                                                                   &rest body)
+  "Render a form for SCHEMA into a displayed buffer and run BODY there.
+
+STATE-VAR holds the fake state and SENT-VAR every response sent.  The
+form arrives with MESSAGE as its question, preceded by a line of plain
+transcript text, and point lands where a real arrival puts it.
+
+The buffer is displayed rather than temporary: key dispatch goes
+through the selected window, so keys pressed at a buffer nobody is
+showing resolve against something else entirely."
+  (declare (indent 1) (debug t))
+  `(let ((agent-shell-elicitation--experimental-feature-enabled t)
+         (buffer (generate-new-buffer "*agent-shell-elicitation-shortcut-test*"))
+         (,sent-var nil))
+     (unwind-protect
+         (progn
+           (switch-to-buffer buffer)
+           (let ((,state-var (list (cons :buffer buffer)
+                                   (cons :client 'test-client)
+                                   (cons :tool-calls nil)
+                                   (cons :elicitations nil)
+                                   (cons :active-requests nil)
+                                   (cons :event-subscriptions nil)
+                                   (cons :idle-timer nil)
+                                   (cons :last-entry-type nil))))
+             (cl-letf (((symbol-function 'agent-shell--state)
+                        (lambda () ,state-var))
+                       ((symbol-function 'agent-shell--update-fragment)
+                        (lambda (&rest args)
+                          (let ((inhibit-read-only t))
+                            (erase-buffer)
+                            (insert "transcript\n")
+                            (insert (plist-get args :body)))))
+                       ((symbol-function 'agent-shell-viewport--buffer)
+                        (lambda (&rest _) nil))
+                       ((symbol-function 'agent-shell--append-transcript)
+                        (lambda (&rest _)))
+                       ((symbol-function 'acp-send-response)
+                        (lambda (&rest args) (push (plist-get args :response) ,sent-var))))
+               (agent-shell--on-request
+                :state ,state-var
+                :acp-request (agent-shell-elicitation-tests--request
+                              :id 5 :message ,message :schema ,schema))
+               ,@body)))
+       (kill-buffer buffer))))
+
+(defun agent-shell-elicitation-tests--goto-line-text (text)
+  "Move point to the start of the line reading TEXT, trimmed."
+  (goto-char (point-min))
+  (should (re-search-forward (concat "^ *" (regexp-quote text) "$") nil t))
+  (goto-char (line-beginning-position)))
+
+(defconst agent-shell-elicitation-tests--two-question-schema
+  '((type . "object")
+    (properties
+     (colour (type . "string") (title . "Colour")
+             (oneOf . [((const . "red") (title . "Red"))
+                       ((const . "blue") (title . "Blue"))]))
+     (size (type . "string") (title . "Size")
+           (description . "How big.")
+           (enum . ["small" "large"]))))
+  "Two single-select questions, the second with a description.")
+
+(ert-deftest agent-shell-elicitation-numbers-options-for-their-keys-test ()
+  "Each question numbers its own options, and the buttons name their keys.
+
+The numbers restart per question, since a digit picks from the question
+at point, and the free-text answer takes the next number after the
+options it stands in for."
+  (agent-shell-elicitation-tests--with-shell (state sent bodies)
+    (agent-shell--on-request
+     :state state
+     :acp-request (agent-shell-elicitation-tests--request
+                   :id 5 :schema agent-shell-elicitation-tests--ask-schema))
+    (let ((body (substring-no-properties (car bodies))))
+      (should (string-match-p "( ) 1\\. Red" body))
+      (should (string-match-p "( ) 2\\. Blue" body))
+      (should (string-match-p "( ) 3\\. Other" body))
+      (should (string-match-p "Submit (y)" body))
+      (should (string-match-p "Decline (d)" body))))
+  (agent-shell-elicitation-tests--with-shell (state sent bodies)
+    (agent-shell--on-request
+     :state state
+     :acp-request (agent-shell-elicitation-tests--request
+                   :id 6 :schema agent-shell-elicitation-tests--two-question-schema))
+    (let ((body (substring-no-properties (car bodies))))
+      (should (string-match-p "( ) 1\\. Red" body))
+      (should (string-match-p "( ) 1\\. small" body))
+      (should (string-match-p "( ) 2\\. large" body)))))
+
+(ert-deftest agent-shell-elicitation-numbers-only-what-a-digit-reaches-test ()
+  "Options past the ninth render without a number, since no key picks them."
+  (agent-shell-elicitation-tests--with-shell (state sent bodies)
+    (agent-shell--on-request
+     :state state
+     :acp-request (agent-shell-elicitation-tests--request
+                   :id 5 :schema `((type . "object")
+                                   (properties
+                                    (pick (type . "string")
+                                          (enum . ,(vconcat
+                                                    (mapcar (lambda (n) (format "opt%d" n))
+                                                            (number-sequence 1 10)))))))))
+    (let ((body (substring-no-properties (car bodies))))
+      (should (string-match-p "( ) 9\\. opt9" body))
+      (should (string-match-p "( ) opt10" body)))))
+
+(ert-deftest agent-shell-elicitation-keys-answer-from-where-the-form-lands-test ()
+  "A digit, y and n work from the question line a form arrives on.
+
+That line is not a control, so keys bound on controls alone would do
+nothing until the user first moved onto an option."
+  (agent-shell-elicitation-tests--with-rendered-form
+      (state sent agent-shell-elicitation-tests--ask-schema)
+    (should (equal (buffer-substring-no-properties (point) (line-end-position))
+                   "    Pick one"))
+    (execute-kbd-macro "2")
+    (should (equal (map-elt (agent-shell-elicitation--get state 5) :values)
+                   '(("question_0" . "Blue"))))
+    ;; Point follows the pick, as it does for RET.
+    (should (equal (buffer-substring-no-properties (point) (line-end-position))
+                   "(*) 2. Blue"))
+    ;; The free-text answer's number opens the minibuffer.
+    (execute-kbd-macro (vconcat "3" (string-to-vector "teal") (kbd "RET")))
+    (should (equal (map-elt (agent-shell-elicitation--get state 5) :values)
+                   '(("question_0_custom" . "teal"))))
+    (execute-kbd-macro "y")
+    (should (equal (map-nested-elt (seq-first sent) '(:result content))
+                   '((question_0_custom . "teal"))))))
+
+(ert-deftest agent-shell-elicitation-d-declines-and-c-c-c-c-cancels-test ()
+  "d declines the form and C-c C-c still reaches the interrupt from anywhere in it."
+  (agent-shell-elicitation-tests--with-rendered-form
+      (state sent agent-shell-elicitation-tests--ask-schema)
+    (should (eq (key-binding (kbd "C-c C-c")) #'agent-shell-elicitation-interrupt))
+    (agent-shell-elicitation-tests--goto-line-text "Colour")
+    (should (eq (key-binding (kbd "C-c C-c")) #'agent-shell-elicitation-interrupt))
+    (execute-kbd-macro "d")
+    (should (equal (seq-first sent)
+                   '((:request-id . 5) (:result . ((action . "decline"))))))))
+
+(ert-deftest agent-shell-elicitation-y-reports-a-missing-answer-test ()
+  "y goes through the same required-field gate as the Submit button."
+  (agent-shell-elicitation-tests--with-rendered-form
+      (state sent '((type . "object")
+                    (properties (pick (type . "string") (title . "Pick")
+                                      (enum . ["a" "b"])))
+                    (required . ["pick"])))
+    (should-error (execute-kbd-macro "y") :type 'user-error)
+    (should-not sent)))
+
+(ert-deftest agent-shell-elicitation-digit-picks-from-the-question-at-point-test ()
+  "A digit answers the question point is in, and the first one from above them."
+  (agent-shell-elicitation-tests--with-rendered-form
+      (state sent agent-shell-elicitation-tests--two-question-schema)
+    ;; From the second question's heading, its description, and its options.
+    (agent-shell-elicitation-tests--goto-line-text "Size")
+    (execute-kbd-macro "2")
+    (should (equal (map-nested-elt (agent-shell-elicitation--get state 5) '(:values "size"))
+                   "large"))
+    (agent-shell-elicitation-tests--goto-line-text "How big.")
+    (execute-kbd-macro "1")
+    (should (equal (map-nested-elt (agent-shell-elicitation--get state 5) '(:values "size"))
+                   "small"))
+    ;; From the question line, the first question.
+    (agent-shell-elicitation-tests--goto-line-text "Pick one")
+    (execute-kbd-macro "2")
+    (should (equal (map-nested-elt (agent-shell-elicitation--get state 5) '(:values "colour"))
+                   "blue"))
+    ;; A number the question does not offer.
+    (should-error (execute-kbd-macro "3") :type 'user-error)))
+
+(ert-deftest agent-shell-elicitation-digit-toggles-a-multi-select-test ()
+  "In a multi-select a digit ticks its option, and pressing it again unticks it."
+  (agent-shell-elicitation-tests--with-rendered-form
+      (state sent '((type . "object")
+                    (properties (tags (type . "array") (title . "Tags")
+                                      (items (type . "string")
+                                             (enum . ["x" "y" "z"]))))))
+    (execute-kbd-macro "3")
+    (execute-kbd-macro "1")
+    (should (equal (map-nested-elt (agent-shell-elicitation--get state 5) '(:values "tags"))
+                   '("z" "x")))
+    (execute-kbd-macro "3")
+    (should (equal (map-nested-elt (agent-shell-elicitation--get state 5) '(:values "tags"))
+                   '("x")))))
+
+(ert-deftest agent-shell-elicitation-keys-stay-inside-the-form-test ()
+  "Outside the form the shortcut keys insert as usual."
+  (agent-shell-elicitation-tests--with-rendered-form
+      (state sent agent-shell-elicitation-tests--ask-schema)
+    (goto-char (point-min))
+    (dolist (key '("1" "y" "d"))
+      (should (eq (key-binding key) #'self-insert-command)))))
+
+(ert-deftest agent-shell-elicitation-leaves-the-viewport-n-alone-test ()
+  "On a form, n still runs whatever the buffer binds it to.
+
+The viewport moves to the next item with n, so a form taking it over
+would decline itself under someone walking down through it."
+  (agent-shell-elicitation-tests--with-rendered-form
+      (state sent agent-shell-elicitation-tests--ask-schema)
+    (let ((map (make-sparse-keymap)))
+      (define-key map "n" #'agent-shell-viewport-next-item)
+      (use-local-map map)
+      (should (eq (key-binding "n") #'agent-shell-viewport-next-item))
+      (agent-shell-elicitation-tests--goto-line-text "( ) 1. Red")
+      (should (eq (key-binding "n") #'agent-shell-viewport-next-item)))))
 
 (provide 'agent-shell-elicitation-tests)
 
