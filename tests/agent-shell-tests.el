@@ -10851,6 +10851,108 @@ shell is left working in a directory that was just deleted."
       (when (file-directory-p temp-dir)
         (delete-directory temp-dir t)))))
 
+(ert-deftest agent-shell-clean-up-survives-buffer-switch-during-kill ()
+  "Killing a shell must survive its viewport changing the current buffer.
+
+Closing a selected viewport can make another window's buffer current.
+Cleanup must still finish after that nested `kill-buffer' returns."
+  (let* ((shell-buffer (generate-new-buffer " *agent-shell-cleanup-test*"))
+         (viewport-buffer
+          (generate-new-buffer
+           (concat (buffer-name shell-buffer) agent-shell-viewport--suffix)))
+         (outside-buffer (generate-new-buffer " *agent-shell-cleanup-outside*"))
+         (pending-dir (make-temp-file "agent-shell-cleanup-" t))
+         (delete-by-moving-to-trash nil)
+         (real-kill-buffer (symbol-function 'kill-buffer))
+         (real-state (symbol-function 'agent-shell--state))
+         (viewport-killed nil)
+         (outside-state-call nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer outside-buffer
+            (setq major-mode 'magit-status-mode))
+          (with-current-buffer shell-buffer
+            (setq major-mode 'agent-shell-mode)
+            (setq-local agent-shell--state
+                        (agent-shell--make-state :buffer shell-buffer))
+            (setq-local agent-shell--pending-directory-cleanup pending-dir)
+            (add-hook 'kill-buffer-hook #'agent-shell--clean-up nil t))
+          (cl-letf (((symbol-function 'kill-buffer)
+                     (lambda (&optional buffer-or-name)
+                       (let* ((buffer (get-buffer
+                                       (or buffer-or-name (current-buffer))))
+                              (result (funcall real-kill-buffer buffer-or-name)))
+                         (when (eq buffer viewport-buffer)
+                           (setq viewport-killed t)
+                           (set-buffer outside-buffer))
+                         result)))
+                    ((symbol-function 'agent-shell--state)
+                     (lambda ()
+                       (when (eq major-mode 'magit-status-mode)
+                         (setq outside-state-call t))
+                       (funcall real-state))))
+            (kill-buffer shell-buffer))
+          (should viewport-killed)
+          (should-not outside-state-call)
+          (should-not (buffer-live-p viewport-buffer))
+          (should-not (buffer-live-p shell-buffer))
+          (should-not (file-directory-p pending-dir)))
+      (when (buffer-live-p shell-buffer)
+        (with-current-buffer shell-buffer
+          (remove-hook 'kill-buffer-hook #'agent-shell--clean-up t))
+        (funcall real-kill-buffer shell-buffer))
+      (when (buffer-live-p viewport-buffer)
+        (funcall real-kill-buffer viewport-buffer))
+      (when (buffer-live-p outside-buffer)
+        (funcall real-kill-buffer outside-buffer))
+      (when (file-directory-p pending-dir)
+        (delete-directory pending-dir t)))))
+
+(ert-deftest agent-shell-clean-up-keeps-shell-buffer-current-test ()
+  "Cleanup must hand `kill-buffer-hook' back with the shell still current.
+
+Killing a viewport shown in a selected, dedicated window deletes that
+window and makes the next window's buffer current.  `kill-buffer' only
+restores the buffer once every hook has run, so hooks after cleanup would
+otherwise act on that other buffer."
+  (let* ((shell-buffer (generate-new-buffer " *agent-shell-cleanup-test*"))
+         (viewport-buffer
+          (generate-new-buffer
+           (concat (buffer-name shell-buffer) agent-shell-viewport--suffix)))
+         (outside-buffer (generate-new-buffer " *agent-shell-cleanup-outside*"))
+         (later-hook-buffer nil)
+         ;; Also runs for the nested viewport kill, so the last call,
+         ;; the shell's own, is the one kept.
+         (later-hook (lambda ()
+                       (setq later-hook-buffer (current-buffer)))))
+    (save-window-excursion
+      (unwind-protect
+          (progn
+            (delete-other-windows)
+            (set-window-buffer (selected-window) outside-buffer)
+            (let ((viewport-window (split-window)))
+              (set-window-buffer viewport-window viewport-buffer)
+              (set-window-dedicated-p viewport-window t)
+              (select-window viewport-window))
+            (with-current-buffer shell-buffer
+              (setq major-mode 'agent-shell-mode)
+              (setq-local agent-shell--state
+                          (agent-shell--make-state :buffer shell-buffer))
+              (add-hook 'kill-buffer-hook #'agent-shell--clean-up nil t))
+            (add-hook 'kill-buffer-hook later-hook)
+            (kill-buffer shell-buffer)
+            (should-not (buffer-live-p viewport-buffer))
+            (should (eq later-hook-buffer shell-buffer)))
+        (remove-hook 'kill-buffer-hook later-hook)
+        (when (buffer-live-p shell-buffer)
+          (with-current-buffer shell-buffer
+            (remove-hook 'kill-buffer-hook #'agent-shell--clean-up t))
+          (kill-buffer shell-buffer))
+        (when (buffer-live-p viewport-buffer)
+          (kill-buffer viewport-buffer))
+        (when (buffer-live-p outside-buffer)
+          (kill-buffer outside-buffer))))))
+
 ;;; Tests for shell locations
 
 (defmacro agent-shell-tests--capturing-new-shell (dir-var buffer-var &rest body)

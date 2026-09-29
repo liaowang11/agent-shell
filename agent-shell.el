@@ -5227,30 +5227,36 @@ side)."
 
 For example, shut down ACP client."
   (when (derived-mode-p 'agent-shell-mode)
-    (agent-shell--cancel-idle-timer)
-    (agent-shell--emit-event :event 'clean-up)
-    (agent-shell--shutdown)
-    ;; Kill any open diff buffers associated with tool calls.
-    (map-do (lambda (_tool-call-id tool-call-data)
-              (when-let* ((diff-buf (map-elt tool-call-data :diff-buffer)))
-                (agent-shell-diff-kill-buffer diff-buf)))
-            (map-elt (agent-shell--state) :tool-calls))
-    (when-let* (((map-elt (agent-shell--state) :buffer))
-                (viewport-buffer (agent-shell-viewport--buffer
-                                  :shell-buffer (map-elt (agent-shell--state) :buffer)
-                                  :existing-only t))
-                (buffer-live-p viewport-buffer))
-      (kill-buffer viewport-buffer))
-    (agent-shell-subagents--kill-buffers (agent-shell--state))
-    ;; Last, so the agent is gone before its working directory can be.
-    ;;
-    ;; Errors are demoted because this runs from `kill-buffer-hook', where
-    ;; an error aborts the kill.  A shell whose directory lives on a host
-    ;; that went away would leave a buffer that can't be killed.
-    (with-demoted-errors "Failed to delete shell directory: %S"
-      (when (and agent-shell--pending-directory-cleanup
-                 (file-directory-p agent-shell--pending-directory-cleanup))
-        (delete-directory agent-shell--pending-directory-cleanup t t)))))
+    ;; Killing a viewport or subagent buffer shown in a selected, dedicated
+    ;; window makes another window's buffer current.  Restore the shell so
+    ;; the hooks run after this one act on it, not on that buffer.
+    (save-current-buffer
+      (let ((state (agent-shell--state))
+            (pending-directory-cleanup agent-shell--pending-directory-cleanup))
+        (agent-shell--cancel-idle-timer)
+        (agent-shell--emit-event :event 'clean-up)
+        (agent-shell--shutdown)
+        ;; Kill any open diff buffers associated with tool calls.
+        (map-do (lambda (_tool-call-id tool-call-data)
+                  (when-let* ((diff-buf (map-elt tool-call-data :diff-buffer)))
+                    (agent-shell-diff-kill-buffer diff-buf)))
+                (map-elt state :tool-calls))
+        (when-let* ((shell-buffer (map-elt state :buffer))
+                    (viewport-buffer (agent-shell-viewport--buffer
+                                      :shell-buffer shell-buffer
+                                      :existing-only t))
+                    ((buffer-live-p viewport-buffer)))
+          (kill-buffer viewport-buffer))
+        (agent-shell-subagents--kill-buffers state)
+        ;; Last, so the agent is gone before its working directory can be.
+        ;;
+        ;; Errors are demoted because this runs from `kill-buffer-hook', where
+        ;; an error aborts the kill.  A shell whose directory lives on a host
+        ;; that went away would leave a buffer that can't be killed.
+        (with-demoted-errors "Failed to delete shell directory: %S"
+          (when (and pending-directory-cleanup
+                     (file-directory-p pending-directory-cleanup))
+            (delete-directory pending-directory-cleanup t t)))))))
 
 (defun agent-shell--shutdown ()
   "Shut down shell activity."
