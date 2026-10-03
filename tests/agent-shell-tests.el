@@ -1874,6 +1874,51 @@ them again: the question already did."
         (should (eq processed answer))
         (should (equal displayed (unless answer '(:skip-summary t))))))))
 
+(ert-deftest agent-shell--send-command-cancel-skips-question-while-paused-test ()
+  "Test a cancelled turn does not ask to continue a paused queue.
+
+A paused queue sends nothing (see `agent-shell--prompt-queue-paused-p'),
+so answering yes would do nothing.  Show the queue's commands instead."
+  (let ((captured-on-success nil)
+        (processed nil)
+        (displayed nil)
+        (asked nil)
+        (agent-shell--state (list (cons :buffer (current-buffer))
+                                  (cons :event-subscriptions nil)
+                                  (cons :client 'test-client)
+                                  (cons :session (list (cons :id "test-session") (cons :title nil)))
+                                  (cons :last-entry-type nil)
+                                  (cons :tool-calls nil)
+                                  (cons :pending-prompts (list "sorted by size"))
+                                  (cons :prompt-queue-paused 'steering)
+                                  (cons :usage (list (cons :total-tokens 0)))
+                                  (cons :idle-timer nil)))
+        (agent-shell-show-busy-indicator nil)
+        (agent-shell-show-usage-at-turn-end nil))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (setq captured-on-success (plist-get args :on-success))))
+              ((symbol-function 'agent-shell--finish-output)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _)))
+              ((symbol-function 'agent-shell--prompt-queue-display)
+               (lambda (&rest args) (setq displayed (or args t))))
+              ((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (setq asked t)))
+              ((symbol-function 'agent-shell--prompt-queue-process-next)
+               (lambda (&rest _) (setq processed t))))
+      (agent-shell--send-command
+       :prompt "Hello"
+       :shell-buffer (current-buffer))
+      (should captured-on-success)
+      (funcall captured-on-success '((stopReason . "cancelled")))
+      (should-not asked)
+      (should-not processed)
+      (should (eq displayed t)))))
+
 (ert-deftest agent-shell--send-command-emits-input-submitted-with-prompt-test ()
   "Test `input-submitted' carries the expanded prompt text."
   (let ((received-events nil)

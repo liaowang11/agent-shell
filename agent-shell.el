@@ -10704,6 +10704,10 @@ reads the buffer's prompt capabilities."
                        (agent-shell--prompt-queue-display))
                       ;; Cancelled with nothing queued: nothing to ask.
                       ((not (map-elt (agent-shell--state) :pending-prompts)))
+                      ;; A paused queue sends nothing, so a yes would be
+                      ;; ignored.  Show how to resume it instead.
+                      ((agent-shell--prompt-queue-paused-p)
+                       (agent-shell--prompt-queue-display))
                       ((y-or-n-p (format "%s
 
 Continue?" (agent-shell--prompt-queue-summary)))
