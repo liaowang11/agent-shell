@@ -5848,7 +5848,14 @@ A terminal state retires it.
         (agent-shell--update-native-subagent
          state subagent-session-id (list (cons :ended-at (current-time))))
         (agent-shell--log-subagent-state state subagent-session-id subagent-state)
-        (agent-shell--retire-subagent state subagent-session-id))
+        (agent-shell--retire-subagent state subagent-session-id)
+        ;; Nothing more streams into its buffer, so markup held back for
+        ;; a following chunk (a trailing image or list item) can render
+        ;; now.  The root's turn ending only does this for its own buffer.
+        (when-let* ((buffer (agent-shell-subagents--buffer
+                             :state state :session-id subagent-session-id)))
+          (with-current-buffer buffer
+            (agent-shell--render-deferred-markup))))
       (agent-shell--render-subagent-row state subagent-session-id))))
 
 (defun agent-shell--subagent-row-at (state subagent-session-id)

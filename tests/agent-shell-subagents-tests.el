@@ -935,6 +935,29 @@ merge only the fields they carry, and a terminal state retires it."
     (should (member "1-C1" (map-elt (agent-shell-tests--subagent-report rendered "child")
                                     :blocks)))))
 
+(ert-deftest agent-shell-subagent-finishing-renders-held-back-markup-test ()
+  "A subagent's last list item renders once the subagent finishes.
+
+Streaming holds back a list item whose newline has not arrived, as more
+of its line may still come.  The root's turn ending releases its own
+buffer's held-back markup, but a subagent finishes on its own clock, in
+its own buffer, so finishing has to release that buffer's."
+  (let* ((agent-shell-markdown-list-bullets '("•"))
+         (rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (funcall send "root" '(sessionUpdate . "subagent_update")
+                               '(subagentSessionId . "child") '(name . "Researcher")
+                               '(task . "Find prior art") '(state . "running"))
+                      (funcall send "child" '(sessionUpdate . "agent_message_chunk")
+                               '(messageId . "m-child")
+                               '(content (type . "text")
+                                         (text . "Found:\n\n- First\n- Last one")))
+                      (funcall send "root" '(sessionUpdate . "subagent_update")
+                               '(subagentSessionId . "child") '(state . "completed")))))
+         (text (map-elt (agent-shell-tests--subagent-report rendered "child") :text)))
+    (should (string-match-p "• Last one" text))
+    (should-not (string-match-p "- Last one" text))))
+
 (ert-deftest agent-shell-subagent-prompt-renders-in-its-buffer-test ()
   "A subagent's replayed prompt renders in its buffer and opens no page."
   (let* ((rendered (agent-shell-tests--subagent-shell
