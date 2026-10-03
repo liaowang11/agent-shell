@@ -13295,31 +13295,47 @@ disable the transcript for this shell and return nil."
                             (cons "started" (format-time-string "%FT%T%:z"))
                             (cons "working_directory" (agent-shell-cwd))
                             (cons "session_id" (map-nested-elt agent-shell--state '(:session :id)))
-                            (cons "model" (map-nested-elt agent-shell--state '(:session :model-id)))))
+                            (cons "model" (map-nested-elt agent-shell--state '(:session :model-id)))
+                            ;; Seeded from the first prompt before this file
+                            ;; exists, so write whatever the session has.
+                            (cons "title" (agent-shell--transcript-title-line
+                                           (map-nested-elt agent-shell--state '(:session :title))))))
                      "# Agent Shell Transcript
 
 ")
              nil filepath nil 'no-message)
             (message "Created %s"
-                     (agent-shell--shorten-paths filepath t))
-            ;; The title is seeded from the first prompt before this file
-            ;; exists, so write whatever the session already has.
-            (agent-shell--update-transcript-title
-             (map-nested-elt agent-shell--state '(:session :title))))
+                     (agent-shell--shorten-paths filepath t)))
         (error
          (setq-local agent-shell--transcript-file nil)
          (message "Transcript disabled: %s" (error-message-string err)))))
     agent-shell--transcript-file))
 
-(defun agent-shell--set-transcript-title-in-text (text title)
-  "Return TEXT with the transcript header's `**Title:**' field set to TITLE.
+(defun agent-shell--transcript-title-line (title)
+  "Return TITLE as a transcript header field holds it, or nil when blank.
 
-Replaces the field when the header already has one, otherwise inserts
+A title seeded from a prompt can span lines while a header field
+cannot, so only its first line is kept, trimmed.
+
+For example, \"  Fix the reader\\nand more\" returns \"Fix the reader\"."
+  (let ((line (string-trim (car (split-string (or title "") "\n")))))
+    (unless (string-empty-p line)
+      line)))
+
+(defun agent-shell--set-transcript-title-in-text (text title)
+  "Return TEXT with the transcript header's title set to TITLE.
+
+In a header written as YAML frontmatter (see
+`agent-shell--make-transcript-frontmatter'), the title is the `title'
+key.  The frontmatter opens with a `---' line and ends at the next one.
+In an older Markdown header, the title is the `**Title:**' field, and
+the header ends at the `---' separator, or at the first speaker heading
+when a transcript has no separator.
+
+Replaces the title when the header already has one, otherwise inserts
 it as the header's last field.  Only the header is searched: the body
 quotes transcript headers verbatim whenever an agent echoes a file or
-an older transcript, and those lines must be left alone.  The header
-ends at the `---' separator, or at the first speaker heading when a
-transcript has no separator.
+an older transcript, and those lines must be left alone.
 
 TITLE is reduced to its first line, since a title seeded from a prompt
 can span lines while a header field cannot.  TEXT is returned unchanged
@@ -13330,30 +13346,43 @@ For example:
   (agent-shell--set-transcript-title-in-text
    \"**Agent:** Claude\\n\\n---\\n\" \"Fix the reader\")
     => \"**Agent:** Claude\\n**Title:** Fix the reader\\n\\n---\\n\""
-  (setq title (string-trim (car (split-string (or title "") "\n"))))
-  (if (string-empty-p title)
-      text
-    (with-temp-buffer
-      (insert text)
-      (let ((header-end (save-excursion
-                          (goto-char (point-min))
-                          (cond
-                           ((re-search-forward "^---[ \t]*$" nil t)
-                            (match-beginning 0))
-                           ((progn
+  (if-let* ((title (agent-shell--transcript-title-line title)))
+      (with-temp-buffer
+        (insert text)
+        (if-let* ((frontmatter-end
+                   (save-excursion
+                     (goto-char (point-min))
+                     (and (looking-at "---[ \t]*$")
+                          (progn (forward-line 1) t)
+                          (re-search-forward "^---[ \t]*$" nil t)
+                          (match-beginning 0))))
+                  (field (format "title: %s" (json-encode-string title))))
+            (progn
+              (goto-char (point-min))
+              (if (re-search-forward "^title:.*$" frontmatter-end t)
+                  (replace-match field t t)
+                (goto-char frontmatter-end)
+                (insert field "\n")))
+          (let ((header-end (save-excursion
                               (goto-char (point-min))
-                              (re-search-forward "^## " nil t))
-                            (match-beginning 0))
-                           (t (point-max))))))
-        (goto-char (point-min))
-        (if (re-search-forward "^\\*\\*Title:\\*\\*.*$" header-end t)
-            (replace-match (format "**Title:** %s" title) t t)
-          (goto-char header-end)
-          (skip-chars-backward " \t\n")
-          (if (bolp)
-              (insert (format "**Title:** %s\n" title))
-            (insert (format "\n**Title:** %s" title)))))
-      (buffer-string))))
+                              (cond
+                               ((re-search-forward "^---[ \t]*$" nil t)
+                                (match-beginning 0))
+                               ((progn
+                                  (goto-char (point-min))
+                                  (re-search-forward "^## " nil t))
+                                (match-beginning 0))
+                               (t (point-max))))))
+            (goto-char (point-min))
+            (if (re-search-forward "^\\*\\*Title:\\*\\*.*$" header-end t)
+                (replace-match (format "**Title:** %s" title) t t)
+              (goto-char header-end)
+              (skip-chars-backward " \t\n")
+              (if (bolp)
+                  (insert (format "**Title:** %s\n" title))
+                (insert (format "\n**Title:** %s" title))))))
+        (buffer-string))
+    text))
 
 (defun agent-shell--update-transcript-title (title)
   "Write TITLE into the transcript header of the current buffer's file.

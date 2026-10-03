@@ -3579,6 +3579,68 @@ code block content
                          "\n"
                          "Hello\n"))))
 
+(ert-deftest agent-shell--set-transcript-title-in-frontmatter-test ()
+  "Test the title is a `title' key in a transcript headed by frontmatter.
+
+The frontmatter opens with the same `---' line a Markdown header closes
+with, so the title must go inside it rather than above that line, and
+lines in the body shaped like a key are left alone."
+  (let ((header (concat "---\n"
+                        "agent: \"Claude\"\n"
+                        "session_id: \"abc-123\"\n"
+                        "---\n"
+                        "\n"
+                        "# Agent Shell Transcript\n"
+                        "\n"
+                        "## User (2026-08-04 10:43:15)\n"
+                        "\n"
+                        "title: \"quoted\"\n"
+                        "---\n")))
+    ;; A missing title is inserted as the last key, quoted like the rest.
+    (should (equal (agent-shell--set-transcript-title-in-text
+                    header "Fix \"the\" reader\nsecond line")
+                   (concat "---\n"
+                           "agent: \"Claude\"\n"
+                           "session_id: \"abc-123\"\n"
+                           "title: \"Fix \\\"the\\\" reader\"\n"
+                           "---\n"
+                           "\n"
+                           "# Agent Shell Transcript\n"
+                           "\n"
+                           "## User (2026-08-04 10:43:15)\n"
+                           "\n"
+                           "title: \"quoted\"\n"
+                           "---\n")))
+    ;; An existing title is replaced in place.
+    (should (equal (agent-shell--set-transcript-title-in-text
+                    (agent-shell--set-transcript-title-in-text header "Seeded")
+                    "Generated summary")
+                   (agent-shell--set-transcript-title-in-text
+                    header "Generated summary")))
+    (should (equal (agent-shell--set-transcript-title-in-text header "  ")
+                   header))))
+
+(ert-deftest agent-shell--ensure-transcript-file-writes-title-test ()
+  "Test a new transcript's frontmatter carries the session's title.
+
+The title is seeded from the first prompt before the file exists."
+  (let* ((root (make-temp-file "agent-shell-transcript" t))
+         (file (expand-file-name ".agent-shell/transcripts/t.md" root)))
+    (unwind-protect
+        (with-temp-buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq default-directory (file-name-as-directory root))
+          (setq-local agent-shell--state
+                      (list (cons :session (list (cons :id "abc-123")
+                                                 (cons :title "Seeded\nmore")))))
+          (setq-local agent-shell--transcript-file file)
+          (agent-shell--ensure-transcript-file)
+          (with-temp-buffer
+            (insert-file-contents file)
+            (should (string-match-p "\\`---\n\\(?:.*\n\\)*title: \"Seeded\"\n---\n"
+                                    (buffer-string)))))
+      (delete-directory root t))))
+
 (ert-deftest agent-shell--update-transcript-title-test ()
   "Test `agent-shell--update-transcript-title'."
   (let ((file (make-temp-file "agent-shell-transcript"))
@@ -3690,11 +3752,11 @@ non-ASCII title have to survive the round trip."
         (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
                   ((symbol-function 'agent-shell-viewport--buffer)
                    (lambda (&rest _) nil)))
-          (write-region (concat "# Agent Shell Transcript\n"
-                                "\n"
-                                "**Agent:** Claude\n"
-                                "\n"
+          (write-region (concat "---\n"
+                                "agent: \"Claude\"\n"
                                 "---\n"
+                                "\n"
+                                "# Agent Shell Transcript\n"
                                 "\n"
                                 "## User (2026-08-04 10:43:15)\n")
                         nil file nil 'no-message)
@@ -3703,13 +3765,13 @@ non-ASCII title have to survive the round trip."
           (agent-shell--set-session-title "Seeded from the first prompt")
           (with-temp-buffer
             (insert-file-contents file)
-            (should (string-match-p "^\\*\\*Title:\\*\\* Seeded from the first prompt$"
+            (should (string-match-p "^title: \"Seeded from the first prompt\"$"
                                     (buffer-string))))
           ;; The agent's generated title replaces it.
           (agent-shell--set-session-title "Generated summary")
           (with-temp-buffer
             (insert-file-contents file)
-            (should (string-match-p "^\\*\\*Title:\\*\\* Generated summary$"
+            (should (string-match-p "^title: \"Generated summary\"$"
                                     (buffer-string)))
             (should-not (string-match-p "Seeded from the first prompt"
                                         (buffer-string)))))
