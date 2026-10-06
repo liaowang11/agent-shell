@@ -49,8 +49,18 @@
   (pcase status
     ("pending" '((:label . "wait") (:icon . "◔") (:face . agent-shell-pending)))
     ("in_progress" '((:label . "busy") (:icon . "◔") (:face . agent-shell-warning)))
+    ;; "running" is the native-subagent/async-task equivalent of
+    ;; "in_progress" -- ACP tool calls and these newer session updates
+    ;; independently settled on different words for the same state.
+    ("running" '((:label . "busy") (:icon . "◔") (:face . agent-shell-warning)))
     ("completed" '((:label . "done") (:icon . "✓") (:face . agent-shell-success)))
     ("failed" '((:label . "error") (:icon . "✗") (:face . agent-shell-error)))
+    ;; The remaining three are async-task-only terminal/paused states.
+    ("paused" '((:label . "paused") (:icon . "⏸") (:face . agent-shell-secondary)))
+    ("stopped" '((:label . "stopped") (:icon . "⏹") (:face . agent-shell-secondary)))
+    ;; Subagent-only terminal states.
+    ("cancelled" '((:label . "cancelled") (:icon . "⊘") (:face . agent-shell-secondary)))
+    ("disconnected" '((:label . "lost") (:icon . "✗") (:face . agent-shell-error)))
     (_ '((:label . "unknown") (:icon . "?") (:face . agent-shell-warning)))))
 
 (defun agent-shell--inverse-label-status-kind-label (status kind)

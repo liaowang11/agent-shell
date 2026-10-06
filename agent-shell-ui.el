@@ -112,7 +112,7 @@ is what leaves it in place."
   (when-let* ((help (agent-shell-ui--fragment-help-echo qualified-id)))
     (list 'help-echo help)))
 
-(cl-defun agent-shell-ui-make-fragment-model (&key (namespace-id "global") (block-id "1") label-left label-right body group-id group-label (group-expanded t))
+(cl-defun agent-shell-ui-make-fragment-model (&key (namespace-id "global") (block-id "1") label-left label-right label-below body group-id group-label (group-expanded t))
   "Create a fragment model alist.
 NAMESPACE-ID, BLOCK-ID, LABEL-LEFT, LABEL-RIGHT, and BODY are the keys.
 
@@ -120,7 +120,12 @@ GROUP-ID nests this fragment under a collapsible group header (a sibling
 fragment with `block-id' GROUP-ID in the same namespace).  When that
 header does not yet exist, GROUP-LABEL materializes it (auto-create) with
 GROUP-EXPANDED as its initial fold state.  GROUP-ID nil means a top-level
-fragment."
+fragment.
+
+LABEL-BELOW is a header line of its own under LABEL-LEFT and LABEL-RIGHT.
+Unlike the body it stays in view when the fragment is folded, and unlike
+the labels it is inserted as given, so a button in it keeps its own
+action instead of toggling the fragment."
   (list (cons :namespace-id namespace-id)
         (cons :block-id block-id)
         (cons :label-left (agent-shell-ui--string-or-nil label-left))
@@ -128,7 +133,8 @@ fragment."
         (cons :body (agent-shell-ui--string-or-nil body))
         (cons :group-id (agent-shell-ui--string-or-nil group-id))
         (cons :group-label (agent-shell-ui--string-or-nil group-label))
-        (cons :group-expanded group-expanded)))
+        (cons :group-expanded group-expanded)
+        (cons :label-below (agent-shell-ui--string-or-nil label-below))))
 
 (cl-defun agent-shell-ui-make-group-model (&key (namespace-id "global") (block-id "1") label-left label-right (expanded t))
   "Create a group-header model alist.
@@ -222,6 +228,8 @@ O(accumulated-body).  Label-only updates leave the body untouched."
             ;; a tool call and its completion) would spawn an empty group.
             ;; Either way the resolved parent qualified-id and indent are
             ;; recorded on the model so insertion and body regeneration nest.
+            ;; A content-free child must not materialize its parent: doing so
+            ;; leaves a bare group header with no member to render beneath it.
             (cond
              ((and existing-start (not create-new))
               (when-let* ((state (get-text-property existing-start
@@ -231,7 +239,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                     (list (cons :group-qualified-id existing-group)
                                           (cons :group-indent
                                                 (or (map-elt state :group-indent) "  ")))))))
-             (group-id
+             ((and group-id (or new-label-left new-label-right new-body))
               (setq group-header (agent-shell-ui--insert-group-header
                                   :namespace-id namespace-id
                                   :group-id group-id
@@ -326,6 +334,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                             (or new-label-right
                                                 (map-elt existing-labels :label-right)))
                                       (cons :body new-body)
+                                      (cons :label-below (map-elt model :label-below))
                                       ;; Preserve the parent group + indent so
                                       ;; the regenerated child stays nested.
                                       (cons :group-qualified-id
@@ -475,11 +484,16 @@ fenced block)."
   "Hide trailing whitespace within [BODY-START, BODY-END) via invisible property.
 Marks the hidden chars `rear-nonsticky' for `invisible' so chars later
 inserted at BODY-END don't silently inherit `invisible t' from the
-trailing-whitespace tail."
+trailing-whitespace tail.
+
+A button's padding is left visible: it carries the button's box, and
+hiding it drops the box's right edge."
   (save-excursion
     (goto-char body-end)
     (when (re-search-backward "[^ \t\n]" body-start t)
       (forward-char 1)
+      (when (get-text-property (point) 'button)
+        (goto-char (next-single-property-change (point) 'button nil body-end)))
       (when (< (point) body-end)
         (add-text-properties (point) body-end
                              '(invisible t rear-nonsticky (invisible)))))))
@@ -1064,7 +1078,8 @@ NAVIGATION controls navigability:
 A group header (MODEL `:kind' `group') gets a fold triangle and no body of
 its own; its children render below it as separate fragments tagged with its
 qualified-id via `:group-qualified-id'.  MODEL `:group-indent' visually
-indents a child's header line under its group header."
+indents a child's header line under its group header.  MODEL `:label-below'
+is a further header line under the labels, shown when folded."
   (let* ((block-start (point))
          (kind (map-elt model :kind))
          (group (eq kind 'group))
@@ -1081,6 +1096,7 @@ indents a child's header line under its group header."
          (label-left-end)
          (label-right-start)
          (label-right-end)
+         (label-below-end)
          (body-start)
          (body-end)
          (collapsable))
@@ -1145,6 +1161,17 @@ indents a child's header line under its group header."
                                          'front-sticky '(read-only))
                                    (agent-shell-ui--fragment-help-echo-properties qualified-id))))
 
+    ;; Indented like the body, which it sits above.
+    (when-let* ((label-below (map-elt model :label-below)))
+      (insert "\n")
+      (let ((label-below-start (point)))
+        (insert (agent-shell-ui--indent-text label-below body-indent))
+        (setq label-below-end (point))
+        (add-text-properties label-below-start label-below-end
+                             (list 'agent-shell-ui-section 'label-below
+                                   'read-only t
+                                   'front-sticky '(read-only)))))
+
     (when body
       (when (or label-left label-right)
         (insert "\n\n"))
@@ -1178,7 +1205,7 @@ indents a child's header line under its group header."
                            `(line-prefix ,group-indent wrap-prefix ,group-indent)))
     ;; Include the newlines before the body in the invisible region
     (when collapsable
-      (add-text-properties (or label-right-end label-left-end)
+      (add-text-properties (or label-below-end label-right-end label-left-end)
                            body-end
                            `(invisible ,(if expanded nil t))))
     ;; Hide trailing whitespace (don't delete) in body using text properties.
@@ -1191,7 +1218,7 @@ indents a child's header line under its group header."
             (add-text-properties (point) body-end
                                  '(invisible t))))))
     (put-text-property
-     block-start (or body-end label-right-end label-left-end)
+     block-start (or body-end label-below-end label-right-end label-left-end)
      'agent-shell-ui-state (list
                             (cons :qualified-id qualified-id)
                             (cons :kind kind)
@@ -1207,8 +1234,8 @@ indents a child's header line under its group header."
                                                 (t
                                                  ;; Default to auto
                                                  (and body indicator-start))))))
-    (put-text-property block-start (or body-end label-right-end label-left-end) 'read-only t)
-    (put-text-property block-start (or body-end label-right-end label-left-end) 'front-sticky '(read-only))))
+    (put-text-property block-start (or body-end label-below-end label-right-end label-left-end) 'read-only t)
+    (put-text-property block-start (or body-end label-below-end label-right-end label-left-end) 'front-sticky '(read-only))))
 
 (cl-defun agent-shell-ui-update-text (&key namespace-id block-id text append create-new no-undo)
   "Update or insert a plain text entry identified by NAMESPACE-ID and BLOCK-ID.
