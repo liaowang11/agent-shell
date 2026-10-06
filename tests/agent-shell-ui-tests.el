@@ -1277,6 +1277,18 @@ group children."
       (should (string-match-p "some tool output"
                               (buffer-substring-no-properties (point-min) (point-max)))))))
 
+(ert-deftest agent-shell-ui-empty-group-child-does-not-create-header-test ()
+  "A group child with no labels or body does not leave a bare header."
+  (with-temp-buffer
+    (agent-shell-ui-mode 1)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "1" :block-id "t1"
+      :group-id "activity-1" :group-label "Activity")
+     :no-undo t)
+    (should-not (agent-shell-ui--group-header-range "1-activity-1"))
+    (should (= (point-min) (point-max)))))
+
 ;;; actions
 
 (ert-deftest agent-shell-ui-make-foldable-text-shares-one-map-test ()
@@ -1291,6 +1303,21 @@ on screen."
                 (get-text-property 0 'keymap text)))
     (should (eq 'hand (get-text-property 0 'pointer text)))
     (should (get-text-property 0 'cursor-sensor-functions text))))
+
+(ert-deftest agent-shell-ui-make-foldable-text-keeps-a-link-map-test ()
+  "A link inside fragment chrome keeps its own map.
+
+The rest of the chrome folds, but the link acts, and it echoes no
+toggle hint, since RET on it does not toggle."
+  (let* ((link-map (make-sparse-keymap))
+         (text (agent-shell-ui-make-foldable-text
+                :text (concat "◔ " (propertize "Researcher" 'keymap link-map))
+                :hint "toggle")))
+    (should (eq agent-shell-ui-fragment-map (get-text-property 0 'keymap text)))
+    (should (get-text-property 0 'cursor-sensor-functions text))
+    (should (eq link-map (get-text-property 2 'keymap text)))
+    (should-not (get-text-property 2 'cursor-sensor-functions text))
+    (should (eq 'hand (get-text-property 2 'pointer text)))))
 
 (ert-deftest agent-shell-ui-fragment-body-carries-no-map-test ()
   "A fragment's body reads rather than folds.

@@ -46,6 +46,7 @@
 (declare-function acp-send-response "acp")
 (declare-function acp-make-error "acp")
 (declare-function agent-shell--active-requests-p "agent-shell")
+(declare-function agent-shell--activity-group-note-entry-type "agent-shell")
 (declare-function agent-shell--cancel-idle-timer "agent-shell")
 (declare-function agent-shell--emit-event "agent-shell")
 (declare-function agent-shell--ensure-state-key "agent-shell")
@@ -506,8 +507,12 @@ send it as input."
   ;;
   ;; Deliberately not "user_message_chunk": that value asks the replay path
   ;; to insert the end-of-prompt marker on the next notification, and one
-  ;; has already gone in above.
-  (map-put! state :last-entry-type "steered_user_message"))
+  ;; has already gone in above.  Through `--note-entry-type', not a bare
+  ;; `map-put!': a tool call before the steer left a per-session record
+  ;; behind, and `agent-shell--activity-group-session-entry-type' prefers
+  ;; that over the shared field once one exists, so only updating the
+  ;; shared field here would leave the interrupted run looking open.
+  (agent-shell--activity-group-note-entry-type state "steered_user_message"))
 
 (defun agent-shell-experimental--normalize-request (request)
   "Normalize REQUEST from JSON symbol keys to keyword keys.

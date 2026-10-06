@@ -796,7 +796,7 @@ block -- covering the dispatch path, not just the helper in isolation."
                      ;; Pre-set so the header/end-of-prompt branches are
                      ;; skipped; the test only exercises content rendering.
                      (cons :last-entry-type "agent_message_chunk")
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :last-activity-time nil)))
         (rendered nil))
     (cl-letf (((symbol-function 'agent-shell--active-requests-p)
@@ -1043,7 +1043,7 @@ prompt -- unlabeled, not as an error fragment."
                      ;; No request in flight => the update is out of turn.
                      (cons :active-requests nil)
                      (cons :last-activity-time nil)
-                     (cons :last-agent-message-id nil)))
+                     (cons :last-agent-message-ids nil)))
         (captured nil)
         (above-flag nil))
     (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
@@ -1079,7 +1079,7 @@ ordinary streaming output stays in the normal flow."
                      (cons :last-entry-type "agent_message_chunk")
                      (cons :active-requests '(((:method . "session/prompt"))))
                      (cons :last-activity-time nil)
-                     (cons :last-agent-message-id nil)))
+                     (cons :last-agent-message-ids nil)))
         (captured nil)
         (above-flag 'unset))
     (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
@@ -1101,10 +1101,11 @@ ordinary streaming output stays in the normal flow."
       (should-not above-flag))))
 
 (ert-deftest agent-shell--on-notification-out-of-turn-thought-is-separate-test ()
-  "An out-of-turn thought renders above the prompt in a separate namespace."
+  "An out-of-turn thought renders above the prompt in its activity namespace."
   (let ((state (list (cons :chunked-group-count 0)
                      (cons :activity-group-count 0)
                      (cons :activity-thoughts nil)
+                     (cons :expanded-activity-group nil)
                      (cons :last-entry-type "agent_thought_chunk")
                      (cons :active-requests nil)
                      (cons :last-activity-time nil)))
@@ -1128,7 +1129,8 @@ ordinary streaming output stays in the normal flow."
                              (content (type . "text") (text . "still working"))))))
       (should (equal (plist-get captured :body) "still working"))
       (should above-flag)
-      (should (equal (plist-get captured :namespace-id) "out-of-turn")))))
+      (should-not (plist-get captured :namespace-id))
+      (should (equal (plist-get captured :group-id) "activity-1")))))
 
 (ert-deftest agent-shell--on-notification-out-of-turn-user-message-reports-anomaly-test ()
   "An out-of-turn user message reports an anomaly without inserting a prompt."
@@ -1171,7 +1173,7 @@ goes quiet."
                       (cons :last-entry-type nil)
                       (cons :active-requests nil)
                       (cons :last-activity-time nil)
-                      (cons :last-agent-message-id nil)
+                      (cons :last-agent-message-ids nil)
                       (cons :heartbeat heartbeat)
                       (cons :out-of-turn-timer nil)))
     (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
@@ -1204,7 +1206,7 @@ out-of-turn re-raise must not apply."
                       (cons :last-entry-type "agent_message_chunk")
                       (cons :active-requests '(((:method . "session/prompt"))))
                       (cons :last-activity-time nil)
-                      (cons :last-agent-message-id nil)
+                      (cons :last-agent-message-ids nil)
                       (cons :heartbeat heartbeat)
                       (cons :out-of-turn-timer nil)))
     (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
@@ -4402,7 +4404,7 @@ and avoid inserting paragraph breaks between chunks of one prompt."
         (state (list (cons :buffer (current-buffer))
                      (cons :active-requests '(((:method . "session/load"))))
                      (cons :last-entry-type "agent_message_chunk")
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :last-activity-time nil)
                      (cons :chunked-group-count 1)
                      (cons :pending-restore nil)
@@ -9588,7 +9590,7 @@ interleaved entry that failed to advance it.  Returns a list of
 \(BLOCK-ID . CREATE-NEW) as passed to `agent-shell--update-fragment'."
   (let ((agent-shell--stream-render-interval nil)
         (state (list (cons :last-entry-type nil)
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :chunked-group-count 0)
                      (cons :active-requests t)
                      (cons :pending-restore nil)
@@ -9747,7 +9749,7 @@ in flight shows its members."
         (agent-shell--stream-render-interval nil)
         (state (list (cons :tool-calls nil)
                      (cons :last-entry-type nil)
-                     (cons :last-agent-message-id nil)
+                     (cons :last-agent-message-ids nil)
                      (cons :activity-group-count 0)
                      (cons :chunked-group-count 0)
                      (cons :request-count 1)
@@ -9797,6 +9799,49 @@ in flight shows its members."
       ;; Turn end folds the group still in flight.
       (agent-shell--collapse-expanded-activity-group state)
       (should (equal '("activity-2" "activity-1") collapsed)))))
+
+(ert-deftest agent-shell--activity-grouping-whitespace-messages-test ()
+  "Blank messages keep activity open; streamed answer text ends it."
+  (dolist (message-id '(nil "answer"))
+    (let ((state (agent-shell--make-state))
+          (agent-shell-activity-group-expand-by-default 'latest)
+          (agent-shell--stream-render-interval nil)
+          (collapsed nil))
+      (map-put! state :active-requests t)
+      (cl-letf (((symbol-function 'agent-shell--update-fragment) #'ignore)
+                ((symbol-function 'agent-shell--collapse-fragment-group)
+                 (lambda (&rest args) (push (plist-get args :block-id) collapsed)))
+                ((symbol-function 'agent-shell--refresh-activity-group-header) #'ignore)
+                ((symbol-function 'agent-shell--append-transcript) #'ignore)
+                ((symbol-function 'agent-shell--make-transcript-tool-call-entry)
+                 (lambda (&rest _) ""))
+                ((symbol-function 'agent-shell--delete-fragment) #'ignore)
+                ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+                ((symbol-function 'agent-shell--emit-event) #'ignore))
+        (cl-flet ((notify (update)
+                    (agent-shell--on-notification
+                     :state state
+                     :acp-notification `((method . "session/update")
+                                         (params (update . ,update))))))
+          (notify '((sessionUpdate . "tool_call") (toolCallId . "A")
+                    (title . "A") (kind . "other") (status . "pending")))
+          (dolist (text '("" "\n" " \t\n"))
+            (notify `((sessionUpdate . "agent_message_chunk")
+                      (messageId . ,message-id)
+                      (content (type . "text") (text . ,text)))))
+          (should-not collapsed)
+          (notify '((sessionUpdate . "tool_call") (toolCallId . "B")
+                    (title . "B") (kind . "other") (status . "pending")))
+          (should (equal (map-nested-elt state '(:tool-calls "A" :group-id))
+                         (map-nested-elt state '(:tool-calls "B" :group-id))))
+          (dolist (text '("\n" "Answer" "\n"))
+            (notify `((sessionUpdate . "agent_message_chunk")
+                      (messageId . ,message-id)
+                      (content (type . "text") (text . ,text)))))
+          (should (equal collapsed '("activity-1")))
+          (notify '((sessionUpdate . "tool_call") (toolCallId . "C")
+                    (title . "C") (kind . "other") (status . "pending")))
+          (should (equal "activity-2" (map-nested-elt state '(:tool-calls "C" :group-id)))))))))
 
 (ert-deftest agent-shell--activity-grouping-late-update-starts-new-group-test ()
   "A message between a tool call and the next starts a fresh group.
@@ -10231,13 +10276,7 @@ Drives an ACP `session/update' notification through
 `agent-shell--on-notification' and asserts the body reaching the renderer
 carries `agent-shell-thought-body', and that markdown rendered on top of
 such a body layers its own faces ahead of the base one."
-  (let ((state (list (cons :chunked-group-count 0)
-                     (cons :activity-group-count 0)
-                     ;; Pre-set so the new-thought branches (transcript
-                     ;; header, group relabel) are skipped; the test only
-                     ;; exercises content rendering.
-                     (cons :last-entry-type "agent_thought_chunk")
-                     (cons :last-activity-time nil)))
+  (let ((state (agent-shell--make-state))
         (rendered nil))
     (cl-letf (((symbol-function 'agent-shell--active-requests-p)
                (lambda (_state) t))
@@ -10246,7 +10285,9 @@ such a body layers its own faces ahead of the base one."
               ((symbol-function 'agent-shell--emit-event)
                #'ignore)
               ((symbol-function 'agent-shell--update-fragment)
-               (lambda (&rest args) (setq rendered (plist-get args :body)))))
+               (lambda (&rest args)
+                 (when (plist-get args :body)
+                   (setq rendered (plist-get args :body))))))
       (agent-shell--on-notification
        :state state
        :acp-notification '((method . "session/update")
@@ -12252,7 +12293,7 @@ fragment) and `interrupted' (the running turn cancelled)."
   (should (equal (agent-shell-tests--steer-outcome :outcome "promptRequired" :busy t)
                  '(reported interrupted))))
 
-(cl-defun agent-shell-tests--render-steered-prompt (prompt &key idle draft)
+(cl-defun agent-shell-tests--render-steered-prompt (prompt &key idle draft interrupts-run)
   "Render PROMPT into a bare shell buffer mid-turn.
 
 IDLE renders as though the turn ended while the steer was in flight.  A
@@ -12265,9 +12306,16 @@ persistent prompt regardless of which way the default points.
 DRAFT is typed at that prompt first, standing for a prompt the user is
 part way through composing when the steer lands.
 
+INTERRUPTS-RUN records a tool call before rendering PROMPT, establishing
+the per-session activity-group record `agent-shell--activity-group-id'
+consults, so the returned `:group-ids' show whether the steer broke the
+activity run a tool call after it would otherwise share.
+
 Returns an alist of the resulting buffer text, the `:last-entry-type'
-left behind, the `:events' the render emitted, and `:point-at-end',
-non-nil when point came back to where the draft was being typed."
+left behind, the `:events' the render emitted, `:point-at-end',
+non-nil when point came back to where the draft was being typed, and
+`:group-ids', a (BEFORE AFTER) pair of activity-group ids when
+INTERRUPTS-RUN is non-nil."
   (let* ((agent-shell-persistent-prompt-enabled t)
          (buffer (generate-new-buffer " *agent-shell-steer-render-test*"))
          (fake-process (start-process "fake-agent" buffer "cat")))
@@ -12305,7 +12353,11 @@ non-nil when point came back to where the draft was being typed."
               (when draft
                 (goto-char (point-max))
                 (insert draft))
-              (let ((events nil))
+              (let ((events nil)
+                    (group-before (when interrupts-run
+                                    (agent-shell--activity-group-id state "before"))))
+                (when interrupts-run
+                  (agent-shell--activity-group-note-entry-type state "tool_call"))
                 (agent-shell-subscribe-to
                  :shell-buffer (current-buffer)
                  :on-event (lambda (event) (push event events)))
@@ -12313,10 +12365,29 @@ non-nil when point came back to where the draft was being typed."
                 (list (cons :text (buffer-substring (point-min) (point-max)))
                       (cons :last-entry-type (map-elt state :last-entry-type))
                       (cons :point-at-end (= (point) (point-max)))
-                      (cons :events (nreverse events)))))))
+                      (cons :events (nreverse events))
+                      (cons :group-ids (when interrupts-run
+                                         (list group-before
+                                               (agent-shell--activity-group-id state "after")))))))))
       (when (process-live-p fake-process)
         (delete-process fake-process))
       (kill-buffer buffer))))
+
+(ert-deftest agent-shell-experimental--render-steered-prompt-breaks-activity-run-test ()
+  "A steer must not let a tool call after it rejoin the interrupted group.
+
+`agent-shell--activity-group-session-entry-type' prefers a per-session
+record's `:last-entry-type' over the shared field once a tool call has
+created one (native subagents keep their own run separate from the
+root's).  Recording the steer has to go through
+`agent-shell--activity-group-note-entry-type', which writes both, or a
+tool call already tracked in the per-session record keeps the
+interrupted run open and a later tool call rejoins its group instead of
+starting a fresh one under the steer."
+  (let ((group-ids (map-elt (agent-shell-tests--render-steered-prompt
+                             "just the filenames" :interrupts-run t)
+                            :group-ids)))
+    (should-not (equal (car group-ids) (cadr group-ids)))))
 
 (ert-deftest agent-shell-experimental--render-steered-prompt-test ()
   "Test a steered prompt renders as a closed user prompt.
@@ -14099,6 +14170,21 @@ with the next block's."
             (agent-shell--render-deferred-markup)
             (should-not (string-match-p "\n\\'" (agent-shell-tests--visible-text)))))
       (delete-file image-file))))
+
+(ert-deftest agent-shell-ui--trailing-whitespace-invisible-spares-button-test ()
+  "A button ending a body keeps its padding visible.
+The padding carries the button's box, so hiding it drops the box's
+right edge, as with the action buttons ending the pending-prompts body.
+Plain whitespace after the button is still hidden."
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _d) t)))
+    (with-temp-buffer
+      (insert "  "
+              (agent-shell--make-button :text "Remove (d)" :kind 'prompt-queue
+                                        :action #'ignore)
+              "\n\n")
+      (agent-shell-ui--apply-trailing-whitespace-invisible (point-min) (point-max))
+      (should (equal (agent-shell-tests--visible-text)
+                     "   Remove (d) ")))))
 
 (defun agent-shell-tests--visible-text ()
   "Return the current buffer's text with `invisible' chars removed."

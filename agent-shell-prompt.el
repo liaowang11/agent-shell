@@ -179,6 +179,17 @@ while \\='default returns nil."
     (or (memq 'comint-highlight-prompt faces)
         (memq 'agent-shell-prompt faces))))
 
+(defun agent-shell--subagent-label-p (position)
+  "Return non-nil when POSITION starts a rendered subagent label.
+
+New labels carry `agent-shell-subagent-label'.  The `display' and
+`agent-shell-ui-state' fallback keeps labels rendered before that marker
+was introduced from being read as prompts when this file is reloaded in
+a live shell."
+  (or (get-text-property position 'agent-shell-subagent-label)
+      (and (get-text-property position 'display)
+           (get-text-property position 'agent-shell-ui-state))))
+
 (defun agent-shell-prompt-ranges ()
   "Return the range of each prompt in the current buffer, in buffer order.
 
@@ -223,10 +234,10 @@ returns:
       (setq pos (next-single-property-change pos 'field nil (point-max)))
       (when (agent-shell--prompt-face-p
              (get-text-property (1- pos) 'font-lock-face))
-        (push (cons (or (previous-single-property-change pos 'font-lock-face)
-                        (point-min))
-                    pos)
-              runs)))
+        (let ((start (or (previous-single-property-change pos 'font-lock-face)
+                         (point-min))))
+          (unless (agent-shell--subagent-label-p start)
+            (push (cons start pos) runs)))))
     (setq runs (nreverse runs))
     (seq-mapn
      (lambda (run next)
