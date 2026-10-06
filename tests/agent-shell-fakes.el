@@ -7,6 +7,7 @@
 ;;; Code:
 
 (require 'acp)
+(require 'cl-lib)
 (require 'acp-fakes)
 (require 'acp-traffic)
 
@@ -15,6 +16,7 @@
 ;; A defcustom in agent-shell.el; declared here so the driver can bind it
 ;; dynamically to drive the restore verbosity of a replayed `session/load'.
 (defvar agent-shell-session-restore-verbosity)
+(defvar agent-shell-transcript-file-path-function)
 
 (defun agent-shell-fakes--first-text-part (prompt)
   "Return the text of the first text part in PROMPT (a vector of parts)."
@@ -195,6 +197,64 @@ Reads TRAFFIC-FILE from the minibuffer when called interactively."
      buffer)
     (pop-to-buffer buffer)
     buffer))
+
+(cl-defun agent-shell-fakes-restore (&key verbosity updates)
+  "Restore a fake session whose `session/load' replays UPDATES.
+
+UPDATES is a list of (SESSION-ID . UPDATE), each UPDATE a
+`session/update' notification's `update' object, in replay order.
+VERBOSITY binds `agent-shell-session-restore-verbosity'.  Returns the
+shell buffer once the replay has rendered; the caller kills it.
+
+  (agent-shell-fakes-restore
+   :verbosity \\='full
+   :updates \\='((\"s1\" . ((sessionUpdate . \"user_message_chunk\")
+                        (content (type . \"text\") (text . \"hi\"))))))"
+  (let* ((messages
+          (append
+           '(((:direction . outgoing) (:kind . request)
+              (:object (jsonrpc . "2.0") (method . "initialize") (id . 1)))
+             ((:direction . incoming) (:kind . response)
+              (:object (jsonrpc . "2.0") (id . 1)
+                       (result (protocolVersion . 1)
+                               (agentCapabilities (loadSession . t)))))
+             ((:direction . outgoing) (:kind . request)
+              (:object (jsonrpc . "2.0") (method . "session/load") (id . 2)
+                       (params (sessionId . "s1") (cwd . "/tmp") (mcpServers . [])))))
+           (mapcar (lambda (update)
+                     `((:direction . incoming) (:kind . notification)
+                       (:object (jsonrpc . "2.0") (method . "session/update")
+                                (params (sessionId . ,(car update))
+                                        (update . ,(cdr update))))))
+                   updates)
+           '(((:direction . incoming) (:kind . response)
+              (:object (jsonrpc . "2.0") (id . 2) (result))))))
+         (agent-shell-session-restore-verbosity verbosity)
+         (buffer (agent-shell-fakes-start-agent messages)))
+    (agent-shell-fakes--settle)
+    (agent-shell-fakes--drive
+     (map-elt (buffer-local-value 'agent-shell--state buffer) :client)
+     buffer)
+    (agent-shell-fakes--settle 100)
+    buffer))
+
+(defmacro agent-shell-fakes-with-restored-shell (args &rest body)
+  "Run BODY in the shell `agent-shell-fakes-restore' makes from ARGS.
+
+Kills the shell afterwards.  Starting a shell adds shell-maker's
+transcript prompt to the global `kill-buffer-query-functions', which
+would then ask about every shell buffer later tests kill, so the hook
+list is restored on exit and no transcript is written."
+  (declare (indent 1))
+  (let ((buffer (make-symbol "buffer")))
+    `(let* ((kill-buffer-query-functions kill-buffer-query-functions)
+            (agent-shell-transcript-file-path-function nil)
+            (,buffer (agent-shell-fakes-restore ,@args)))
+       (unwind-protect
+           (with-current-buffer ,buffer
+             ,@body)
+         (let ((kill-buffer-query-functions nil))
+           (kill-buffer ,buffer))))))
 
 (defun agent-shell-fakes--recorded-load-session-id (messages)
   "Return the sessionId of a recorded outgoing `session/load' in MESSAGES.

@@ -1,0 +1,2827 @@
+;;; agent-shell-subagents-tests.el --- Tests for native subagents and async tasks -*- lexical-binding: t; -*-
+
+(require 'ert)
+(require 'map)
+(require 'agent-shell)
+(require 'agent-shell-fakes)
+
+;;; Code:
+
+(ert-deftest agent-shell-air-capabilities-meta-test ()
+  "Test that AIR `_meta' carries the requested capability names."
+  (let ((meta (agent-shell--air-capabilities-meta "asyncTasks" "sessionIndex")))
+    (should (equal (map-nested-elt meta '(jetbrains air version)) 1))
+    (should (equal (map-nested-elt meta '(jetbrains air capabilities))
+                   ["asyncTasks" "sessionIndex"]))))
+
+(ert-deftest agent-shell-air-meta-rides-inside-client-capabilities-test ()
+  "Test that the initialize request nests AIR `_meta' inside `clientCapabilities'.
+
+Agents read extension meta there (claude-agent-acp, codex-acp); a
+request-level `_meta' is never consulted, and the gated features
+silently fall back to plain tool calls."
+  (let* ((request (acp-make-initialize-request
+                   :protocol-version 1
+                   :client-capabilities `((subagents . ())
+                                          (_meta . ,(agent-shell--air-capabilities-meta
+                                                     "asyncTasks"))))))
+    (should (equal (map-nested-elt request '(:params clientCapabilities _meta
+                                                    jetbrains air capabilities))
+                   ["asyncTasks"]))
+    (should-not (map-elt (map-elt request :params) '_meta))))
+
+(ert-deftest agent-shell-advertises-every-air-capability-it-implements-test ()
+  "The AIR capabilities we advertise must name every feature we render.
+
+claude-agent-acp gates each feature on the client naming it in the
+initialize request's `_meta.jetbrains.air.capabilities': background
+tasks on \"asyncTasks\" (async-tasks.ts).  A feature we render but never
+name is dead code -- the agent simply never sends those notifications.
+
+\"nativeSubagentSessions\" stays out: it would switch claude-agent-acp
+to AIR's older subagent draft (acp-subagents.ts)."
+  (let ((advertised (map-nested-elt (agent-shell--air-client-capabilities-meta)
+                                    '(jetbrains air capabilities))))
+    (should-not (seq-contains-p advertised "nativeSubagentSessions"))
+    (should (seq-contains-p advertised "asyncTasks"))))
+
+(ert-deftest agent-shell-air-capabilities-are-per-agent-test ()
+  "Only agents that implement the AIR extension are told about it.
+
+The `jetbrains.air' namespace is one vendor's, so the shared handshake
+advertising it to codex, gemini and the rest would grow a union of every
+vendor's keys sent to everyone.  Agent configs already carry per-agent
+wire extras."
+  (should (agent-shell--air-client-capabilities-meta))
+  ;; Claude implements it.
+  (should (map-elt (agent-shell-anthropic-make-claude-code-config) :initialize-meta))
+  ;; A config that never opted in advertises nothing.
+  (should-not (map-elt (agent-shell-make-agent-config :identifier 'nobody)
+                       :initialize-meta)))
+
+(ert-deftest agent-shell-subagents-capability-is-per-agent-test ()
+  "Only agents that answer `subagents' with the subagents RFD are sent it.
+
+codex-acp answers an object-valued `clientCapabilities.subagents' with
+AIR's older draft (`subagent_spawned'), which this client does not
+render; without it, codex-acp reports subagents as plain tool calls."
+  (dolist (case `((,(agent-shell-anthropic-make-claude-code-config) . t)
+                  (,(agent-shell-omp-make-agent-config) . t)
+                  (,(agent-shell-make-agent-config :identifier 'nobody) . nil)))
+    (with-temp-buffer
+      (let ((agent-shell--state (agent-shell--make-state :agent-config (car case)
+                                                         :buffer (current-buffer)))
+            (sent nil))
+        (cl-letf (((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                   #'ignore)
+                  ((symbol-function 'agent-shell--send-request)
+                   (cl-function
+                    (lambda (&key request &allow-other-keys)
+                      (setq sent request)))))
+          (agent-shell--initiate-handshake
+           :shell-buffer (current-buffer)
+           :on-initiated #'ignore))
+        (should (eq (and (assq 'subagents
+                               (map-nested-elt sent '(:params clientCapabilities)))
+                         t)
+                    (cdr case)))))))
+
+(ert-deftest agent-shell-air-extension-supported-p-reads-the-agents-advert-test ()
+  "Whether the agent implements the AIR extension is read, not assumed.
+
+`agent-shell-fork-at-point' rides `_meta.jetbrains.air.fork', so an agent
+that never advertised the extension silently forks the latest turn
+instead of the message at point."
+  (should (agent-shell--air-extension-supported-p
+           '((_meta . ((jetbrains . ((air . ((version . 1)
+                                             (capabilities . ["asyncTasks"]))))))))))
+  (should-not (agent-shell--air-extension-supported-p
+               '((_meta . ((steering . ((supported . t))))))))
+  (should-not (agent-shell--air-extension-supported-p nil)))
+
+(ert-deftest agent-shell-session-bound-notification-p-recognizes-subagent-and-async-task-updates-test ()
+  "Test that native subagent and async task updates count as session-bound.
+Otherwise they would misfire the \"unexpected out-of-turn update\" path,
+since they legitimately arrive after `end_turn' once a session/prompt
+request has already settled."
+  (dolist (kind '("subagent_update" "session_message"
+                  "async_task_spawned" "async_task_progress" "async_task_state_update"))
+    (should (agent-shell--session-bound-notification-p
+             `((method . "session/update")
+               (params . ((update . ((sessionUpdate . ,kind))))))))))
+
+(ert-deftest agent-shell-native-subagent-registry-round-trip-test ()
+  "Test that a spawned subagent's name/task can be looked back up."
+  (let ((state (list (cons :native-subagents nil))))
+    (agent-shell--save-native-subagent state "subagent-1" "Researcher" "Find prior art")
+    (let ((registered (agent-shell--native-subagent state "subagent-1")))
+      (should (equal (map-elt registered :name) "Researcher"))
+      (should (equal (map-elt registered :task) "Find prior art")))
+    (should-not (agent-shell--native-subagent state "subagent-unknown"))))
+
+(ert-deftest agent-shell-async-task-registry-round-trip-test ()
+  "Test that a spawned async task's name/type/description can be looked back up."
+  (let ((state (list (cons :async-tasks nil))))
+    (agent-shell--save-async-task state "task-1" "Build" "workflow" "Running the test suite" t t)
+    (let ((registered (agent-shell--async-task state "task-1")))
+      (should (equal (map-elt registered :name) "Build"))
+      (should (equal (map-elt registered :task-type) "workflow"))
+      (should (equal (map-elt registered :description) "Running the test suite"))
+      (should (eq (map-elt registered :can-stop) t))
+      (should (equal (map-elt registered :state) "running")))
+    (should-not (agent-shell--async-task state "task-unknown"))))
+
+(cl-defun agent-shell-tests--spawn-async-task (&key show-in-transcript (can-stop t))
+  "Dispatch an `async_task_spawned' notification and report what it did.
+
+SHOW-IN-TRANSCRIPT and CAN-STOP are the flags the agent sends.
+
+Returns an alist of the tasks the stop command would offer and whether a
+transcript fragment was rendered."
+  (let ((state (list (cons :async-tasks nil)
+                     (cons :last-entry-type "agent_message_chunk")))
+        rendered)
+    (cl-letf (((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _) (setq rendered t))))
+      (agent-shell--dispatch-notification
+       :state state
+       :acp-notification
+       `((method . "session/update")
+         (params (update (sessionUpdate . "async_task_spawned")
+                         (asyncTaskId . "task-1")
+                         (name . "Build")
+                         (taskType . "workflow")
+                         (description . "Running the test suite")
+                         (canStop . ,can-stop)
+                         (showInTranscript . ,show-in-transcript))))))
+    (list (cons :stoppable (agent-shell--stoppable-async-tasks state))
+          (cons :rendered rendered)
+          (cons :last-entry-type (map-elt state :last-entry-type)))))
+
+(ert-deftest agent-shell-async-task-progress-does-not-resume-a-paused-task-test ()
+  "Progress is not a state transition, so it must not rewrite the state.
+
+`async_task_progress' carries no `state' field: claude-agent-acp's
+`publishMetadata' sends one for any non-terminal task, paused included
+\(async-tasks.ts).  Treating it as \"running\" makes a paused task report
+running in both the status icon and the registry the stop command reads."
+  (let ((state (list (cons :async-tasks nil)
+                     (cons :last-entry-type nil)))
+        rendered-status)
+    (cl-letf (((symbol-function 'agent-shell--update-fragment)
+               (cl-function (lambda (&key label-left &allow-other-keys)
+                              (setq rendered-status label-left))))
+              ((symbol-function 'agent-shell--make-status-kind-label)
+               (cl-function (lambda (&key status &allow-other-keys) status))))
+      (agent-shell--save-async-task state "task-1" "Build" "workflow" "desc" t t)
+      (agent-shell--set-async-task-state state "task-1" "paused")
+      (agent-shell--dispatch-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params (update (sessionUpdate . "async_task_progress")
+                         (asyncTaskId . "task-1")
+                         (summary . "still going")))))
+      (should (equal (map-elt (agent-shell--async-task state "task-1") :state) "paused"))
+      (should (string-match-p "paused" rendered-status)))))
+
+(ert-deftest agent-shell-async-task-progress-persists-to-registry-test ()
+  "Progress is written to the registry so the subagents list can show it."
+  (let ((state (list (cons :async-tasks nil)
+                     (cons :last-entry-type nil)))
+        changed)
+    (cl-letf (((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'agent-shell-subagents--changed)
+               (lambda (changed-state) (setq changed changed-state))))
+      (agent-shell--save-async-task state "task-1" "Build" "workflow" "desc" t t)
+      (agent-shell--set-async-task-state state "task-1" "paused")
+      (agent-shell--dispatch-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params (update (sessionUpdate . "async_task_progress")
+                         (asyncTaskId . "task-1")
+                         (summary . "Compiling")
+                         (lastToolName . "Bash")
+                         (usage (totalTokens . 2000) (toolUses . 3))))))
+      (let ((task (agent-shell--async-task state "task-1")))
+        (should (equal (map-elt task :summary) "Compiling"))
+        (should (equal (map-elt task :last-tool-name) "Bash"))
+        (should (equal (map-elt (map-elt task :usage) 'totalTokens) 2000))
+        (should (equal (map-elt task :description) "desc"))
+        (should (equal (map-elt task :state) "paused")))
+      (should (eq changed state)))))
+
+(ert-deftest agent-shell-async-task-state-update-persists-summary-test ()
+  "A terminal state update's summary is written to the registry."
+  (let ((state (list (cons :async-tasks nil)
+                     (cons :last-entry-type nil))))
+    (cl-letf (((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'agent-shell-subagents--changed) #'ignore))
+      (agent-shell--save-async-task state "task-1" "Build" "workflow" "desc" t t)
+      (agent-shell--dispatch-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params (update (sessionUpdate . "async_task_state_update")
+                         (asyncTaskId . "task-1")
+                         (state . "completed")
+                         (summary . "All tests passed")))))
+      (let ((task (agent-shell--async-task state "task-1")))
+        (should (equal (map-elt task :summary) "All tests passed"))
+        (should (equal (map-elt task :state) "completed"))))))
+
+(ert-deftest agent-shell-async-task-state-update-card-keeps-progress-test ()
+  "A state update redraws the card with the tool and usage progress reported."
+  (let ((state (list (cons :async-tasks nil)
+                     (cons :last-entry-type nil)))
+        drawn-body)
+    (cl-letf (((symbol-function 'agent-shell--render-tracked-work)
+               (cl-function (lambda (&key body &allow-other-keys)
+                              (setq drawn-body body))))
+              ((symbol-function 'agent-shell-subagents--changed) #'ignore))
+      (agent-shell--save-async-task state "task-1" "Build" "workflow" "desc" t t)
+      (agent-shell--dispatch-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params (update (sessionUpdate . "async_task_progress")
+                         (asyncTaskId . "task-1")
+                         (lastToolName . "Bash")
+                         (usage (totalTokens . 2000) (toolUses . 3))))))
+      (agent-shell--dispatch-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params (update (sessionUpdate . "async_task_state_update")
+                         (asyncTaskId . "task-1")
+                         (state . "completed")
+                         (summary . "All tests passed"))))))
+    (should (equal drawn-body (agent-shell--format-async-task-body
+                               nil "All tests passed" "Bash"
+                               '((totalTokens . 2000) (toolUses . 3)))))))
+
+(ert-deftest agent-shell-async-task-hidden-from-transcript-is-still-stoppable-test ()
+  "A task the agent hides from the transcript can still be stopped.
+
+`showInTranscript' says whether the task gets its own transcript card --
+it is false when a tool call already shows it -- not whether the task
+exists.  `canStop' is a separate flag, so a hidden task the agent
+advertises as stoppable has to reach `agent-shell--stoppable-async-tasks'
+or `agent-shell-stop-async-task' reports nothing to stop."
+  (let ((spawned (agent-shell-tests--spawn-async-task :show-in-transcript nil)))
+    (should (equal (map-elt (cdar (map-elt spawned :stoppable)) :name) "Build"))
+    ;; Still hidden: registering it must not put a duplicate card next to
+    ;; the tool call already showing it.
+    (should-not (map-elt spawned :rendered))
+    ;; Nothing was drawn, so the entry type must not advance -- doing so
+    ;; would split a streaming agent message in two.
+    (should (equal (map-elt spawned :last-entry-type) "agent_message_chunk")))
+  ;; A visible task registers and renders, as before.
+  (let ((spawned (agent-shell-tests--spawn-async-task :show-in-transcript t)))
+    (should (equal (map-elt (cdar (map-elt spawned :stoppable)) :name) "Build"))
+    (should (map-elt spawned :rendered))
+    (should (equal (map-elt spawned :last-entry-type) "async_task_spawned")))
+  ;; A task the agent will not stop is registered but never offered.
+  (let ((spawned (agent-shell-tests--spawn-async-task :show-in-transcript nil :can-stop nil)))
+    (should-not (map-elt spawned :stoppable))))
+
+(defun agent-shell-tests--interleaved-message-chunks (chunks)
+  "Dispatch CHUNKS as agent messages and return their (BLOCK-ID . CREATE-NEW).
+
+CHUNKS is a list of (SESSION-ID MESSAGE-ID . TEXT).  A subagent's content
+arrives on its own `sessionId' but renders into the root shell, so both
+sessions drive the same STATE.  Only message fragments are returned, not
+the relabelling of the subagent's row that its first chunk causes."
+  (let ((agent-shell--stream-render-interval nil)
+        (state (list (cons :session (list (cons :id "root")))
+                     (cons :native-subagents nil)
+                     (cons :last-entry-type nil)
+                     (cons :last-agent-message-ids nil)
+                     (cons :last-agent-message-block-ids nil)
+                     (cons :chunked-group-count 0)
+                     (cons :activity-group-sessions
+                           '((:root (:last-entry-type . nil))))
+                     (cons :active-requests t)
+                     (cons :pending-restore nil)
+                     (cons :last-activity-time nil)
+                     (cons :buffer nil)))
+        (calls '()))
+    (agent-shell--save-native-subagent state "child" "Researcher" "Find prior art")
+    (cl-letf (((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (when (string-suffix-p "agent_message_chunk" (plist-get args :block-id))
+                   (push (cons (plist-get args :block-id) (plist-get args :create-new))
+                         calls))))
+              ((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--emit-event) #'ignore)
+              ((symbol-function 'agent-shell--collapse-expanded-activity-group) #'ignore)
+              ((symbol-function 'agent-shell--active-requests-p) (lambda (&rest _) t))
+              ((symbol-function 'agent-shell--content-block-to-markdown)
+               (lambda (block) (map-elt block 'text)))
+              ((symbol-function 'agent-shell--indent-markdown-headers) #'identity))
+      (dolist (chunk chunks)
+        (agent-shell--on-notification
+         :state state
+         :acp-notification
+         `((method . "session/update")
+           (params (sessionId . ,(nth 0 chunk))
+                   (update (sessionUpdate . "agent_message_chunk")
+                           (messageId . ,(nth 1 chunk))
+                           (content (type . "text") (text . ,(cddr chunk)))))))))
+    (nreverse calls)))
+
+(ert-deftest agent-shell-interleaved-subagent-chunks-stay-one-message-test ()
+  "A message interrupted by another session's message is not split in two.
+
+A subagent's chunks render into the root shell, so both sessions share
+one entry per session.  Given child, root, child, the second child
+chunk compares its id against the root's and looks like a new message.
+`agent-shell-ui-update-fragment' only reuses an existing block when
+CREATE-NEW is nil, so the message gets a second block instead of
+continuing its first."
+  (let ((calls (agent-shell-tests--interleaved-message-chunks
+                '(("child" "m-child" . "I looked")
+                  ("root"  "m-root"  . "Meanwhile")
+                  ("child" "m-child" . " and found it")))))
+    ;; Each message starts once.
+    (should (equal (mapcar #'cdr calls) '(t t nil)))
+    ;; The resumed chunk goes back to the block it started.
+    (should (equal (car (nth 0 calls)) (car (nth 2 calls))))
+    (should-not (equal (car (nth 0 calls)) (car (nth 1 calls))))))
+
+(ert-deftest agent-shell-interleaved-subagent-chunks-without-message-id-stay-one-message-test ()
+  "Interleaved messages without ACP IDs still keep session-local blocks."
+  (let ((calls (agent-shell-tests--interleaved-message-chunks
+                '( ("child" nil . "I looked")
+                   ("root" nil . "Meanwhile")
+                   ("child" nil . " and found it")))))
+    (should (equal (mapcar #'cdr calls) '(t t nil)))
+    (should (equal (car (nth 0 calls)) (car (nth 2 calls))))
+    (should-not (equal (car (nth 0 calls)) (car (nth 1 calls))))))
+
+(defun agent-shell-tests--interleaved-activity-group-ids (updates)
+  "Dispatch activity UPDATES and return the requested tool group IDs.
+
+UPDATES is a list of (SESSION-ID . UPDATE), where UPDATE is a
+`session/update' payload.  The helper uses the real notification dispatcher
+but stubs buffer rendering, so it exercises session routing and state while
+remaining independent of a live shell buffer."
+  (let ((state (agent-shell--make-state))
+        (tool-call-ids (seq-keep (lambda (entry)
+                                   (when (equal (map-elt (cdr entry) 'sessionUpdate)
+                                                "tool_call")
+                                     (map-elt (cdr entry) 'toolCallId)))
+                                 updates)))
+    (map-put! (map-elt state :session) :id "root")
+    (map-put! state :active-requests t)
+    (agent-shell--save-native-subagent state "child" "Researcher" "Find prior art")
+    (cl-letf (((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'agent-shell--refresh-activity-group-header) #'ignore)
+              ((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--collapse-expanded-activity-group) #'ignore)
+              ((symbol-function 'agent-shell--emit-event) #'ignore)
+              ((symbol-function 'agent-shell--make-transcript-tool-call-entry)
+               (lambda (&rest _) ""))
+              ((symbol-function 'agent-shell--delete-fragment) #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+              ((symbol-function 'agent-shell-make-tool-call-label)
+               (lambda (&rest _) '((:status . "s") (:title . "t"))))
+              ((symbol-function 'agent-shell--content-block-to-markdown)
+               (lambda (block) (map-elt block 'text)))
+              ((symbol-function 'agent-shell--indent-markdown-headers) #'identity))
+      (dolist (entry updates)
+        (agent-shell--on-notification
+         :state state
+         :acp-notification
+         `((method . "session/update")
+           (params . ((sessionId . ,(car entry))
+                      (update . ,(cdr entry)))))))
+      (mapcar (lambda (tool-call-id)
+                (map-nested-elt state `(:tool-calls ,tool-call-id :group-id)))
+              tool-call-ids))))
+
+(ert-deftest agent-shell-interleaved-activity-groups-stay-session-local-test ()
+  "Interleaved root and subagent activity runs do not share a group.
+
+A subagent's tool call is filed under its row, which is its group for as
+long as it lives, while a root tool call after one continues the root's
+open run: neither session's activity boundary moves because the other
+rendered between two of its entries."
+  (should (equal
+           '("activity-1" "subagent-child" "activity-1")
+           (agent-shell-tests--interleaved-activity-group-ids
+            `(("root" . ((sessionUpdate . "tool_call")
+                          (toolCallId . "root-a")
+                          (title . "root-a") (kind . "other") (status . "pending")))
+              ("child" . ((sessionUpdate . "tool_call")
+                           (toolCallId . "child-a")
+                           (title . "child-a") (kind . "other") (status . "pending")))
+              ("root" . ((sessionUpdate . "tool_call")
+                          (toolCallId . "root-b")
+                          (title . "root-b") (kind . "other") (status . "pending")))))))
+  (should (equal
+           '("activity-1" "activity-1")
+           (agent-shell-tests--interleaved-activity-group-ids
+            `(("root" . ((sessionUpdate . "tool_call")
+                          (toolCallId . "root-a")
+                          (title . "root-a") (kind . "other") (status . "pending")))
+              ("child" . ((sessionUpdate . "agent_message_chunk")
+                           (messageId . "child-message")
+                           (content (type . "text") (text . "child reply"))))
+              ("root" . ((sessionUpdate . "tool_call")
+                          (toolCallId . "root-b")
+                          (title . "root-b") (kind . "other") (status . "pending")))))))
+  (should (equal
+           '("activity-1" "subagent-child" "activity-2")
+           (agent-shell-tests--interleaved-activity-group-ids
+            `(("root" . ((sessionUpdate . "tool_call")
+                          (toolCallId . "root-a")
+                          (title . "root-a") (kind . "other") (status . "pending")))
+              ("root" . ((sessionUpdate . "agent_message_chunk")
+                          (messageId . "root-message")
+                          (content (type . "text") (text . "root reply"))))
+              ("child" . ((sessionUpdate . "tool_call")
+                           (toolCallId . "child-a")
+                           (title . "child-a") (kind . "other") (status . "pending")))
+              ("root" . ((sessionUpdate . "tool_call")
+                          (toolCallId . "root-b")
+                          (title . "root-b") (kind . "other") (status . "pending"))))))))
+
+(ert-deftest agent-shell-interleaved-thought-chunks-stay-in-their-session-test ()
+  "Interleaved thought streams keep distinct blocks and groups.
+
+The subagent's thought renders flat in its own buffer, then relabels its
+row from what it now holds, which is the bodyless write between the two.
+Its second chunk appends to the block the first opened, rather than
+starting another one behind the root's thought."
+  (let ((state (agent-shell--make-state))
+        (calls nil))
+    (map-put! (map-elt state :session) :id "root")
+    (map-put! state :active-requests t)
+    (agent-shell--save-native-subagent state "child" "Researcher" "Find prior art")
+    (cl-letf (((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args)
+                 (push (list (plist-get args :block-id)
+                             (plist-get args :group-id)
+                             (plist-get args :create-new)
+                             (plist-get args :append))
+                       calls)))
+              ((symbol-function 'agent-shell--refresh-activity-group-header) #'ignore)
+              ((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--emit-event) #'ignore)
+              ((symbol-function 'agent-shell--collapse-expanded-activity-group) #'ignore)
+              ((symbol-function 'agent-shell--content-block-to-markdown)
+               (lambda (block) (map-elt block 'text)))
+              ((symbol-function 'agent-shell--indent-markdown-headers) #'identity))
+      (dolist (entry
+               '(("child" . ((sessionUpdate . "agent_thought_chunk")
+                              (content (type . "text") (text . "child one"))))
+                 ("root" . ((sessionUpdate . "agent_thought_chunk")
+                             (content (type . "text") (text . "root one"))))
+                 ("child" . ((sessionUpdate . "agent_thought_chunk")
+                              (content (type . "text") (text . "child two"))))))
+        (agent-shell--on-notification
+         :state state
+         :acp-notification
+         `((method . "session/update")
+           (params . ((sessionId . ,(car entry))
+                      (update . ,(cdr entry)))))))
+      (setq calls (nreverse calls)))
+    (should (equal
+             '( ("subagent-child-agent_thought_chunk-0" nil nil nil)
+                ("subagent-child" nil nil nil)
+                ("activity-1-agent_thought_chunk" "activity-1" nil nil)
+                ("subagent-child-agent_thought_chunk-0" nil nil t))
+             calls))))
+
+(ert-deftest agent-shell-format-async-task-body-prefers-summary-over-description-test ()
+  "Test that SUMMARY, when present, takes priority over DESCRIPTION."
+  (should (equal (agent-shell--format-async-task-body "description" "summary" nil nil)
+                 "summary"))
+  (should (equal (agent-shell--format-async-task-body "description" nil nil nil)
+                 "description")))
+
+(ert-deftest agent-shell-format-async-task-body-includes-tool-and-usage-lines-test ()
+  "Test that the last tool name and usage tally render as extra lines."
+  (let ((body (agent-shell--format-async-task-body
+              "description" nil "Bash" '((totalTokens . 1500) (toolUses . 3)))))
+    (should (string-match-p "Last tool: Bash" body))
+    (should (string-match-p "2k tokens · 3 tool uses" body))))
+
+(ert-deftest agent-shell-native-subagent-registry-migrates-legacy-state-test ()
+  "Test that saving a subagent works even without a pre-seeded :native-subagents.
+A live shell created before this key existed would otherwise hit
+`map-put!'s \"Cannot modify map in-place\" error on the first save."
+  (let ((state (list (cons :usage nil))))
+    (agent-shell--save-native-subagent state "subagent-1" "Researcher" "Find prior art")
+    (should (equal (map-elt (agent-shell--native-subagent state "subagent-1") :name)
+                   "Researcher"))))
+
+(ert-deftest agent-shell-async-task-registry-migrates-legacy-state-test ()
+  "Test that saving an async task works even without a pre-seeded :async-tasks.
+A live shell created before this key existed would otherwise hit
+`map-put!'s \"Cannot modify map in-place\" error on the first save."
+  (let ((state (list (cons :usage nil))))
+    (agent-shell--save-async-task state "task-1" "Build" "workflow" "desc" t t)
+    (should (equal (map-elt (agent-shell--async-task state "task-1") :name) "Build"))))
+
+(ert-deftest agent-shell-set-async-task-state-updates-registered-entry-test ()
+  "Test that the registry's :state field reflects the latest update."
+  (let ((state (list (cons :async-tasks nil))))
+    (agent-shell--save-async-task state "task-1" "Build" "workflow" "desc" t t)
+    (agent-shell--set-async-task-state state "task-1" "completed")
+    (should (equal (map-elt (agent-shell--async-task state "task-1") :state) "completed"))))
+
+(ert-deftest agent-shell-set-async-task-state-ignores-unregistered-task-test ()
+  "Test that updating an unknown task id is a no-op, not an error."
+  (let ((state (list (cons :async-tasks nil))))
+    (should-not (agent-shell--set-async-task-state state "task-unknown" "completed"))))
+
+(ert-deftest agent-shell-stoppable-async-tasks-filters-by-can-stop-and-state-test ()
+  "Test that only running, stoppable tasks are offered for stopping."
+  (let ((state (list (cons :async-tasks nil))))
+    (agent-shell--save-async-task state "stoppable" "Build" "workflow" "desc" t t)
+    (agent-shell--save-async-task state "not-stoppable" "Deploy" "workflow" "desc" nil t)
+    (agent-shell--save-async-task state "already-done" "Test" "workflow" "desc" t t)
+    (agent-shell--set-async-task-state state "already-done" "completed")
+    (let ((ids (mapcar #'car (agent-shell--stoppable-async-tasks state))))
+      (should (equal ids '("stoppable"))))))
+
+(ert-deftest agent-shell-async-task-stop-request-shape-test ()
+  "Test that the stop request carries the session and task id in `_session/async_task/stop'."
+  (let ((request (agent-shell--async-task-stop-request
+                  :session-id "session-1" :async-task-id "task-1")))
+    (should (equal (map-elt request :method) "_session/async_task/stop"))
+    (should (equal (map-nested-elt request '(:params sessionId)) "session-1"))
+    (should (equal (map-nested-elt request '(:params asyncTaskId)) "task-1"))))
+
+(ert-deftest agent-shell-stop-async-task-errors-without-candidates-test ()
+  "Test that stopping fails clearly when nothing is stoppable."
+  (let ((state (list (cons :async-tasks nil))))
+    (with-temp-buffer
+      (setq-local major-mode 'agent-shell-mode)
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () state)))
+        (should-error (agent-shell-stop-async-task) :type 'user-error)))))
+
+(ert-deftest agent-shell-stop-async-task-from-viewport-test ()
+  "Test that stopping from a viewport buffer stops its shell's task."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell stop test*"))
+        (sent nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell-buffer
+            (setq major-mode 'agent-shell-mode)
+            (setq-local agent-shell--state
+                        (agent-shell--make-state :buffer shell-buffer))
+            (map-put! (map-elt agent-shell--state :session) :id "s1")
+            (agent-shell--save-async-task agent-shell--state
+                                          "task-1" "Build" "workflow" "desc" t t))
+          (with-temp-buffer
+            (setq-local major-mode 'agent-shell-viewport-view-mode)
+            (cl-letf (((symbol-function 'agent-shell--current-shell)
+                       (lambda () shell-buffer))
+                      ((symbol-function 'agent-shell--send-request)
+                       (lambda (&rest args) (push args sent))))
+              (agent-shell-stop-async-task)))
+          (should (equal (map-nested-elt (plist-get (car sent) :request)
+                                         '(:params asyncTaskId))
+                         "task-1")))
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-notification-subagent-group-nil-for-root-session-test ()
+  "Test that a root-session notification carries no subagent group."
+  (let ((state (list (cons :session (list (cons :id "root-session")))
+                     (cons :native-subagents nil))))
+    (should-not (agent-shell--notification-subagent-group
+                state `((method . "session/update")
+                        (params . ((sessionId . "root-session")
+                                   (update . ((sessionUpdate . "agent_message_chunk"))))))))))
+
+(ert-deftest agent-shell-notification-subagent-group-resolves-registered-subagent-test ()
+  "Test that a registered subagent's own updates resolve to its group."
+  (let ((state (list (cons :session (list (cons :id "root-session")))
+                     (cons :native-subagents nil))))
+    (agent-shell--save-native-subagent state "subagent-1" "Researcher" "Find prior art")
+    (let ((group (agent-shell--notification-subagent-group
+                  state `((method . "session/update")
+                          (params . ((sessionId . "subagent-1")
+                                     (update . ((sessionUpdate . "agent_message_chunk")))))))))
+      (should (equal (car group) "subagent-1"))
+      (should (equal (map-elt (cdr group) :name) "Researcher")))))
+
+(ert-deftest agent-shell-notification-subagent-group-nil-for-unregistered-session-test ()
+  "Test that an unrecognized foreign session id doesn't crash or false-match."
+  (let ((state (list (cons :session (list (cons :id "root-session")))
+                     (cons :native-subagents nil))))
+    (should-not (agent-shell--notification-subagent-group
+                state `((method . "session/update")
+                        (params . ((sessionId . "some-other-session")
+                                   (update . ((sessionUpdate . "agent_message_chunk"))))))))))
+
+(ert-deftest agent-shell-subagent-name-face-inherits-font-lock-type-face-test ()
+  "The subagent name face is distinct and inherits the type face."
+  (should (facep 'agent-shell-subagent-name))
+  (should (eq (face-attribute 'agent-shell-subagent-name :inherit nil t)
+              'font-lock-type-face)))
+
+(ert-deftest agent-shell-subagent-name-label-includes-name-and-name-face-test ()
+  "A subagent name uses its own face with a TTY fallback."
+  (let ((label (agent-shell--subagent-name-label '(:name "Researcher"))))
+    (should (equal (substring-no-properties label) "Researcher"))
+    (should (eq (get-text-property 0 'font-lock-face label)
+                'agent-shell-subagent-name))
+    (should (eq (get-text-property 0 'agent-shell-subagent-label label)
+                t))
+    (should (equal (get-text-property 0 'display label)
+                   `(when (not window-system) .
+                      ,(propertize "[Researcher]" 'face 'agent-shell-subagent-name))))))
+
+(ert-deftest agent-shell-subagent-name-label-nil-without-name-test ()
+  "A nameless subagent yields no label rather than a blank one."
+  (should-not (agent-shell--subagent-name-label nil)))
+
+(defun agent-shell-tests--subagent-shell (dispatch &optional transcript-file)
+  "Render DISPATCH's notifications into a live shell and report the result.
+
+TRANSCRIPT-FILE, when given, is where the shell keeps its transcript;
+without one, transcript writes are dropped.
+
+DISPATCH is called with two functions.  SEND takes a session id and a
+`session/update' payload and dispatches it as that session.  END-TURN
+ends the root's turn the way `session/prompt' succeeding does, then
+prints the prompt the shell holds afterwards; PROMPT submits a new one.
+
+Returns an alist of `:blocks' (every rendered block's qualified id, in
+buffer order, deduplicated), `:groups' (each block's group), the
+buffer's `:text' with properties stripped, `:pages' (what
+`shell-maker--extract-history' pairs up, which is what the viewport
+pages through), `:state', and `:subagents', mapping each subagent's
+session id to the same report for its own buffer.  Subagent buffers are
+killed along with the shell.
+
+Renders for real rather than stubbing `agent-shell--update-fragment':
+what breaks when a subagent outlives its turn is where fragments land in
+the buffer, which a captured argument list cannot show."
+  (let* (;; This shell prints its prompt when a turn ends rather than
+         ;; keeping one live throughout, so there is nothing to render
+         ;; above while the first turn runs and
+         ;; `agent-shell--live-prompt-start' would only signal.  Rendering
+         ;; above a prompt that is there is still covered: `end-turn'
+         ;; leaves one, and everything after it renders above it.
+         (agent-shell-persistent-prompt-enabled nil)
+         ;; Render each chunk as it arrives: DISPATCH reads the buffers
+         ;; right after sending, with no turn end to flush a batch.  A
+         ;; test of batching rebinds this inside DISPATCH.
+         (agent-shell--stream-render-interval nil)
+         (buffer (generate-new-buffer " *agent-shell-subagent-test*"))
+         (process (start-process "fake-agent" buffer "cat")))
+    (set-process-query-on-exit-flag process nil)
+    ;; The default sentinel reports the exit into read-only comint output,
+    ;; and a failing sentinel aborts the whole ERT batch.
+    (set-process-sentinel process #'ignore)
+    (unwind-protect
+        (with-current-buffer buffer
+          (comint-mode)
+          (setq-local major-mode 'agent-shell-mode)
+          (setq-local comint-prompt-regexp "Claude> ")
+          (setq-local comint-use-prompt-regexp t)
+          (setq-local shell-maker--config
+                      (make-shell-maker-config
+                       :name "agent" :prompt "Claude> " :prompt-regexp "Claude> "))
+          (setq-local agent-shell--state
+                      (agent-shell--make-state
+                       :buffer buffer
+                       :agent-config '((:shell-prompt . "Claude> ")
+                                       (:mode-line-name . "Claude"))))
+          (setq-local agent-shell--transcript-file transcript-file)
+          (let ((state agent-shell--state))
+            (map-put! (map-elt state :session) :id "root")
+            (map-put! state :request-count 1)
+            (map-put! state :active-requests '(((:method . "session/prompt"))))
+            (cl-letf (((symbol-function 'shell-maker--process) (lambda () process))
+                      ((symbol-function 'shell-maker-busy) (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell--append-transcript)
+                       (if transcript-file
+                           (symbol-function 'agent-shell--append-transcript)
+                         #'ignore))
+                      ;; No viewport in these tests; exercise the shell path.
+                      ((symbol-function 'agent-shell-viewport--buffer) #'ignore))
+              (cl-flet* ((prompt (text)
+                           (let ((inhibit-read-only t))
+                             (goto-char (point-max))
+                             (insert (propertize
+                                      "Claude> "
+                                      ;; Both faces, as a live prompt carries
+                                      ;; them: `shell-maker--extract-history'
+                                      ;; wants the literal
+                                      ;; `comint-highlight-prompt'.
+                                      'font-lock-face '(agent-shell-prompt
+                                                        comint-highlight-prompt)
+                                      'field 'output)
+                                     text))
+                           (set-marker (process-mark process) (point-max))
+                           (shell-maker-insert-end-of-prompt-marker)
+                           (let ((inhibit-read-only t))
+                             (goto-char (point-max))
+                             (insert "\n"))
+                           (map-put! state :request-count
+                                     (1+ (map-elt state :request-count)))
+                           (map-put! state :active-requests
+                                     '(((:method . "session/prompt")))))
+                         (send (session-id &rest update)
+                           (agent-shell--on-notification
+                            :state state
+                            :acp-notification
+                            `((method . "session/update")
+                              (params . ((sessionId . ,session-id)
+                                         (update . ,update))))))
+                         (end-turn ()
+                           (agent-shell--forget-turn-tool-calls state)
+                           (agent-shell--collapse-expanded-activity-group state)
+                           (map-put! state :active-requests nil)
+                           (let ((inhibit-read-only t))
+                             (goto-char (point-max))
+                             (set-marker (process-mark process) (point-max))
+                             (shell-maker--output-filter process "\nClaude> ")
+                             ;; comint marks no face in batch, and extraction
+                             ;; needs the literal `comint-highlight-prompt'.
+                             (add-text-properties
+                              (car comint-last-prompt) (cdr comint-last-prompt)
+                              '(font-lock-face (agent-shell-prompt
+                                                comint-highlight-prompt))))))
+                (prompt "do research")
+                ;; `prompt' advanced the count for the turn it submits; the
+                ;; first turn is the one already set up above.
+                (map-put! state :request-count 1)
+                (funcall dispatch #'send #'end-turn #'prompt))))
+          (list (cons :blocks (mapcar #'car (agent-shell-tests--rendered-blocks)))
+                (cons :groups (agent-shell-tests--rendered-blocks))
+                (cons :text (substring-no-properties
+                             (buffer-substring (point-min) (point-max))))
+                (cons :pages (shell-maker--extract-history
+                              "Claude> " :trimmed nil))
+                (cons :state agent-shell--state)
+                (cons :subagents
+                      (mapcar (lambda (entry)
+                                (cons (car entry)
+                                      (agent-shell-tests--subagent-buffer-report
+                                       (map-elt (cdr entry) :buffer))))
+                              (map-elt agent-shell--state :native-subagents)))))
+      (when (process-live-p process)
+        (delete-process process))
+      (with-current-buffer buffer
+        (let ((kill-buffer-query-functions nil))
+          (agent-shell-subagents--kill-buffers agent-shell--state)
+          (kill-buffer buffer))))))
+
+(defun agent-shell-tests--subagent-buffer-report (buffer)
+  "Return BUFFER's `:blocks', `:groups', `:text' and `:mode', or nil.
+Nil when BUFFER is dead.  The same shape `agent-shell-tests--subagent-shell'
+reports the shell in."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (list (cons :blocks (mapcar #'car (agent-shell-tests--rendered-blocks)))
+            (cons :groups (agent-shell-tests--rendered-blocks))
+            (cons :text (substring-no-properties
+                         (buffer-substring (point-min) (point-max))))
+            (cons :mode major-mode)))))
+
+(defun agent-shell-tests--rendered-blocks ()
+  "Return (QUALIFIED-ID . GROUP-ID) for each rendered block, in buffer order.
+
+Runs of the same block collapse into one entry, so a block rendered
+twice is two entries and says so."
+  (let ((position (point-min))
+        (blocks '()))
+    (while (< position (point-max))
+      (when-let* ((state (get-text-property position 'agent-shell-ui-state))
+                  (id (map-elt state :qualified-id))
+                  ((not (equal id (car-safe (car blocks))))))
+        (push (cons id (map-elt state :group-id)) blocks))
+      (setq position (next-single-property-change
+                      position 'agent-shell-ui-state nil (point-max))))
+    (nreverse blocks)))
+
+(defun agent-shell-tests--spawn-and-work (send)
+  "Dispatch a root turn that spawns `child' and leaves it working, via SEND."
+  (funcall send "root" '(sessionUpdate . "tool_call") '(toolCallId . "T1")
+           '(title . "Task: research") '(kind . "other") '(status . "in_progress"))
+  (funcall send "root" '(sessionUpdate . "subagent_update")
+           '(sessionId . "child") '(title . "Researcher")
+           '(description . "Find prior art") '(state (state . "running")))
+  (funcall send "child" '(sessionUpdate . "tool_call") '(toolCallId . "C1")
+           '(title . "Read foo.el") '(kind . "read") '(status . "pending"))
+  (funcall send "child" '(sessionUpdate . "agent_message_chunk")
+           '(messageId . "m-child") '(content (type . "text") (text . "I looked")))
+  (funcall send "root" '(sessionUpdate . "agent_message_chunk")
+           '(messageId . "m-root") '(content (type . "text") (text . "Delegating."))))
+
+(defun agent-shell-tests--subagent-report (rendered session-id)
+  "Return SESSION-ID's buffer report from RENDERED."
+  (map-elt (map-elt rendered :subagents) session-id))
+
+(ert-deftest agent-shell-subagent-content-renders-in-its-own-buffer-test ()
+  "A subagent's work renders in its buffer, and the shell keeps one row.
+
+The row sits where the spawn happened.  The subagent's tool calls and
+messages render flat in its own buffer, headed by its task, so none of
+it lands in the turn the root is streaming."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--spawn-and-work send))))
+         (blocks (map-elt rendered :blocks))
+         (child (agent-shell-tests--subagent-report rendered "child")))
+    ;; The shell: the root's own work, and one row for the subagent.
+    (should (member "1-subagent-child" blocks))
+    (should (member "1-T1" blocks))
+    (should (member "1-m-root-agent_message_chunk" blocks))
+    (should-not (member "1-C1" blocks))
+    (should-not (member "1-m-child-agent_message_chunk" blocks))
+    (should-not (member "1-subagent-child-task" blocks))
+    (should-not (string-match-p "I looked" (map-elt rendered :text)))
+    ;; The row is folded, its body holding the task and a way in.
+    (should (string-match-p "Researcher" (map-elt rendered :text)))
+    ;; The subagent's buffer: task first, then its work, ungrouped.
+    (should (eq (map-elt child :mode) 'agent-shell-subagent-mode))
+    (should (equal (seq-take (map-elt child :blocks) 3)
+                   '("1-subagent-child-task" "1-C1" "1-m-child-agent_message_chunk")))
+    (should-not (seq-some #'cdr (map-elt child :groups)))
+    (should (string-match-p "Find prior art" (map-elt child :text)))
+    (should (string-match-p "I looked" (map-elt child :text)))
+    ;; The tool call stays filed under the row for its summary.
+    (should (equal (map-nested-elt rendered '(:state :tool-calls "C1" :group-id))
+                   "subagent-child"))))
+
+(ert-deftest agent-shell-subagent-row-name-opens-its-buffer-test ()
+  "RET on the name in a subagent's row opens its buffer.
+
+The rest of the row's label still folds it, and its body holds only
+the task.  The row is relabelled as the subagent works, so the name
+has to keep acting across rewrites, not only when first drawn."
+  (let (opened label-map)
+    (let ((rendered
+           (agent-shell-tests--subagent-shell
+            (lambda (send _end-turn _prompt)
+              (agent-shell-tests--spawn-and-work send)
+              (cl-letf (((symbol-function 'agent-shell-subagents-display)
+                         (lambda (_state session-id) (push session-id opened))))
+                (goto-char (point-min))
+                (goto-char (prop-match-beginning
+                            (text-property-search-forward
+                             'agent-shell-subagent-label t t)))
+                (call-interactively (key-binding (kbd "RET")))
+                (goto-char (line-beginning-position))
+                (setq label-map (get-text-property (point) 'keymap)))))))
+      (should (equal opened '("child")))
+      (should (eq label-map agent-shell-ui-fragment-map))
+      (should-not (string-match-p "Open subagent" (map-elt rendered :text))))))
+
+(ert-deftest agent-shell-subagent-row-survives-the-turn-that-spawned-it-test ()
+  "Work arriving after `end_turn' goes to the buffer and updates the one row.
+
+A subagent outlives the turn that spawned it, so its row is addressed by
+the namespace pinned at spawn rather than by whatever the root is doing
+when the update lands.  Without that, the row renders a second time
+under an `out-of-turn' namespace."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send end-turn _prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (funcall end-turn)
+                      (funcall send "child" '(sessionUpdate . "tool_call")
+                               '(toolCallId . "C2") '(title . "Grep bar")
+                               '(kind . "search") '(status . "completed"))
+                      (funcall send "child" '(sessionUpdate . "agent_thought_chunk")
+                               '(content (type . "text") (text . "still thinking"))))))
+         (blocks (map-elt rendered :blocks))
+         (child-blocks (map-elt (agent-shell-tests--subagent-report rendered "child")
+                                :blocks)))
+    (should (member "1-C2" child-blocks))
+    (should (member "1-subagent-child-agent_thought_chunk-0" child-blocks))
+    (should (equal (seq-count (lambda (id) (equal id "1-subagent-child")) blocks) 1))
+    (should-not (seq-find (lambda (id) (string-prefix-p "out-of-turn-" id)) blocks))
+    (should-not (seq-find (lambda (id) (string-prefix-p "out-of-turn-" id)) child-blocks))))
+
+(ert-deftest agent-shell-subagent-tool-call-completes-in-place-after-the-turn-test ()
+  "A subagent tool call still running at `end_turn' completes in its own row.
+
+The turn's end drops the tool calls the root is done with, but a
+subagent's are still in flight: dropping those too leaves the late
+completion with no title and no group to rejoin, so it lands as a
+stranger below while the original row stays pending forever."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send end-turn _prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (funcall end-turn)
+                      (funcall send "child" '(sessionUpdate . "tool_call_update")
+                               '(toolCallId . "C1") '(status . "completed")))))
+         (state (map-elt rendered :state)))
+    (should (equal (seq-count (lambda (id) (equal id "1-C1"))
+                              (map-elt (agent-shell-tests--subagent-report rendered "child")
+                                       :blocks))
+                   1))
+    (should (equal (map-nested-elt state '(:tool-calls "C1" :title)) "Read foo.el"))
+    (should (equal (map-nested-elt state '(:tool-calls "C1" :group-id)) "subagent-child"))
+    ;; The root's own tool call is released, as before.
+    (should-not (map-nested-elt state '(:tool-calls "T1")))))
+
+(ert-deftest agent-shell-subagent-state-update-relabels-one-row-test ()
+  "A lifecycle report updates the row rather than drawing a second one.
+
+It arrives on the root's session, possibly turns later, so only the
+namespace pinned at spawn points it back at the row drawn then.  The
+terminal state also releases the subagent's tool calls, keeping the
+summary they add up to."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send end-turn prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (funcall end-turn)
+                      (funcall prompt "something else")
+                      (funcall send "root" '(sessionUpdate . "subagent_update")
+                               '(sessionId . "child")
+                               '(state (state . "idle") (stopReason . "end_turn"))))))
+         (blocks (map-elt rendered :blocks))
+         (state (map-elt rendered :state))
+         (subagent (agent-shell--native-subagent state "child")))
+    (should (equal (seq-count (lambda (id) (equal id "1-subagent-child")) blocks) 1))
+    (should-not (member "2-subagent-child" blocks))
+    (should (equal (map-elt subagent :state) "completed"))
+    (should (map-elt subagent :ended-at))
+    (should (map-elt subagent :summary))
+    (should (equal (map-elt subagent :tool-count) 1))
+    (should-not (map-nested-elt state '(:tool-calls "C1")))
+    ;; The row still reads what the subagent did.
+    (should (string-match-p (regexp-quote (map-elt subagent :summary))
+                            (map-elt rendered :text)))))
+
+(ert-deftest agent-shell-subagent-message-spanning-the-turn-stays-one-message-test ()
+  "A subagent message interrupted by `end_turn' keeps streaming into one block."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send end-turn _prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (funcall end-turn)
+                      (funcall send "child" '(sessionUpdate . "agent_message_chunk")
+                               '(messageId . "m-child")
+                               '(content (type . "text") (text . " and found it."))))))
+         (child (agent-shell-tests--subagent-report rendered "child")))
+    (should (equal (seq-count (lambda (id) (equal id "1-m-child-agent_message_chunk"))
+                              (map-elt child :blocks))
+                   1))
+    (should (string-match-p "I looked and found it." (map-elt child :text)))))
+
+(ert-deftest agent-shell-subagent-work-stays-out-of-a-later-page-test ()
+  "A subagent still working through a later turn leaves that page alone.
+
+The viewport pages by interaction, so content rendered at the shell's
+end belongs to whichever prompt came last.  A subagent's work goes to
+its own buffer instead, and its row stays on the page that spawned it."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send end-turn prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (funcall end-turn)
+                      (funcall prompt "unrelated question")
+                      (funcall send "child" '(sessionUpdate . "tool_call")
+                               '(toolCallId . "C2") '(title . "Grep bar")
+                               '(kind . "search") '(status . "completed"))
+                      (funcall send "root" '(sessionUpdate . "agent_message_chunk")
+                               '(messageId . "m-root3")
+                               '(content (type . "text") (text . "Answer 2.")))
+                      (funcall end-turn))))
+         (pages (map-elt rendered :pages)))
+    (should (equal (length pages) 2))
+    (should (equal (car (nth 0 pages)) "do research"))
+    (should (equal (car (nth 1 pages)) "unrelated question"))
+    (should (string-match-p "Researcher" (substring-no-properties (cdr (nth 0 pages)))))
+    (should-not (string-match-p "Researcher" (substring-no-properties (cdr (nth 1 pages)))))
+    ;; Only the row, on the page that spawned it, names it as its latest.
+    (should-not (string-match-p "Grep bar" (substring-no-properties (cdr (nth 1 pages)))))
+    (should (string-match-p "Grep bar" (map-elt (agent-shell-tests--subagent-report
+                                                 rendered "child")
+                                                :text)))
+    (should (string-match-p "Answer 2." (substring-no-properties (cdr (nth 1 pages)))))))
+
+(ert-deftest agent-shell-nested-subagent-row-renders-in-its-parent-buffer-test ()
+  "A subagent spawned by a subagent gets its row in the spawner's buffer.
+
+Its own work goes to a buffer of its own, like any subagent's, and the
+shell shows only the root's direct child."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (funcall send "child" '(sessionUpdate . "subagent_update")
+                               '(sessionId . "grandchild") '(title . "Reviewer")
+                               '(description . "Check it") '(state (state . "running")))
+                      (funcall send "grandchild" '(sessionUpdate . "tool_call")
+                               '(toolCallId . "G1") '(title . "Read bar.el")
+                               '(kind . "read") '(status . "completed")))))
+         (child (agent-shell-tests--subagent-report rendered "child"))
+         (grandchild (agent-shell-tests--subagent-report rendered "grandchild")))
+    (should-not (member "1-subagent-grandchild" (map-elt rendered :blocks)))
+    (should (member "1-subagent-grandchild" (map-elt child :blocks)))
+    (should-not (member "1-G1" (map-elt child :blocks)))
+    (should (member "1-G1" (map-elt grandchild :blocks)))
+    (should (string-match-p "Check it" (map-elt grandchild :text)))
+    (should (equal (map-elt (agent-shell--native-subagent
+                             (map-elt rendered :state) "grandchild")
+                            :parent)
+                   "child"))))
+
+(defun agent-shell-tests--row-label-at-width (width)
+  "Return the running `live' subagent's row label, plain, for a WIDTH window.
+Its latest activity is a running tool call with a long title."
+  (let ((state (agent-shell-tests--list-state)))
+    (agent-shell--save-tool-call
+     state "C1" '((:title . "Grep for every caller of the function under review today")
+                  (:kind . "search") (:status . "in_progress")))
+    (agent-shell--update-native-subagent
+     state "live" '((:summary . "Read 2 files")
+                    (:activity (:kind . tool) (:id . "C1") (:block-id . "C1"))))
+    (cl-letf (((symbol-function 'agent-shell--subagent-row-width)
+               (lambda (&rest _) width)))
+      (substring-no-properties
+       (agent-shell--subagent-row-label
+        state (agent-shell--subagent-row-at state "live"))))))
+
+(ert-deftest agent-shell-subagent-row-label-fits-its-window-test ()
+  "A running subagent's row stays on one line by cutting its latest activity.
+
+The activity changes on every tool call.  A row that wrapped would
+change height with it, reflowing everything below.  The fold indicator
+in front of the label takes two columns."
+  (let ((wide (agent-shell-tests--row-label-at-width 200))
+        (narrow (agent-shell-tests--row-label-at-width 60))
+        (cramped (agent-shell-tests--row-label-at-width 30)))
+    (should (string-suffix-p "· Grep for every caller of the function under review today" wide))
+    (should (string-match-p "\\`◔ Subagent Researcher Read 2 files · Grep for.*…\\'" narrow))
+    (should (< (+ 2 (string-width narrow)) 60))
+    ;; No room left for a useful activity: the rest is kept whole.
+    (should (equal cramped "◔ Subagent Researcher Read 2 files"))))
+
+(ert-deftest agent-shell-subagent-row-width-is-the-narrowest-window-showing-it-test ()
+  "A row is cut to the narrowest window showing the buffer it renders in."
+  (let ((state (agent-shell-tests--list-state))
+        (shell (generate-new-buffer "*row-width-test*")))
+    (unwind-protect
+        (progn
+          (map-put! state :buffer shell)
+          (should-not (agent-shell--subagent-row-width
+                       state (agent-shell--subagent-row-at state "live")))
+          (with-selected-window (frame-first-window)
+            (save-window-excursion
+              (delete-other-windows)
+              (set-window-buffer (selected-window) shell)
+              (let ((other (split-window-right)))
+                (set-window-buffer other shell)
+                (should (equal (agent-shell--subagent-row-width
+                                state (agent-shell--subagent-row-at state "live"))
+                               (min (window-body-width (selected-window))
+                                    (window-body-width other))))))))
+      (kill-buffer shell))))
+
+(defun agent-shell-tests--subagent-activity-label (session-id)
+  "Return SESSION-ID's latest activity label in the current shell, plain."
+  (when-let* ((activity (map-elt (agent-shell--native-subagent agent-shell--state session-id)
+                                 :activity))
+              (label (agent-shell--subagent-activity-label agent-shell--state activity)))
+    (substring-no-properties label)))
+
+(ert-deftest agent-shell-subagent-row-shows-its-latest-activity-test ()
+  "A running subagent's row names what it did last, whatever kind it was.
+
+A newer tool call takes over from an older one, and an older one
+completing does not take it back.  A tool call is shown only while it
+runs: once done, the summary counts it.  Once the subagent finishes the
+summary says what it did, so the activity goes."
+  (let* ((labels nil)
+         (rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send _end-turn _prompt)
+             (cl-flet ((note () (push (agent-shell-tests--subagent-activity-label "child")
+                                      labels)))
+               (agent-shell-tests--spawn-and-work send)
+               (note)
+               (funcall send "child" '(sessionUpdate . "tool_call") '(toolCallId . "C2")
+                        '(title . "Grep bar") '(kind . "search") '(status . "in_progress"))
+               (note)
+               (push (substring-no-properties
+                      (agent-shell--subagent-row-label
+                       agent-shell--state
+                       (agent-shell--subagent-row-at agent-shell--state "child")))
+                     labels)
+               (funcall send "child" '(sessionUpdate . "tool_call_update")
+                        '(toolCallId . "C1") '(status . "completed"))
+               (note)
+               (funcall send "child" '(sessionUpdate . "tool_call_update")
+                        '(toolCallId . "C2") '(status . "completed"))
+               (note)
+               (push (substring-no-properties
+                      (agent-shell--subagent-row-label
+                       agent-shell--state
+                       (agent-shell--subagent-row-at agent-shell--state "child")))
+                     labels)
+               (funcall send "child" '(sessionUpdate . "agent_thought_chunk")
+                        '(content (type . "text") (text . "hmm")))
+               (note)
+               (funcall send "child" '(sessionUpdate . "plan")
+                        '(entries . [((status . "completed") (content . "Look"))
+                                     ((status . "pending") (content . "Report"))]))
+               (note)
+               (funcall send "root" '(sessionUpdate . "subagent_update")
+                        '(sessionId . "child")
+                        '(state (state . "idle") (stopReason . "end_turn")))
+               (note)))))
+         (labels (nreverse labels)))
+    (should (equal (nth 0 labels) "Writing"))
+    ;; Plain, with no status icon to sit beside the subagent's own.
+    (should (equal (nth 1 labels) "Grep bar"))
+    (should (string-match-p "\\`◔ Subagent Researcher Read .+ · .*Grep bar\\'" (nth 2 labels)))
+    (should (string-match-p "Grep bar" (nth 3 labels)))
+    (should-not (nth 4 labels))
+    (should (string-match-p "\\`◔ Subagent Researcher Read a file, ran a search\\'"
+                            (nth 5 labels)))
+    (should (equal (nth 6 labels) "Thinking"))
+    (should (equal (nth 7 labels) "Plan 1/2"))
+    (should-not (nth 8 labels))
+    (should-not (string-match-p "Plan 1/2" (map-elt rendered :text)))))
+
+(ert-deftest agent-shell-subagent-pending-permission-stays-its-latest-activity-test ()
+  "A subagent waiting on approval shows that until the request is answered.
+
+It is stalled until then, which matters more than any thought it streams
+in the meantime."
+  (let ((labels nil)
+        (case-fold-search nil))
+    (cl-letf (((symbol-function 'agent-shell--make-tool-call-permission-text)
+               (lambda (&rest _) "Allow?")))
+      (agent-shell-tests--subagent-shell
+       (lambda (send _end-turn _prompt)
+         (agent-shell-tests--spawn-and-work send)
+         (agent-shell--on-request
+          :state agent-shell--state
+          :acp-request '((id . 7)
+                         (method . "session/request_permission")
+                         (params (sessionId . "child")
+                                 (toolCall (toolCallId . "C3") (title . "Delete build")
+                                           (kind . "delete") (status . "pending"))
+                                 (options . [((optionId . "allow") (name . "Allow")
+                                              (kind . "allow_once"))]))))
+         (push (agent-shell-tests--subagent-activity-label "child") labels)
+         (funcall send "child" '(sessionUpdate . "agent_thought_chunk")
+                  '(content (type . "text") (text . "waiting")))
+         (push (agent-shell-tests--subagent-activity-label "child") labels)
+         (cl-letf (((symbol-function 'acp-send-response) #'ignore))
+           (agent-shell--send-permission-response
+            :client nil :request-id 7 :option-id "allow"
+            :state agent-shell--state :tool-call-id "C3"))
+         (push (agent-shell-tests--subagent-activity-label "child") labels)
+         (push (substring-no-properties
+                (agent-shell--subagent-row-label
+                 agent-shell--state
+                 (agent-shell--subagent-row-at agent-shell--state "child")))
+               labels)
+         (push (buffer-substring-no-properties (point-min) (point-max)) labels)
+         (funcall send "child" '(sessionUpdate . "agent_message_chunk")
+                  '(messageId . "m-2") '(content (type . "text") (text . "done")))
+         (push (agent-shell-tests--subagent-activity-label "child") labels))))
+    (setq labels (nreverse labels))
+    (should (equal (nth 0 labels) "Needs approval: Delete build"))
+    (should (string-match-p "\\`Needs approval" (nth 1 labels)))
+    ;; Answered: the row reads as the tool call it is, at once.
+    (should (string-match-p "Delete build" (nth 2 labels)))
+    (should-not (string-match-p "Needs approval" (nth 2 labels)))
+    (should-not (string-match-p "Needs approval" (nth 4 labels)))
+    (should (equal (nth 5 labels) "Writing"))))
+
+(ert-deftest agent-shell-nested-subagent-is-its-parent-s-latest-activity-test ()
+  "A subagent spawning one of its own shows that one as its latest activity.
+Only while that one runs, as a finished tool call goes too."
+  (let (labels)
+    (agent-shell-tests--subagent-shell
+     (lambda (send _end-turn _prompt)
+       (agent-shell-tests--spawn-and-work send)
+       (funcall send "child" '(sessionUpdate . "subagent_update")
+                '(sessionId . "grandchild") '(title . "Reviewer")
+                '(description . "Check it") '(state (state . "running")))
+       (push (agent-shell-tests--subagent-activity-label "child") labels)
+       (funcall send "child" '(sessionUpdate . "subagent_update")
+                '(sessionId . "grandchild")
+                '(state (state . "idle") (stopReason . "end_turn")))
+       (push (agent-shell-tests--subagent-activity-label "child") labels)))
+    (should (equal (nreverse labels) '("Subagent Reviewer" nil)))))
+
+(ert-deftest agent-shell-subagent-activity-jump-opens-its-fragment-test ()
+  "Jumping to a subagent's latest activity lands on it in the subagent's buffer."
+  (let (landed)
+    (agent-shell-tests--subagent-shell
+     (lambda (send _end-turn _prompt)
+       (agent-shell-tests--spawn-and-work send)
+       (funcall send "child" '(sessionUpdate . "tool_call") '(toolCallId . "C2")
+                '(title . "Grep bar") '(kind . "search") '(status . "completed")
+                '(content . [((type . "content")
+                              (content (type . "text") (text . "bar.el:3")))]))
+       (save-window-excursion
+         (cl-letf (((symbol-function 'agent-shell-subagents-display)
+                    (lambda (state session-id)
+                      (switch-to-buffer
+                       (map-elt (agent-shell--native-subagent state session-id) :buffer)))))
+           (agent-shell-subagents-jump-to-activity agent-shell--state "child")
+           (setq landed (list (buffer-local-value 'major-mode (current-buffer))
+                              (map-elt (get-text-property (point) 'agent-shell-ui-state)
+                                       :qualified-id)
+                              (map-elt (get-text-property (point) 'agent-shell-ui-state)
+                                       :collapsed)))))))
+    (should (equal landed '(agent-shell-subagent-mode "1-C2" nil)))))
+
+(ert-deftest agent-shell-subagent-update-registers-and-retires-a-subagent-test ()
+  "A single `subagent_update' drives the whole lifecycle.
+
+Its first sighting registers the subagent and draws its row, later ones
+merge only the fields they carry, and a terminal state retires it."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (funcall send "root" '(sessionUpdate . "subagent_update")
+                               '(sessionId . "child") '(title . "Researcher")
+                               '(description . "Find prior art")
+                               '(state (state . "running")))
+                      (funcall send "child" '(sessionUpdate . "tool_call")
+                               '(toolCallId . "C1") '(title . "Read foo.el")
+                               '(kind . "read") '(status . "completed"))
+                      (funcall send "root" '(sessionUpdate . "subagent_update")
+                               '(sessionId . "child")
+                               '(state (state . "idle") (stopReason . "error"))))))
+         (subagent (agent-shell--native-subagent (map-elt rendered :state) "child")))
+    (should (equal (map-elt subagent :name) "Researcher"))
+    (should (equal (map-elt subagent :task) "Find prior art"))
+    (should (equal (map-elt subagent :state) "failed"))
+    (should (map-elt subagent :ended-at))
+    (should (equal (seq-count (lambda (id) (equal id "1-subagent-child"))
+                              (map-elt rendered :blocks))
+                   1))
+    (should (member "1-C1" (map-elt (agent-shell-tests--subagent-report rendered "child")
+                                    :blocks)))))
+
+(defun agent-shell-tests--rfd-subagent-update (send session-id &rest fields)
+  "Dispatch, via SEND, the RFD `subagent_update' for SESSION-ID with FIELDS.
+claude-agent-acp sends it on the parent, here the root."
+  (apply send "root" '(sessionUpdate . "subagent_update")
+         (cons 'sessionId session-id) fields))
+
+(defun agent-shell-tests--rfd-session-message (send session-id message-id text)
+  "Dispatch, via SEND, the RFD `session_message' MESSAGE-ID with TEXT to SESSION-ID."
+  (funcall send session-id '(sessionUpdate . "session_message")
+           (cons 'messageId message-id) '(senderSessionId . "root")
+           (cons 'recipientSessionId session-id)
+           `(content . [((type . "text") (text . ,text))])))
+
+(ert-deftest agent-shell-rfd-subagent-state-test ()
+  "An RFD work state maps onto the states a subagent row renders."
+  (should (equal (agent-shell--subagent-rfd-state '((state . "running"))) "running"))
+  (should (equal (agent-shell--subagent-rfd-state '((state . "requires_action"))) "running"))
+  (should (equal (agent-shell--subagent-rfd-state
+                  '((state . "idle") (stopReason . "end_turn")))
+                 "completed"))
+  (should (equal (agent-shell--subagent-rfd-state
+                  '((state . "idle") (stopReason . "cancelled")))
+                 "cancelled"))
+  (should (equal (agent-shell--subagent-rfd-state
+                  '((state . "idle") (stopReason . "error")
+                    (error (code . -32603) (message . "boom"))))
+                 "failed"))
+  ;; claude-agent-acp saw the work end, but neither a cancel nor a failure.
+  (should (equal (agent-shell--subagent-rfd-state '((state . "idle"))) "disconnected"))
+  ;; An ancestor announced after a reload carries no state at all.
+  (should-not (agent-shell--subagent-rfd-state nil)))
+
+(ert-deftest agent-shell-rfd-subagent-keeps-its-session-across-runs-test ()
+  "An RFD child is announced, prompted, goes idle and runs again in one row.
+
+claude-agent-acp's RFD form names the child by `sessionId', labels it
+with `title' and `description', reports `state' as an object, and sends
+each prompt as a `session_message' on the child.  Idle is not an end: a
+SendMessage runs the same child again."
+  (let* (after-first-run
+         (rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send _end-turn _prompt)
+             (agent-shell-tests--rfd-subagent-update
+              send "child" '(title . "Researcher") '(description . "Find prior art")
+              '(state (state . "running")))
+             (agent-shell-tests--rfd-session-message
+              send "child" "toolu_agent" "Look for prior art")
+             (funcall send "child" '(sessionUpdate . "tool_call") '(toolCallId . "C1")
+                      '(title . "Read foo.el") '(kind . "read") '(status . "completed"))
+             (agent-shell-tests--rfd-subagent-update
+              send "child" '(state (state . "idle") (stopReason . "end_turn")))
+             (setq after-first-run
+                   (copy-tree (agent-shell--native-subagent agent-shell--state "child")))
+             ;; A SendMessage resumes it.
+             (agent-shell-tests--rfd-subagent-update send "child" '(state (state . "running")))
+             (agent-shell-tests--rfd-session-message
+              send "child" "toolu_send" "Check the tests too"))))
+         (state (map-elt rendered :state))
+         (subagent (agent-shell--native-subagent state "child"))
+         (child (agent-shell-tests--subagent-report rendered "child")))
+    (should (equal (map-elt after-first-run :name) "Researcher"))
+    (should (equal (map-elt after-first-run :task) "Find prior art"))
+    (should (equal (map-elt after-first-run :state) "completed"))
+    (should (map-elt after-first-run :ended-at))
+    ;; Running again, it counts as running and records activity again.
+    (should (equal (map-elt subagent :state) "running"))
+    (should-not (map-elt subagent :ended-at))
+    (should-not (map-elt subagent :summary))
+    (should (equal (mapcar #'car (agent-shell-subagents--running state)) '("child")))
+    (should (equal (seq-count (lambda (id) (equal id "1-subagent-child"))
+                              (map-elt rendered :blocks))
+                   1))
+    ;; Both prompts render in the child's buffer, not in the shell.
+    (should (string-match-p "Look for prior art" (map-elt child :text)))
+    (should (string-match-p "Check the tests too" (map-elt child :text)))
+    (should-not (string-match-p "Look for prior art" (map-elt rendered :text)))
+    (should-not (string-match-p "Check the tests too" (map-elt rendered :text)))
+    (should (member "1-C1" (map-elt child :blocks)))))
+
+(ert-deftest agent-shell-rfd-linked-session-messages-test ()
+  "A launch's prompt and the child's reply render in the child's row.
+
+For an RFD client, claude-agent-acp replaces the Agent call with the
+prompt as two linked `session_message's (the parent's outgoing view, the
+child's incoming one) and the child's answer as a message to the
+parent.  The shell shows both under the row standing for the child,
+folded like the Agent call they replace, rather than as blocks of their
+own that nothing ties to the row.  The reply comes from the launch's
+result, after the child went idle."
+  (dolist (expand '(nil t))
+    (let* ((agent-shell-tool-use-expand-by-default expand)
+           (rendered
+            (agent-shell-tests--subagent-shell
+             (lambda (send _end-turn _prompt)
+               (agent-shell-tests--rfd-subagent-update
+		send "child" '(title . "Researcher") '(state (state . "running")))
+               (funcall send "root" '(sessionUpdate . "session_message")
+			'(messageId . "toolu_agent") '(senderSessionId . "root")
+			'(recipientSessionId . "child")
+			'(recipientMessageId . "toolu_agent")
+			'(content . [((type . "text") (text . "Look for prior art"))]))
+               (funcall send "child" '(sessionUpdate . "session_message")
+			'(messageId . "toolu_agent") '(senderSessionId . "root")
+			'(recipientSessionId . "child")
+			'(senderMessageId . "toolu_agent")
+			'(content . [((type . "text") (text . "Look for prior art"))]))
+               (agent-shell-tests--rfd-subagent-update
+		send "child" '(state (state . "idle") (stopReason . "end_turn")))
+               (funcall send "root" '(sessionUpdate . "session_message")
+			'(messageId . "toolu_agent:reply") '(senderSessionId . "child")
+			'(recipientSessionId . "root")
+			'(content . [((type . "text") (text . "Found two papers"))])))))
+           (text (map-elt rendered :text))
+           (child (agent-shell-tests--subagent-report rendered "child")))
+      (should (string-match-p "Look for prior art" text))
+      (should (string-match-p "Found two papers" text))
+      (should-not (seq-find (lambda (id) (string-match-p "session-message" id))
+                            (map-elt rendered :blocks)))
+      (should (string-match-p (if expand "▼ [^ ]+ Subagent Researcher"
+				"▶ [^ ]+ Subagent Researcher")
+                              text))
+      (should-not (string-match-p "◔ Subagent Researcher" text))
+      (should (string-match-p
+               "Subagent Researcher[^▶▼]*Look for prior art[^▶▼]*Found two papers" text))
+      (should-not (let ((case-fold-search nil)) (string-match-p "▼ Prompt" text)))
+      ;; The child sees it as its prompt.
+      (should (string-match-p "Prompt" (map-elt child :text)))
+      (should (string-match-p "Look for prior art" (map-elt child :text))))))
+
+(ert-deftest agent-shell-rfd-session-message-to-unknown-child-folds-like-a-tool-call-test ()
+  "A launch's prompt to a child no `subagent_update' announced has no row.
+
+It renders as a block of its own, standing in for the Agent call, so
+its fold follows `agent-shell-tool-use-expand-by-default'."
+  (dolist (expand '(nil t))
+    (let* ((agent-shell-tool-use-expand-by-default expand)
+           (text (map-elt (agent-shell-tests--subagent-shell
+                           (lambda (send _end-turn _prompt)
+                             (funcall send "root" '(sessionUpdate . "session_message")
+                                      '(messageId . "toolu_agent") '(senderSessionId . "root")
+                                      '(recipientSessionId . "child")
+                                      '(recipientMessageId . "toolu_agent")
+                                      '(content . [((type . "text")
+                                                    (text . "Look for prior art"))]))))
+                          :text)))
+      (should (string-match-p (if expand "▼ To child" "▶ To child") text))
+      (should (string-match-p "Look for prior art" text)))))
+
+(ert-deftest agent-shell-rfd-subagent-config-options-stay-off-the-shell-test ()
+  "A child's `config_option_update' leaves the shell's config options alone.
+
+claude-agent-acp reports each RFD child's model and effort on the
+child's session.  They describe the child, so they must not replace
+the root session's options in the header and the model picker."
+  (let* ((rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send _end-turn _prompt)
+             (agent-shell--save-config-options
+              :state agent-shell--state
+              :acp-config-options [((id . "model") (name . "Model") (category . "model")
+                                    (type . "select") (currentValue . "opus")
+                                    (options . [((value . "opus") (name . "Opus"))
+                                                ((value . "sonnet") (name . "Sonnet"))]))])
+             (agent-shell-tests--rfd-subagent-update
+              send "child" '(title . "Researcher") '(state (state . "running")))
+             (funcall send "child" '(sessionUpdate . "config_option_update")
+                      '(configOptions . [((id . "model") (name . "Model")
+                                          (category . "model") (type . "select")
+                                          (currentValue . "haiku")
+                                          (options . [((value . "haiku")
+                                                       (name . "haiku"))]))])))))
+         (options (agent-shell--config-options (map-elt rendered :state))))
+    (should (equal (map-elt (car options) :current-value) "opus"))
+    (should (equal (length (map-elt (car options) :options)) 2))))
+
+(ert-deftest agent-shell-rfd-subagent-failure-retires-it-test ()
+  "An RFD child that goes idle with an error is failed and retired."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(title . "Researcher") '(state (state . "running")))
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(state (state . "requires_action")))
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(state (state . "idle") (stopReason . "error")
+                                            (error (code . -32603) (message . "boom")))))))
+         (subagent (agent-shell--native-subagent (map-elt rendered :state) "child")))
+    (should (equal (map-elt subagent :state) "failed"))
+    (should (map-elt subagent :ended-at))))
+
+(ert-deftest agent-shell-subagent-finishing-renders-held-back-markup-test ()
+  "A subagent's last list item renders once the subagent finishes.
+
+Streaming holds back a list item whose newline has not arrived, as more
+of its line may still come.  The root's turn ending releases its own
+buffer's held-back markup, but a subagent finishes on its own clock, in
+its own buffer, so finishing has to release that buffer's."
+  (let* ((agent-shell-markdown-list-bullets '("•"))
+         (rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (funcall send "root" '(sessionUpdate . "subagent_update")
+                               '(sessionId . "child") '(title . "Researcher")
+                               '(description . "Find prior art") '(state (state . "running")))
+                      (funcall send "child" '(sessionUpdate . "agent_message_chunk")
+                               '(messageId . "m-child")
+                               '(content (type . "text")
+                                         (text . "Found:\n\n- First\n- Last one")))
+                      (funcall send "root" '(sessionUpdate . "subagent_update")
+                               '(sessionId . "child")
+                               '(state (state . "idle") (stopReason . "end_turn"))))))
+         (text (map-elt (agent-shell-tests--subagent-report rendered "child") :text)))
+    (should (string-match-p "• Last one" text))
+    (should-not (string-match-p "- Last one" text))))
+
+(ert-deftest agent-shell-subagent-prompt-renders-in-its-buffer-test ()
+  "A subagent's replayed prompt renders in its buffer and opens no page."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (funcall send "child" '(sessionUpdate . "user_message_chunk")
+                               '(content (type . "text") (text . "Look for prior art"))))))
+         (child (agent-shell-tests--subagent-report rendered "child")))
+    (should (string-match-p "Look for prior art" (map-elt child :text)))
+    (should-not (string-match-p "Look for prior art" (map-elt rendered :text)))
+    (should (equal (length (map-elt rendered :pages)) 1))))
+
+(ert-deftest agent-shell-subagent-permission-renders-in-both-places-test ()
+  "A subagent's permission dialog shows in the shell and in its buffer.
+
+The shell's copy names the subagent, since nothing else there says whose
+request it is.  Answering it removes both copies."
+  (let* ((during nil)
+         (rendered
+          (cl-letf (((symbol-function 'agent-shell--make-tool-call-permission-text)
+                     (lambda (&rest _) "Allow reading foo.el?")))
+            (agent-shell-tests--subagent-shell
+             (lambda (send _end-turn _prompt)
+               (agent-shell-tests--spawn-and-work send)
+               (let* ((state agent-shell--state)
+                      (agent-shell--subagent-group
+                       (agent-shell--session-subagent-group state "child")))
+                 (agent-shell--render-permission-fragment state "C1"))
+               (setq during
+                     (list (cons :shell (buffer-substring-no-properties
+                                         (point-min) (point-max)))
+                           (cons :shell-blocks (mapcar #'car (agent-shell-tests--rendered-blocks)))
+                           (cons :child (agent-shell-tests--subagent-buffer-report
+                                         (map-elt (agent-shell--native-subagent
+                                                   agent-shell--state "child")
+                                                  :buffer)))))
+               (agent-shell--delete-permission-fragment agent-shell--state "C1"))))))
+    (should (equal (map-nested-elt rendered '(:state :tool-calls "C1" :subagent-session-id))
+                   "child"))
+    (should (member "1-permission-C1" (map-elt during :shell-blocks)))
+    (should (string-match-p "Researcher needs approval" (map-elt during :shell)))
+    (should (member "1-permission-C1" (map-nested-elt during '(:child :blocks))))
+    (should (string-match-p "Allow reading foo.el?" (map-nested-elt during '(:child :text))))
+    ;; Answered: gone from both.
+    (should-not (member "1-permission-C1" (map-elt rendered :blocks)))
+    (should-not (member "1-permission-C1"
+                        (map-elt (agent-shell-tests--subagent-report rendered "child")
+                                 :blocks)))))
+
+(ert-deftest agent-shell-unknown-session-content-gets-one-notice-test ()
+  "Content from a session nobody announced renders in the shell after a notice.
+
+The notice says whose it is once, however much of it arrives."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (funcall send "stranger" '(sessionUpdate . "agent_message_chunk")
+                               '(messageId . "m-s") '(content (type . "text") (text . "Hello")))
+                      (funcall send "stranger" '(sessionUpdate . "agent_message_chunk")
+                               '(messageId . "m-s") '(content (type . "text") (text . " again"))))))
+         (blocks (map-elt rendered :blocks)))
+    (should (equal (seq-count (lambda (id) (equal id "1-unknown-session-stranger")) blocks)
+                   1))
+    (should (string-match-p "Hello again" (map-elt rendered :text)))
+    (should (equal (map-nested-elt rendered '(:state :unknown-sessions)) '("stranger")))))
+
+(ert-deftest agent-shell-unknown-session-message-renders-after-the-notice-test ()
+  "A `session_message' to a session nobody announced renders like its other content.
+
+A restore that replays only the last turn can drop the turn that
+announced a child, so a SendMessage to it in the last turn arrives for
+a session the shell does not know."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--rfd-session-message
+                       send "stranger" "toolu_send" "Check the tests too"))))
+         (blocks (map-elt rendered :blocks)))
+    (should (member "1-unknown-session-stranger" blocks))
+    (should-not (member "1-unhandled-notification" blocks))
+    (should (string-match-p "Check the tests too" (map-elt rendered :text)))))
+
+(ert-deftest agent-shell-partial-restore-ignores-an-unannounced-subagent-end-test ()
+  "A restore that drops a subagent's announcing turn draws no row for it.
+
+claude-agent-acp's replay sends every child's end state after the last
+turn.  When `last' leaves out the turn that announced the child, that
+end is the first the shell hears of it, and it is no spawn."
+  (agent-shell-fakes-with-restored-shell
+      (:verbosity 'last
+       :updates
+       '(("s1" . ((sessionUpdate . "user_message_chunk")
+                  (content (type . "text") (text . "FIRSTPROMPT"))))
+         ("s1" . ((sessionUpdate . "subagent_update") (sessionId . "child")
+                  (title . "Researcher") (state (state . "running"))))
+         ("child" . ((sessionUpdate . "agent_message_chunk")
+                     (content (type . "text") (text . "CHILDTEXT"))))
+         ("s1" . ((sessionUpdate . "agent_message_chunk")
+                  (content (type . "text") (text . "ROOTDONE1"))))
+         ("s1" . ((sessionUpdate . "user_message_chunk")
+                  (content (type . "text") (text . "SECONDPROMPT"))))
+         ("s1" . ((sessionUpdate . "agent_message_chunk")
+                  (content (type . "text") (text . "ROOTDONE2"))))
+         ("s1" . ((sessionUpdate . "subagent_update") (sessionId . "child")
+                  (state (state . "idle") (stopReason . "end_turn"))))))
+    (should (string-match-p "ROOTDONE2" (buffer-string)))
+    (should-not (string-match-p "Subagent" (buffer-string)))
+    (should-not (map-elt agent-shell--state :native-subagents))
+    (should-not (seq-find (lambda (buffer)
+                            (string-match-p "subagent" (buffer-name buffer)))
+                          (buffer-list)))))
+
+(ert-deftest agent-shell-partial-restore-keeps-a-subagent-in-its-turn-test ()
+  "A replayed subagent's prompt opens no prompt turn of the restored shell.
+
+claude-agent-acp replays each child's transcript right after its
+launch, the child's prompt first.  Taken as a root prompt, it would
+split the launching turn in two, and `first-last' would drop the
+child's work along with the rest of that turn."
+  (agent-shell-fakes-with-restored-shell
+      (:verbosity 'first-last
+       :updates
+       '(("s1" . ((sessionUpdate . "user_message_chunk")
+                  (content (type . "text") (text . "FIRSTPROMPT"))))
+         ("s1" . ((sessionUpdate . "tool_call") (toolCallId . "toolu_agent")
+                  (title . "Agent") (kind . "think") (status . "in_progress")))
+         ("s1" . ((sessionUpdate . "subagent_update") (sessionId . "child")
+                  (title . "Researcher") (state (state . "running"))))
+         ("child" . ((sessionUpdate . "user_message_chunk")
+                     (content (type . "text") (text . "CHILDPROMPT"))))
+         ("child" . ((sessionUpdate . "agent_message_chunk")
+                     (content (type . "text") (text . "CHILDTEXT"))))
+         ("s1" . ((sessionUpdate . "agent_message_chunk")
+                  (content (type . "text") (text . "ROOTDONE1"))))
+         ("s1" . ((sessionUpdate . "user_message_chunk")
+                  (content (type . "text") (text . "SECONDPROMPT"))))
+         ("s1" . ((sessionUpdate . "agent_message_chunk")
+                  (content (type . "text") (text . "ROOTDONE2"))))
+         ("s1" . ((sessionUpdate . "user_message_chunk")
+                  (content (type . "text") (text . "THIRDPROMPT"))))
+         ("s1" . ((sessionUpdate . "agent_message_chunk")
+                  (content (type . "text") (text . "ROOTDONE3"))))))
+    (should (string-match-p "ROOTDONE1" (buffer-string)))
+    (should (string-match-p "ROOTDONE3" (buffer-string)))
+    (should-not (string-match-p "SECONDPROMPT" (buffer-string)))
+    (should-not (string-match-p "CHILDPROMPT" (buffer-string)))
+    (let ((buffer (map-elt (agent-shell--native-subagent agent-shell--state "child")
+                           :buffer)))
+      (should (buffer-live-p buffer))
+      (with-current-buffer buffer
+        (should (string-match-p "CHILDPROMPT" (buffer-string)))
+        (should (string-match-p "CHILDTEXT" (buffer-string)))))))
+
+(ert-deftest agent-shell-subagent-buffers-die-with-the-shell-test ()
+  "Killing a shell's subagent buffers leaves none behind."
+  (let (buffer)
+    (agent-shell-tests--subagent-shell
+     (lambda (send _end-turn _prompt)
+       (agent-shell-tests--spawn-and-work send)
+       (setq buffer (map-elt (agent-shell--native-subagent agent-shell--state "child")
+                             :buffer))
+       (should (buffer-live-p buffer))))
+    (should-not (buffer-live-p buffer))))
+
+(ert-deftest agent-shell-subagent-buffer-is-remade-after-being-killed-test ()
+  "A subagent buffer the user killed comes back for the subagent's next update."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (kill-buffer (map-elt (agent-shell--native-subagent
+                                             agent-shell--state "child")
+                                            :buffer))
+                      (funcall send "child" '(sessionUpdate . "tool_call")
+                               '(toolCallId . "C2") '(title . "Grep bar")
+                               '(kind . "search") '(status . "completed")))))
+         (child (agent-shell-tests--subagent-report rendered "child")))
+    (should child)
+    (should (string-match-p "Grep bar" (map-elt child :text)))
+    (should-not (string-match-p "I looked" (map-elt child :text)))))
+
+(ert-deftest agent-shell-latest-page-namespace-p-excludes-an-earlier-turn-test ()
+  "The viewport mirror takes the live namespaces and refuses an earlier one.
+
+It only ever shows the latest interaction, so mirroring a fragment
+pinned to a turn the user has paged past would append that turn's
+content to a page it does not belong to."
+  (let ((state '((:request-count . 2))))
+    (should (agent-shell--latest-page-namespace-p state 2))
+    (should (agent-shell--latest-page-namespace-p state "out-of-turn"))
+    (should-not (agent-shell--latest-page-namespace-p state 1))))
+
+(ert-deftest agent-shell-root-after-turn-activity-shares-one-group-test ()
+  "Late root commands and thoughts share a labelled, folding group."
+  (dolist (thought-first '(nil t))
+    (let* ((agent-shell-activity-group-expand-by-default 'latest)
+           (hidden nil)
+           (rendered
+            (agent-shell-tests--subagent-shell
+             (lambda (send end-turn _prompt)
+               (funcall send "root" '(sessionUpdate . "agent_message_chunk")
+                        '(content (type . "text") (text . "Waiting.")))
+               (funcall end-turn)
+               (when thought-first
+                 (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                          '(content (type . "text") (text . "Checking."))))
+               (funcall send "root" '(sessionUpdate . "tool_call")
+                        '(toolCallId . "late") '(title . "Late command")
+                        '(kind . "execute") '(status . "in_progress"))
+               (unless thought-first
+                 (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                          '(content (type . "text") (text . "Checking."))))
+               (funcall send "root" '(sessionUpdate . "tool_call_update")
+                        '(toolCallId . "late") '(status . "completed"))
+               (funcall send "root" '(sessionUpdate . "agent_message_chunk")
+                        '(content (type . "text") (text . "Finished.")))
+               (setq hidden
+                     (mapcar (lambda (text)
+                               (save-excursion
+                                 (goto-char (point-min))
+                                 (search-forward text)
+                                 (and (get-text-property (match-beginning 0) 'invisible) t)))
+                             '("Late command" "Checking."))))))
+           (groups (map-elt rendered :groups))
+           (tool-parent (map-elt groups "1-late"))
+           (thought (seq-find (lambda (entry)
+                                (string-suffix-p "agent_thought_chunk" (car entry)))
+                              groups)))
+      (should thought)
+      (should (equal hidden '(t t)))
+      (should (= 1 (seq-count (lambda (entry) (equal (car entry) "1-late")) groups)))
+      (should (equal tool-parent (cdr thought)))
+      (should (= 1 (seq-count (lambda (entry)
+                               (and (null (cdr entry))
+                                    (string-match-p "activity-" (car entry))))
+                             groups)))
+      (should (string-match-p "▶ Thought, ran a command" (map-elt rendered :text)))
+      (should-not (string-match-p "[▶▼] Activity" (map-elt rendered :text))))))
+
+(ert-deftest agent-shell-root-after-turn-thought-starts-new-run-test ()
+  "A late thought cannot append into the preceding turn's last thought."
+  (let* ((rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send end-turn _prompt)
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . "Before turn end.")))
+             (funcall end-turn)
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . "After turn end.")))
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . " Still thinking."))))))
+         (thoughts (seq-filter (lambda (entry)
+                                (string-suffix-p "agent_thought_chunk" (car entry)))
+                              (map-elt rendered :groups))))
+    (should (= 2 (length thoughts)))
+    (should (string-match-p "After turn end\\. Still thinking\\." (map-elt rendered :text)))
+    (should (seq-every-p (lambda (entry) (= 1 (cdr entry)))
+                        (map-nested-elt rendered '(:state :activity-thoughts))))
+    (should-not (equal (cdar thoughts) (cdr (cadr thoughts))))
+    (should (seq-every-p (lambda (entry) (string-prefix-p "1-activity-" (cdr entry)))
+                        thoughts))))
+
+(defun agent-shell-tests--file-text (file)
+  "Return FILE's contents, or nil when it does not exist."
+  (when (file-exists-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (buffer-string))))
+
+(defmacro agent-shell-tests--with-transcript-dir (var &rest body)
+  "Bind VAR to a fresh directory for BODY and delete it afterwards."
+  (declare (indent 1))
+  `(let ((,var (make-temp-file "agent-shell-subagent-transcript" t)))
+     (unwind-protect
+         (progn ,@body)
+       (delete-directory ,var t))))
+
+(ert-deftest agent-shell-subagent-transcript-path-test ()
+  "A subagent's transcript sits beside the root's, named after it."
+  (should (equal (agent-shell-subagents--transcript-file-path
+                  :parent-file "/t/2026-09-24.md"
+                  :name "Survey subagent UI!"
+                  :session-id "ab4463c3e484421df")
+                 "/t/2026-09-24/subagents/survey-subagent-ui-ab4463c3e484421df.md"))
+  ;; A nested subagent shares its parent's directory rather than nesting.
+  (should (equal (agent-shell-subagents--transcript-file-path
+                  :parent-file "/t/2026-09-24/subagents/researcher-child.md"
+                  :parent-is-subagent t
+                  :name nil
+                  :session-id "task:generation:2")
+                 "/t/2026-09-24/subagents/subagent-task-generation-2.md")))
+
+(ert-deftest agent-shell-subagent-content-goes-to-its-own-transcript-test ()
+  "A subagent writes its own transcript; the root's records it spawning and ending.
+
+The root's transcript holds what the root session said and did, plus
+an entry linking to the subagent's file when it spawns and another when
+it ends.  The subagent's tool calls and messages are in its own file,
+which starts with a header naming it, its task and its parent."
+  (agent-shell-tests--with-transcript-dir dir
+    (let* ((root-file (expand-file-name "session.md" dir))
+           (rendered (agent-shell-tests--subagent-shell
+                      (lambda (send _end-turn _prompt)
+                        (agent-shell-tests--spawn-and-work send)
+                        (funcall send "child" '(sessionUpdate . "tool_call_update")
+                                 '(toolCallId . "C1") '(status . "completed"))
+                        (funcall send "root" '(sessionUpdate . "subagent_update")
+                                 '(sessionId . "child")
+                                 '(state (state . "idle") (stopReason . "end_turn"))))
+                      root-file))
+           (child-file (map-elt (agent-shell--native-subagent (map-elt rendered :state) "child")
+                                :transcript-file))
+           (root-text (agent-shell-tests--file-text root-file))
+           (child-text (agent-shell-tests--file-text child-file)))
+      (should (equal child-file (expand-file-name "session/subagents/researcher-child.md" dir)))
+      (should (string-match-p "^## Subagent: Researcher" root-text))
+      (should (string-match-p (regexp-quote "(session/subagents/researcher-child.md)") root-text))
+      (should (string-match-p "^## Subagent completed: Researcher" root-text))
+      (should (string-match-p "Delegating\\." root-text))
+      (should-not (string-match-p "I looked" root-text))
+      (should-not (string-match-p "Read foo\\.el" root-text))
+      (should (string-match-p "^\\*\\*Subagent:\\*\\* Researcher" child-text))
+      (should (string-match-p "^\\*\\*Parent Session ID:\\*\\* root" child-text))
+      (should (string-match-p (regexp-quote "[session.md](../../session.md)") child-text))
+      (should (string-match-p "Find prior art" child-text))
+      (should (string-match-p "I looked" child-text))
+      (should (string-match-p "Tool Call \\[completed\\]: Read foo\\.el" child-text))
+      (should (string-match-p "^## Subagent completed: Researcher" child-text))
+      (should-not (string-match-p "Delegating\\." child-text)))))
+
+(ert-deftest agent-shell-nested-subagent-spawn-is-logged-by-its-parent-test ()
+  "A subagent spawned by a subagent is logged in that subagent's transcript."
+  (agent-shell-tests--with-transcript-dir dir
+    (let* ((root-file (expand-file-name "session.md" dir))
+           (rendered (agent-shell-tests--subagent-shell
+                      (lambda (send _end-turn _prompt)
+                        (agent-shell-tests--spawn-and-work send)
+                        (funcall send "child" '(sessionUpdate . "subagent_update")
+                                 '(sessionId . "grandchild") '(title . "Reviewer")
+                                 '(description . "Check it") '(state (state . "running")))
+                        (funcall send "grandchild" '(sessionUpdate . "agent_message_chunk")
+                                 '(messageId . "m-grandchild")
+                                 '(content (type . "text") (text . "Checked."))))
+                      root-file))
+           (state (map-elt rendered :state))
+           (child-text (agent-shell-tests--file-text
+                        (map-elt (agent-shell--native-subagent state "child") :transcript-file)))
+           (grandchild-file (map-elt (agent-shell--native-subagent state "grandchild")
+                                     :transcript-file))
+           (grandchild-text (agent-shell-tests--file-text grandchild-file)))
+      (should (equal grandchild-file
+                     (expand-file-name "session/subagents/reviewer-grandchild.md" dir)))
+      (should (string-match-p "^## Subagent: Reviewer" child-text))
+      (should (string-match-p (regexp-quote "(reviewer-grandchild.md)") child-text))
+      (should-not (string-match-p "Reviewer" (agent-shell-tests--file-text root-file)))
+      (should (string-match-p "^\\*\\*Parent Session ID:\\*\\* child" grandchild-text))
+      (should (string-match-p "Checked\\." grandchild-text)))))
+
+(ert-deftest agent-shell-rfd-session-message-goes-to-the-child-transcript-test ()
+  "A `session_message' to a child is logged in the child's transcript only."
+  (agent-shell-tests--with-transcript-dir dir
+    (let* ((root-file (expand-file-name "session.md" dir))
+           (rendered (agent-shell-tests--subagent-shell
+                      (lambda (send _end-turn _prompt)
+                        (agent-shell-tests--rfd-subagent-update
+                         send "child" '(title . "Researcher") '(state (state . "running")))
+                        (agent-shell-tests--rfd-session-message
+                         send "child" "toolu_agent" "Look for prior art"))
+                      root-file))
+           (child-file (map-elt (agent-shell--native-subagent (map-elt rendered :state) "child")
+                                :transcript-file)))
+      (should (string-match-p "^## Prompt" (agent-shell-tests--file-text child-file)))
+      (should (string-match-p "Look for prior art" (agent-shell-tests--file-text child-file)))
+      (should-not (string-match-p "Look for prior art"
+                                  (agent-shell-tests--file-text root-file))))))
+
+(ert-deftest agent-shell-restored-subagent-running-again-gets-a-transcript-test ()
+  "A subagent a restore replayed gets its transcript when it runs again.
+
+A restore replays with no transcript file, so the child it announces
+starts without one.  Its later live work must still be logged."
+  (agent-shell-tests--with-transcript-dir dir
+    (let* ((root-file (expand-file-name "session.md" dir))
+           (rendered (agent-shell-tests--subagent-shell
+                      (lambda (send _end-turn _prompt)
+                        (let ((agent-shell--transcript-file nil))
+                          (agent-shell-tests--rfd-subagent-update
+                           send "child" '(title . "Researcher") '(state (state . "running")))
+                          (agent-shell-tests--rfd-subagent-update
+                           send "child" '(state (state . "idle") (stopReason . "end_turn"))))
+                        (agent-shell-tests--rfd-subagent-update
+                         send "child" '(state (state . "running")))
+                        (agent-shell-tests--rfd-session-message
+                         send "child" "toolu_send" "Check the tests too"))
+                      root-file))
+           (child-file (map-elt (agent-shell--native-subagent (map-elt rendered :state) "child")
+                                :transcript-file)))
+      (should child-file)
+      (should (string-match-p "Check the tests too" (agent-shell-tests--file-text child-file)))
+      (should (string-match-p "^## Subagent: Researcher" (agent-shell-tests--file-text root-file))))))
+
+(defun agent-shell-tests--list-state ()
+  "Return a state with a running and a finished subagent and one async task."
+  (let ((state (agent-shell--make-state)))
+    (map-put! (map-elt state :session) :id "root")
+    (agent-shell--save-native-subagent state "done" "Reviewer" "Check it")
+    (agent-shell--update-native-subagent
+     state "done" (list (cons :spawned-at (time-subtract nil 120))
+                        (cons :ended-at (time-subtract nil 60))
+                        (cons :state "completed")))
+    (agent-shell--save-native-subagent state "live" "Researcher" "Find prior art")
+    (agent-shell--update-native-subagent
+     state "live" (list (cons :spawned-at (time-subtract nil 30))))
+    (agent-shell--save-async-task state "task-1" "npm test" "shell" "Run the tests"
+                                  t t)
+    state))
+
+(ert-deftest agent-shell-subagents-header-indicator-counts-running-subagents-test ()
+  "The header counts subagents still running and says nothing without any."
+  (let ((state (agent-shell-tests--list-state)))
+    (should (equal (substring-no-properties
+                    (agent-shell-subagents--header-indicator state))
+                   "1 subagent"))
+    (agent-shell--save-native-subagent state "other" "Writer" "Write it")
+    (should (equal (substring-no-properties
+                    (agent-shell-subagents--header-indicator state))
+                   "2 subagents"))
+    (should-not (agent-shell-subagents--header-indicator (agent-shell--make-state)))))
+
+(ert-deftest agent-shell-subagents-header-rebuilds-only-when-the-count-changes-test ()
+  "A subagent's streaming does not rebuild the header unless its count moves."
+  (let ((state (agent-shell-tests--list-state))
+        (updates 0))
+    (with-temp-buffer
+      (setq-local major-mode 'agent-shell-mode)
+      (map-put! state :buffer (current-buffer))
+      (cl-letf (((symbol-function 'agent-shell--update-header-and-mode-line)
+                 (lambda (&rest _) (setq updates (1+ updates))))
+                ((symbol-function 'agent-shell-viewport--buffer) #'ignore))
+        (agent-shell-subagents--refresh-header state)
+        (agent-shell-subagents--refresh-header state)
+        (should (= updates 1))
+        (agent-shell--update-native-subagent
+         state "live" (list (cons :ended-at (current-time))))
+        (agent-shell-subagents--refresh-header state)
+        (should (= updates 2))))))
+
+(ert-deftest agent-shell-subagents-list-entries-put-running-first-test ()
+  "Running subagents and tasks come first, finished ones after."
+  (let ((entries (agent-shell-subagents--list-entries (agent-shell-tests--list-state))))
+    (should (equal (mapcar (lambda (entry) (cons (map-elt entry :kind) (map-elt entry :id)))
+                           entries)
+                   '((subagent . "live") (async-task . "task-1") (subagent . "done"))))
+    (should (equal (mapcar (lambda (entry) (map-elt entry :finished)) entries)
+                   '(nil nil t)))
+    (should (string-match-p "Researcher" (map-elt (car entries) :label-left)))
+    (should (equal (map-elt (car entries) :body) "Find prior art"))
+    (should (string-match-p "1m 0s" (map-elt (nth 2 entries) :label-right)))))
+
+(ert-deftest agent-shell-subagents-list-puts-activity-under-the-name-test ()
+  "A subagent's row reads its name and age, then what it is doing below.
+
+The line below has the summary of what the subagent has done, then
+its latest activity.  A finished subagent
+has no activity, so its line is the summary alone."
+  (let ((state (agent-shell-tests--list-state)))
+    (agent-shell--update-native-subagent
+     state "live" (list (cons :summary "Read 2 files")
+                        (cons :activity '((:kind . thought)))))
+    (let ((entry (car (agent-shell-subagents--list-entries state))))
+      (should (string-match-p "Researcher" (map-elt entry :label-left)))
+      (should-not (string-match-p "Read 2 files" (map-elt entry :label-left)))
+      (should (string-match-p "\\`[0-9]+s\\'"
+                              (substring-no-properties (map-elt entry :label-right))))
+      (should (equal (substring-no-properties (map-elt entry :label-below))
+                     "Read 2 files · Thinking")))
+    (agent-shell--update-native-subagent
+     state "done" (list (cons :summary "Read 1 file")))
+    (let ((entry (car (last (agent-shell-subagents--list-entries state)))))
+      (should (equal (substring-no-properties (map-elt entry :label-below))
+                     "Read 1 file")))))
+
+(ert-deftest agent-shell-subagents-list-renders-activity-on-its-own-line-test ()
+  "The activity line stays in view when the row is folded and jumps when pressed.
+
+The name and age share the first line; the task is the only thing a
+fold hides."
+  (let ((state (agent-shell-tests--list-state))
+        (jumped nil))
+    (agent-shell--update-native-subagent
+     state "live" (list (cons :summary "Read 2 files")
+                        (cons :activity '((:kind . thought)))))
+    (cl-letf (((symbol-function 'agent-shell-subagents-jump-to-activity)
+               (lambda (_state session-id) (setq jumped session-id))))
+      (agent-shell-tests--with-subagents-list state
+        (let ((visible (agent-shell-tests--visible-text)))
+          (should (string-match-p "Researcher [0-9]+s\nRead 2 files · Thinking" visible))
+          (should-not (string-match-p "Find prior art" visible)))
+        (agent-shell-tests--list-goto "Thinking")
+        (call-interactively (key-binding (kbd "RET")))
+        (should (equal jumped "live"))
+        (agent-shell-tests--list-goto "Researcher")
+        (agent-shell-ui-toggle-fragment)
+        (should (string-match-p "Find prior art" (agent-shell-tests--visible-text)))))))
+
+(ert-deftest agent-shell-subagents-list-async-task-body-shows-progress-test ()
+  "An async task's row shows its description, then any recorded progress."
+  (let ((body (lambda (state)
+                (map-elt (seq-find (lambda (entry) (eq (map-elt entry :kind) 'async-task))
+                                   (agent-shell-subagents--list-entries state))
+                         :body))))
+    (let ((state (agent-shell-tests--list-state)))
+      (should (equal (funcall body state) "Run the tests"))
+      (agent-shell--update-async-task
+       state "task-1" (list :summary "Compiling"
+                            :last-tool-name "Bash"
+                            :usage '((totalTokens . 2000) (toolUses . 3))))
+      (should (equal (funcall body state)
+                     "Run the tests\nCompiling\nLast tool: Bash\n2k tokens · 3 tool uses")))
+    (let ((state (agent-shell-tests--list-state)))
+      (agent-shell--update-async-task state "task-1" (list :summary "Run the tests"))
+      (should (equal (funcall body state) "Run the tests")))))
+
+(ert-deftest agent-shell-subagents-list-async-task-body-shows-command-test ()
+  "A backgrounded command's row shows the command its tool call ran.
+
+claude-agent-acp names a backgrounded Bash task after the call's
+description, so the description is not repeated under the name, and the
+command comes from the tool call the task's `toolCallId' names."
+  (let ((state (agent-shell--make-state))
+        (body (lambda (state)
+                (map-elt (car (agent-shell-subagents--list-entries state)) :body))))
+    (agent-shell--save-async-task state "task-1" "Poll for feedback" "local_bash"
+                                  "Poll for feedback" t t)
+    (should (equal (funcall body state) ""))
+    (map-put! state :tool-calls
+              (list (cons "call-1" (list (cons :command "gh pr view 12 --comments")))))
+    (agent-shell--update-async-task state "task-1" (list :tool-call-id "call-1"))
+    (should (equal (funcall body state) "gh pr view 12 --comments"))
+    (agent-shell--update-async-task state "task-1" (list :summary "Poll for feedback"))
+    (should (equal (funcall body state) "gh pr view 12 --comments"))))
+
+(ert-deftest agent-shell-subagents-elapsed-test ()
+  "Elapsed time reads in the largest two units."
+  (let ((start (current-time)))
+    (should (equal (agent-shell-subagents--elapsed start (time-add start 42)) "42s"))
+    (should (equal (agent-shell-subagents--elapsed start (time-add start 75)) "1m 15s"))
+    (should (equal (agent-shell-subagents--elapsed start (time-add start 3725)) "1h 2m"))))
+
+(defmacro agent-shell-tests--with-subagents-list (state &rest body)
+  "Run BODY in a subagents list rendered from STATE."
+  (declare (indent 1) (debug t))
+  `(with-temp-buffer
+     (agent-shell-subagents-list-mode)
+     (let ((shell (current-buffer)))
+       (setq agent-shell-subagents--shell-buffer shell)
+       (cl-letf (((symbol-function 'agent-shell-subagents--shell-state)
+                  (lambda (&rest _) ,state)))
+         (agent-shell-subagents--render-list ,state)
+         ,@body))))
+
+(defun agent-shell-tests--list-goto (text)
+  "Move point to the row showing TEXT."
+  (goto-char (point-min))
+  (search-forward text)
+  (goto-char (match-beginning 0)))
+
+(ert-deftest agent-shell-subagents-list-renders-finished-rows-under-a-folded-group-test ()
+  "Finished rows sit in a folded group named with their count."
+  (let ((state (agent-shell-tests--list-state)))
+    (agent-shell-tests--with-subagents-list state
+      (let ((blocks (mapcar #'car (agent-shell-tests--rendered-blocks))))
+        (should (equal blocks '("subagents-subagent:live" "subagents-async-task:task-1"
+                                "subagents-finished" "subagents-subagent:done"))))
+      (should (string-match-p "Finished (1)" (buffer-string)))
+      (agent-shell-tests--list-goto "Reviewer")
+      (should (get-text-property (point) 'invisible)))))
+
+(ert-deftest agent-shell-subagents-list-refresh-keeps-folds-and-point-test ()
+  "Redrawing the list keeps unfolded rows unfolded and point on its row."
+  (let ((state (agent-shell-tests--list-state)))
+    (agent-shell-tests--with-subagents-list state
+      (should-not (string-match-p "Find prior art" (agent-shell-tests--visible-text)))
+      (agent-shell-tests--list-goto "Researcher")
+      (agent-shell-ui-toggle-fragment)
+      (should (string-match-p "Find prior art" (agent-shell-tests--visible-text)))
+      (agent-shell-tests--list-goto "npm test")
+      (agent-shell-subagents-list-refresh)
+      (should (string-match-p "Find prior art" (agent-shell-tests--visible-text)))
+      (should (equal (map-elt (agent-shell-subagents--list-entry-at-point) :id) "task-1")))))
+
+(ert-deftest agent-shell-subagents-list-refresh-keeps-separator-and-end-test ()
+  "Keep point in a separator and at the end across a redraw."
+  (let ((state (agent-shell-tests--list-state)))
+    (agent-shell-tests--with-subagents-list state
+      (agent-shell-tests--list-goto "npm test")
+      (forward-line -1)
+      (should-not (get-text-property (point) 'agent-shell-ui-state))
+      (let ((distance (- (save-excursion
+                           (agent-shell-tests--list-goto "npm test")
+                           (line-beginning-position))
+                         (point))))
+        (agent-shell--save-native-subagent state "extra" "Extra" "Help")
+        (agent-shell-subagents--render-list state)
+        (should (= distance (- (save-excursion
+                                 (agent-shell-tests--list-goto "npm test")
+                                 (line-beginning-position))
+                               (point)))))
+      (goto-char (point-max))
+      (agent-shell-subagents--render-list state)
+      (should (= (point) (point-max))))))
+
+(ert-deftest agent-shell-subagents-list-refresh-keeps-gap-visible-when-task-finishes-test ()
+  "A gap before a task stays visible when the task moves into Finished."
+  (let ((state (agent-shell-tests--list-state)))
+    (agent-shell-tests--with-subagents-list state
+      (agent-shell-tests--list-goto "npm test")
+      (forward-line -1)
+      (agent-shell--update-async-task state "task-1" (list :state "completed"))
+      (agent-shell-subagents--render-list state)
+      (should-not (invisible-p (point)))
+      (should (save-excursion
+                (beginning-of-line)
+                (looking-at ".*Finished"))))))
+
+(ert-deftest agent-shell-subagents-list-refresh-handles-missing-gap-row-test ()
+  "Removing the row after a separator leaves point in the new buffer."
+  (let ((state (agent-shell-tests--list-state)))
+    (agent-shell-tests--with-subagents-list state
+      (agent-shell-tests--list-goto "npm test")
+      (forward-line -1)
+      (map-put! state :async-tasks nil)
+      (map-put! state :native-subagents
+                (seq-filter (lambda (entry) (equal (car entry) "done"))
+                            (map-elt state :native-subagents)))
+      (agent-shell-subagents--render-list state)
+      (should (<= (point-min) (point) (point-max)))
+      (should-not (invisible-p (point)))
+      (should (save-excursion
+                (beginning-of-line)
+                (looking-at ".*Finished"))))))
+
+(ert-deftest agent-shell-subagents-list-refresh-keeps-empty-list-point-test ()
+  "Refreshing an empty list keeps point in its message."
+  (let ((state (agent-shell--make-state)))
+    (agent-shell-tests--with-subagents-list state
+      (goto-char (+ (point-min) 5))
+      (agent-shell-subagents--render-list state)
+      (should (= (point) (+ (point-min) 5))))))
+
+(ert-deftest agent-shell-subagents-list-scheduled-refresh-keeps-separator-test ()
+  "A scheduled update leaves point on the same separator."
+  (let* ((shell (generate-new-buffer "*subagents-gap-shell*"))
+         (state (agent-shell-tests--list-state))
+         (buffer nil))
+    (unwind-protect
+        (progn
+          (map-put! state :buffer shell)
+          (setq buffer (get-buffer-create (agent-shell-subagents--list-buffer-name state)))
+          (with-current-buffer buffer
+            (agent-shell-subagents-list-mode)
+            (setq agent-shell-subagents--shell-buffer shell)
+            (agent-shell-subagents--render-list state)
+            (agent-shell-tests--list-goto "npm test")
+            (forward-line -1)
+            (let ((position (point)))
+              (agent-shell-subagents--schedule-list-refresh state)
+              (sleep-for 0.3)
+              (should-not agent-shell-subagents-list--refresh-timer)
+              (should (= (point) position)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (kill-buffer shell))))
+
+(ert-deftest agent-shell-subagents-list-refresh-keeps-separator-window-test ()
+  "An unselected list window keeps its separator point and start."
+  (let ((state (agent-shell-tests--list-state))
+        (buffer (generate-new-buffer "*subagents-gap-test*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((window (selected-window))
+                 (other (split-window)))
+            (set-window-buffer window buffer)
+            (with-current-buffer buffer
+              (agent-shell-subagents-list-mode)
+              (agent-shell-subagents--render-list state)
+              (agent-shell-tests--list-goto "npm test")
+              (forward-line -1)
+              (let ((position (point)))
+                (should-not (get-text-property position 'agent-shell-ui-state))
+                (set-window-point window position)
+                (set-window-start window position)
+                (select-window other)
+                (agent-shell-subagents--render-list state)
+                (should (= (window-point window) position))
+                (should (= (window-start window) position))))))
+      (kill-buffer buffer))))
+
+(ert-deftest agent-shell-subagents-list-refresh-keeps-an-unselected-window-s-point-test ()
+  "A background refresh must not reset an unselected window's point.
+
+A subagent update redraws the list from a timer, without selecting the
+list's window.  `erase-buffer' collapses every window showing the
+buffer to `point-min'; restoring point with `goto-char' only fixes the
+selected window, since `window-point' for any other window is stored
+separately and only `set-window-point' moves it."
+  (let ((state (agent-shell-tests--list-state))
+        (buffer (generate-new-buffer "*subagents-list-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (agent-shell-subagents-list-mode)
+            (agent-shell-subagents--render-list state))
+          (with-selected-window (frame-first-window)
+            (save-window-excursion
+              (delete-other-windows)
+              (let* ((list-window (selected-window))
+                     (other-window (split-window)))
+                (set-window-buffer list-window buffer)
+                (set-window-buffer other-window (get-buffer-create "*scratch*"))
+                (with-selected-window list-window
+                  (agent-shell-tests--list-goto "npm test"))
+                (select-window other-window)
+                (with-current-buffer buffer
+                  (agent-shell-subagents--render-list state))
+                (should (equal (map-elt (get-text-property (window-point list-window)
+                                                            'agent-shell-ui-state
+                                                            buffer)
+                                        :qualified-id)
+                               "subagents-async-task:task-1"))))))
+      (kill-buffer buffer))))
+
+(ert-deftest agent-shell-subagents-list-refresh-keeps-point-within-its-row-test ()
+  "Redrawing the list leaves point on the same character of its row.
+
+A running subagent redraws the list every few tenths of a second, so
+point returning to the row's start would pull it out of whatever line
+of the task the user is reading."
+  (let ((state (agent-shell-tests--list-state)))
+    (agent-shell--update-native-subagent
+     state "live" (list (cons :task "Find prior art\nthen summarize what you found")))
+    (agent-shell-tests--with-subagents-list state
+      (agent-shell-tests--list-goto "Researcher")
+      (agent-shell-ui-toggle-fragment)
+      (search-forward "summarize")
+      (let ((column (current-column)))
+        (agent-shell-subagents-list-refresh)
+        (should (looking-back "then summarize" (line-beginning-position)))
+        (should (equal (current-column) column)))
+      (agent-shell-tests--list-goto "npm test")
+      (forward-char 2)
+      (agent-shell-subagents-list-refresh)
+      (should (looking-at "m test")))))
+
+(ert-deftest agent-shell-subagents-list-refresh-keeps-window-scroll-test ()
+  "Redrawing the list keeps each window's first visible line.
+
+`erase-buffer' moves every window's start to `point-min', so a list
+scrolled past its first rows would jump back to the top."
+  (let ((state (agent-shell-tests--list-state))
+        (buffer (generate-new-buffer "*subagents-list-test*")))
+    (dotimes (index 30)
+      (agent-shell--save-native-subagent
+       state (format "extra-%d" index) (format "Helper%d" index) "Help"))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (agent-shell-subagents-list-mode)
+            (agent-shell-subagents--render-list state))
+          (with-selected-window (frame-first-window)
+            (save-window-excursion
+              (delete-other-windows)
+              (let ((window (selected-window)))
+                (set-window-buffer window buffer)
+                (with-current-buffer buffer
+                  (agent-shell-tests--list-goto "Helper20")
+                  (set-window-point window (point))
+                  (set-window-start window (point))
+                  (agent-shell-subagents--render-list state))
+                (should (equal (map-elt (get-text-property (window-start window)
+                                                            'agent-shell-ui-state
+                                                            buffer)
+                                        :qualified-id)
+                               "subagents-subagent:extra-20"))))))
+      (kill-buffer buffer))))
+
+(defun agent-shell-tests--visible-text ()
+  "Return the current buffer's text that is not invisible."
+  (let ((position (point-min))
+        (text ""))
+    (while (< position (point-max))
+      (let ((next (next-single-char-property-change position 'invisible)))
+        (unless (get-char-property position 'invisible)
+          (setq text (concat text (buffer-substring-no-properties position next))))
+        (setq position next)))
+    text))
+
+(ert-deftest agent-shell-subagents-list-stop-refuses-a-subagent-test ()
+  "Stopping a subagent the agent did not announce as stoppable refuses.
+
+claude-agent-acp's `announceNativeSubagent' sends `capabilities.cancel'
+for a child it can stop; without it nothing is sent."
+  (let ((state (agent-shell-tests--list-state))
+        (sent nil))
+    (cl-letf (((symbol-function 'acp-send-notification)
+               (lambda (&rest args) (push (plist-get args :notification) sent)))
+              ((symbol-function 'agent-shell--send-async-task-stop)
+               (lambda (_state id) (push id sent))))
+      (agent-shell-tests--with-subagents-list state
+        (agent-shell-tests--list-goto "Researcher")
+        (should (equal (cadr (should-error (agent-shell-subagents-list-stop)
+                                           :type 'user-error))
+                       "The agent does not let clients stop Researcher"))
+        ;; Finished rows have nothing to stop.
+        (agent-shell-tests--list-goto "Reviewer")
+        (should (equal (cadr (should-error (agent-shell-subagents-list-stop)
+                                           :type 'user-error))
+                       "Already finished"))
+        (should-not sent)))))
+
+(ert-deftest agent-shell-subagents-list-stops-a-stoppable-async-task-test ()
+  "Stopping an async task row sends the agent's stop request for it."
+  (let ((state (agent-shell-tests--list-state))
+        (stopped nil))
+    (cl-letf (((symbol-function 'agent-shell--send-async-task-stop)
+               (lambda (_state id) (push id stopped))))
+      (agent-shell-tests--with-subagents-list state
+        (agent-shell-tests--list-goto "npm test")
+        (agent-shell-subagents-list-stop)
+        (should (equal stopped '("task-1")))
+        (should-error (agent-shell-subagents-list-open) :type 'user-error)))))
+
+(ert-deftest agent-shell-subagents-list-jump-goes-to-the-spawn-row-test ()
+  "Jumping from the list lands on the subagent's row in the shell."
+  (let (landed)
+    (agent-shell-tests--subagent-shell
+     (lambda (send _end-turn _prompt)
+       (agent-shell-tests--spawn-and-work send)
+       (let ((shell (current-buffer)))
+         (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer))
+           (agent-shell-subagents)
+           (should (derived-mode-p 'agent-shell-subagents-list-mode))
+           (agent-shell-tests--list-goto "Researcher")
+           (agent-shell-subagents-list-jump)
+           (should (eq (current-buffer) shell))
+           (setq landed (map-elt (get-text-property (point) 'agent-shell-ui-state)
+                                 :qualified-id))))))
+    (should (equal landed "1-subagent-child"))))
+
+(ert-deftest agent-shell-subagents-list-dies-with-the-shell-test ()
+  "The subagents list is killed with the shell's subagent buffers."
+  (let (list-buffer)
+    (agent-shell-tests--subagent-shell
+     (lambda (send _end-turn _prompt)
+       (agent-shell-tests--spawn-and-work send)
+       (save-current-buffer
+         (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer))
+           (agent-shell-subagents)
+           (setq list-buffer (current-buffer))))))
+    (should (bufferp list-buffer))
+    (should-not (buffer-live-p list-buffer))))
+
+;; Subagent buffer quit
+
+(ert-deftest agent-shell-subagents-display-records-the-origin-test ()
+  "Displaying a subagent records the buffer it was opened from."
+  (agent-shell-tests--subagent-shell
+   (lambda (send _end-turn _prompt)
+     (agent-shell-tests--spawn-and-work send)
+     (let ((shell (current-buffer)))
+       (save-current-buffer
+         (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer))
+           (agent-shell-subagents-display agent-shell--state "child")
+           (should (derived-mode-p 'agent-shell-subagent-mode))
+           (should (eq agent-shell-subagents--origin shell))))))))
+
+(defun agent-shell-subagents-tests--quit-to-origin (origin-parameters)
+  "Quit a dedicated subagent window; return whether it reselected the origin.
+
+The origin window gets ORIGIN-PARAMETERS, an alist of window parameters
+plus an optional `dedicated' entry, mimicking a Doom popup.  The origin
+is the MRU window, but `delete-window' skips it for those parameters and
+reselects the unrelated one unless the quit command returns to the
+origin itself."
+  (let ((origin (generate-new-buffer "*subagent-quit-origin*"))
+        (other (generate-new-buffer "*subagent-quit-other*"))
+        (subagent (generate-new-buffer "*subagent-quit-subagent*")))
+    (unwind-protect
+        (with-current-buffer subagent
+          (agent-shell-subagent-mode)
+          (setq agent-shell-subagents--origin origin)
+          (with-selected-window (frame-first-window)
+            (save-window-excursion
+              (delete-other-windows)
+              (let* ((origin-window (selected-window))
+                     (other-window (split-window)))
+                (set-window-buffer origin-window origin)
+                (set-window-buffer other-window other)
+                (pcase-dolist (`(,name . ,value) origin-parameters)
+                  (if (eq name 'dedicated)
+                      (set-window-dedicated-p origin-window value)
+                    (set-window-parameter origin-window name value)))
+                (select-window other-window)
+                (select-window origin-window)
+                (let ((subagent-window (split-window origin-window nil 'right)))
+                  (set-window-buffer subagent-window subagent)
+                  (set-window-dedicated-p subagent-window 'popup)
+                  (select-window subagent-window)
+                  (with-current-buffer subagent
+                    (call-interactively (key-binding (kbd "q"))))
+                  (should-not (window-live-p subagent-window))
+                  (should (eq (window-buffer other-window) other))
+                  (and (eq (selected-window) origin-window)
+                       (eq (window-buffer origin-window) origin)))))))
+      (dolist (buffer (list origin other subagent))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest agent-shell-subagents-quit-returns-to-a-dedicated-origin-test ()
+  "Quitting a subagent returns to its origin's dedicated window.
+
+`delete-window' never reselects a dedicated window, as Doom's popups are."
+  (should (agent-shell-subagents-tests--quit-to-origin '((dedicated . popup)))))
+
+(ert-deftest agent-shell-subagents-quit-returns-to-a-no-other-window-origin-test ()
+  "Quitting a subagent returns to an origin window marked `no-other-window'.
+
+Doom sets that on popups too, and `delete-window' skips such windows."
+  (should (agent-shell-subagents-tests--quit-to-origin '((no-other-window . t)))))
+
+(ert-deftest agent-shell-subagents-list-quit-returns-to-origin-test ()
+  "Quitting the list switches back to the buffer it was opened from."
+  (agent-shell-tests--subagent-shell
+   (lambda (send _end-turn _prompt)
+     (agent-shell-tests--spawn-and-work send)
+     (let ((shell (current-buffer)))
+       (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer))
+         (agent-shell-subagents)
+         (should (derived-mode-p 'agent-shell-subagents-list-mode))
+         (agent-shell-subagents-list-quit)
+         (should (eq (current-buffer) shell)))))))
+
+(ert-deftest agent-shell-subagents-list-quit-falls-back-when-origin-is-gone-test ()
+  "Quitting does not error when the origin buffer was killed meanwhile."
+  (agent-shell-tests--subagent-shell
+   (lambda (send _end-turn _prompt)
+     (agent-shell-tests--spawn-and-work send)
+     (let ((shell (current-buffer))
+           (list-buffer nil))
+       (cl-letf (((symbol-function 'pop-to-buffer) #'set-buffer))
+         (agent-shell-subagents)
+         (setq list-buffer (current-buffer)))
+       (with-current-buffer list-buffer
+         (setq-local agent-shell-subagents-list--origin (generate-new-buffer " *gone*"))
+         (kill-buffer agent-shell-subagents-list--origin)
+         (agent-shell-subagents-list-quit))
+       (should (buffer-live-p shell))))))
+
+(ert-deftest agent-shell-subagents-list-quit-does-not-duplicate-the-origin-into-an-unrelated-window-test ()
+  "Quitting a dedicated list window must not spill into the MRU window.
+
+Reproduces a Doom-popup layout: the list's window is dedicated to its
+buffer, so `bury-buffer' deletes it (`window--delete' with
+`dedicated-only'), and `delete-window' then reselects the
+most-recently-used window -- here, an unrelated window the user was in
+before opening the list.  Without capturing the origin's window before
+burying, `switch-to-buffer' lands on that unrelated window and
+duplicates the origin buffer into it instead of returning to it."
+  (let ((origin (generate-new-buffer "*subagents-quit-origin*"))
+        (other (generate-new-buffer "*subagents-quit-other*"))
+        (list-buffer (generate-new-buffer "*subagents-quit-list*")))
+    (unwind-protect
+        (with-current-buffer list-buffer
+          (agent-shell-subagents-list-mode)
+          (setq agent-shell-subagents-list--origin origin)
+          (with-selected-window (frame-first-window)
+            (save-window-excursion
+              (delete-other-windows)
+              (let* ((origin-window (selected-window))
+                     (other-window (split-window)))
+                (set-window-buffer origin-window origin)
+                (set-window-buffer other-window other)
+                ;; The user reads `other' last, so it is the MRU window
+                ;; `delete-window' reselects once the list window is gone.
+                (select-window other-window)
+                (let ((list-window (split-window other-window)))
+                  (set-window-buffer list-window list-buffer)
+                  (set-window-dedicated-p list-window 'popup)
+                  (select-window list-window)
+                  (with-current-buffer list-buffer
+                    (agent-shell-subagents-list-quit))
+                  (should-not (window-live-p list-window))
+                  (should (eq (window-buffer other-window) other))
+                  (should (eq (selected-window) origin-window))
+                  (should (eq (window-buffer origin-window) origin)))))))
+      (dolist (buffer (list origin other list-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest agent-shell-root-thoughts-around-a-tool-both-render-test ()
+  "A root thought after a tool call in the same group keeps the one before.
+
+The tool call leaves the activity run open, so both thoughts share a
+group.  Keyed by the group alone, the second would replace the first."
+  (let* ((rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send _end-turn _prompt)
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . "First thought.")))
+             (funcall send "root" '(sessionUpdate . "tool_call")
+                      '(toolCallId . "t1") '(title . "A command")
+                      '(kind . "execute") '(status . "in_progress"))
+             (funcall send "root" '(sessionUpdate . "tool_call_update")
+                      '(toolCallId . "t1") '(status . "completed"))
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . "Second thought.")))
+             (funcall send "root" '(sessionUpdate . "agent_thought_chunk")
+                      '(content (type . "text") (text . " Still second."))))))
+         (text (map-elt rendered :text)))
+    (should (string-match-p "First thought\\." text))
+    (should (string-match-p "Second thought\\. Still second\\." text))))
+
+(ert-deftest agent-shell-subagent-prompt-leaves-the-parent-prompt-closed-test ()
+  "A subagent's replayed prompt does not close a prompt in the parent shell.
+
+Replay closes a root prompt with the end-of-prompt marker on the next
+update after it.  A subagent's prompt opens nothing in the parent, so the
+update after it must not add a second marker there."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--spawn-and-work send)
+                      (funcall send "child" '(sessionUpdate . "user_message_chunk")
+                               '(content (type . "text") (text . "Look for prior art")))
+                      (funcall send "child" '(sessionUpdate . "agent_message_chunk")
+                               '(content (type . "text") (text . "Found some."))))))
+         (text (map-elt rendered :text)))
+    (should (= 1 (with-temp-buffer
+                   (insert text)
+                   (how-many (regexp-quote "<shell-maker-end-of-prompt>")
+                             (point-min) (point-max)))))))
+
+;;; Stopping one subagent
+
+(ert-deftest agent-shell-rfd-subagent-records-its-cancel-capability-test ()
+  "A child announced with `capabilities.cancel' is recorded as stoppable.
+
+claude-agent-acp's `announceNativeSubagent' (native-subagents.ts) sends
+`capabilities: {cancel: {}}' on the RFD announce only; `reportState'
+then sends `state' alone, so the capability has to outlive later
+updates.  acp.el decodes the empty object as nil, so `(cancel)' is the
+whole of it on our side."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(title . "Researcher") '(capabilities (cancel))
+                       '(state (state . "running")))
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(state (state . "requires_action")))
+                      (agent-shell-tests--rfd-subagent-update
+                       send "other" '(title . "Writer") '(state (state . "running"))))))
+         (state (map-elt rendered :state)))
+    (should (map-elt (agent-shell--native-subagent state "child") :can-cancel))
+    (should-not (map-elt (agent-shell--native-subagent state "other") :can-cancel))))
+
+(ert-deftest agent-shell-subagents-list-stops-a-cancellable-subagent-test ()
+  "Stopping a cancellable subagent sends `session/cancel' for it alone.
+
+claude-agent-acp's `cancel' (acp-agent.ts) hands a `session/cancel'
+naming a child session to `cancelChildSession', which stops only that
+child's task (`Query.stopTask'); the root's turn runs on.  The child's
+open permission requests are answered cancelled, as the root interrupt
+does for the root's, or their dialogs stay up for a child that stopped."
+  (let ((state (agent-shell-tests--list-state))
+        (sent nil)
+        (answered nil))
+    (agent-shell--update-native-subagent state "live" (list (cons :can-cancel t)))
+    (map-put! state :tool-calls
+              '(("C1" . ((:subagent-session-id . "live") (:permission-request-id . 7)))
+                ("R1" . ((:permission-request-id . 8)))))
+    (cl-letf (((symbol-function 'acp-send-notification)
+               (lambda (&rest args) (push (plist-get args :notification) sent)))
+              ((symbol-function 'agent-shell--send-permission-response)
+               (lambda (&rest args)
+                 (push (cons (plist-get args :request-id) (plist-get args :cancelled))
+                       answered))))
+      (agent-shell-tests--with-subagents-list state
+        (agent-shell-tests--list-goto "Researcher")
+        (agent-shell-subagents-list-stop)))
+    (should (equal (length sent) 1))
+    (should (equal (map-elt (car sent) :method) "session/cancel"))
+    (should (equal (map-nested-elt (car sent) '(:params sessionId)) "live"))
+    (should (equal answered '((7 . t))))))
+
+(ert-deftest agent-shell-subagents-stop-from-a-subagent-buffer-test ()
+  "The subagent buffer stops its own subagent; the shell asks which one.
+
+Only running subagents the agent announced with `capabilities.cancel'
+are offered (see `announceNativeSubagent' in claude-agent-acp)."
+  (let ((state (agent-shell-tests--list-state))
+        (sent nil))
+    (cl-letf (((symbol-function 'acp-send-notification)
+               (lambda (&rest args) (push (plist-get args :notification) sent))))
+      (with-temp-buffer
+        (setq-local major-mode 'agent-shell-mode)
+        (setq-local agent-shell--state state)
+        (map-put! state :buffer (current-buffer))
+        (let ((shell (current-buffer)))
+          ;; Nothing cancellable yet: "live" lacks the capability and
+          ;; "done" has finished.
+          (should-error (agent-shell-subagents-stop) :type 'user-error)
+          (agent-shell--update-native-subagent state "live" (list (cons :can-cancel t)))
+          (agent-shell--update-native-subagent state "done" (list (cons :can-cancel t)))
+          (agent-shell-subagents-stop)
+          (should (equal (map-nested-elt (car sent) '(:params sessionId)) "live"))
+          (setq sent nil)
+          (with-temp-buffer
+            (agent-shell-subagent-mode)
+            (setq agent-shell-subagents--shell-buffer shell
+                  agent-shell-subagents--session-id "live")
+            (should (eq (key-binding (kbd "C-c C-c")) #'agent-shell-subagents-stop))
+            (agent-shell-subagents-stop)
+            (should (equal (map-nested-elt (car sent) '(:params sessionId)) "live"))
+            (setq agent-shell-subagents--session-id "done")
+            (should-error (agent-shell-subagents-stop) :type 'user-error)))))))
+
+;;; Subagent ends
+
+(ert-deftest agent-shell-rfd-subagent-unknown-state-retires-it-test ()
+  "A child reported `unknown' is disconnected and stops counting as running.
+
+claude-agent-acp's `rfdEndState' (native-subagents.ts) reports a child
+that can no longer be observed (its \"disconnected\" end) as
+`{state: \"unknown\"}'."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(title . "Researcher") '(state (state . "running")))
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(state (state . "unknown"))))))
+         (state (map-elt rendered :state))
+         (subagent (agent-shell--native-subagent state "child")))
+    (should (equal (agent-shell--subagent-rfd-state '((state . "unknown"))) "disconnected"))
+    (should (equal (map-elt subagent :state) "disconnected"))
+    (should (map-elt subagent :ended-at))
+    (should-not (agent-shell-subagents--running state))))
+
+(ert-deftest agent-shell-rfd-subagent-failure-shows-its-error-test ()
+  "A failed child's `error.message' shows in its row, list entry and transcript.
+
+claude-agent-acp's `rfdEndState' (native-subagents.ts) puts the SDK's
+text in the idle state as `error: {code, message}'.  When the first idle
+snapshot lacked it, `supplyError' reports the same failure again with
+the text, so it can arrive after the child already retired."
+  (agent-shell-tests--with-transcript-dir dir
+    (let* ((root-file (expand-file-name "session.md" dir))
+           (rendered (agent-shell-tests--subagent-shell
+                      (lambda (send _end-turn _prompt)
+                        (agent-shell-tests--rfd-subagent-update
+                         send "child" '(title . "Researcher")
+                         '(description . "Find prior art") '(state (state . "running")))
+                        (agent-shell-tests--rfd-subagent-update
+                         send "child" '(state (state . "idle") (stopReason . "error")))
+                        (agent-shell-tests--rfd-subagent-update
+                         send "child" '(state (state . "idle") (stopReason . "error")
+                                              (error (code . -32603)
+                                                     (message . "API overloaded")))))
+                      root-file))
+           (state (map-elt rendered :state))
+           (subagent (agent-shell--native-subagent state "child"))
+           (entry (seq-find (lambda (entry) (equal (map-elt entry :id) "child"))
+                            (agent-shell-subagents--list-entries state)))
+           (root-text (agent-shell-tests--file-text root-file)))
+      (should (equal (map-elt subagent :state) "failed"))
+      (should (equal (map-elt subagent :error) "API overloaded"))
+      ;; The row's body, which unfolds under its label.
+      (should (string-match-p "Find prior art\n+Error: API overloaded" (map-elt rendered :text)))
+      (should (string-match-p "Error: API overloaded" (map-elt entry :body)))
+      (should (string-match-p "^## Subagent failed: Researcher" root-text))
+      (should (string-match-p "API overloaded" root-text))
+      ;; Retired once: the late error does not end it again.
+      (should (= 1 (with-temp-buffer
+                     (insert root-text)
+                     (how-many "^## Subagent failed" (point-min) (point-max))))))))
+
+;;; Async task output and tool call
+
+(ert-deftest agent-shell-async-task-keeps-output-path-and-tool-call-test ()
+  "An async task's `outputFilePath' and `toolCallId' are kept from every update.
+
+claude-agent-acp's `AsyncTaskSpawnedUpdate', `AsyncTaskProgressUpdate' and
+`AsyncTaskStateUpdate' (acp-subagents.ts) each carry both as optional
+fields.  The tool call id can come after the spawn, in a progress
+update (docs/air-extensions.md, \"Tool call of a task\"), and the
+output path can change up to the terminal update."
+  (let ((state (list (cons :async-tasks nil)
+                     (cons :last-entry-type nil))))
+    (cl-letf (((symbol-function 'agent-shell--update-fragment) #'ignore)
+              ((symbol-function 'agent-shell-subagents--changed) #'ignore))
+      (dolist (update '(((sessionUpdate . "async_task_spawned") (asyncTaskId . "b1")
+                         (name . "npm test") (taskType . "local_bash")
+                         (description . "npm test") (showInTranscript)
+                         (canStop . t) (outputFilePath . "/w/tasks/b1.output"))
+                        ((sessionUpdate . "async_task_progress") (asyncTaskId . "b1")
+                         (toolCallId . "toolu_1"))
+                        ((sessionUpdate . "async_task_state_update") (asyncTaskId . "b1")
+                         (state . "completed") (outputFilePath . "/w/tasks/b1-final.output"))))
+        (agent-shell--dispatch-notification
+         :state state
+         :acp-notification `((method . "session/update") (params (update . ,update)))))
+      (let ((task (agent-shell--async-task state "b1")))
+        (should (equal (map-elt task :tool-call-id) "toolu_1"))
+        (should (equal (map-elt task :output-file-path) "/w/tasks/b1-final.output"))
+        (should (equal (map-elt task :state) "completed"))))))
+
+(ert-deftest agent-shell-subagents-list-opens-a-task-output-file-test ()
+  "Opening an async task row visits its output file, mapped to this host.
+
+`outputFilePath' is a path on the agent's host (acp-subagents.ts), so it
+goes through `agent-shell-path-resolver-function' as other agent paths do."
+  (let ((state (agent-shell-tests--list-state))
+        (agent-shell-path-resolver-function (lambda (path) (concat "/ssh:host:" path)))
+        (visited nil)
+        (log (generate-new-buffer " *task-output*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'find-file-noselect)
+                   (lambda (file &rest _) (setq visited file) log))
+                  ((symbol-function 'pop-to-buffer) #'ignore))
+          (agent-shell-tests--with-subagents-list state
+            (agent-shell-tests--list-goto "npm test")
+            (should (equal (cadr (should-error (agent-shell-subagents-list-open)
+                                               :type 'user-error))
+                           "This task has no output file"))
+            (agent-shell--update-async-task
+             state "task-1" (list :output-file-path "/w/tasks/task-1.output"))
+            (agent-shell-subagents-list-open)
+            (should (equal visited "/ssh:host:/w/tasks/task-1.output"))))
+      (kill-buffer log))))
+
+;;; Backgrounded Bash
+
+(defun agent-shell-tests--block-text (qualified-id)
+  "Return the text of fragment QUALIFIED-ID in the current buffer."
+  (let ((position (point-min))
+        (text ""))
+    (while (< position (point-max))
+      (let ((next (next-single-property-change
+                   position 'agent-shell-ui-state nil (point-max))))
+        (when (equal (map-elt (get-text-property position 'agent-shell-ui-state)
+                              :qualified-id)
+                     qualified-id)
+          (setq text (concat text (buffer-substring-no-properties position next))))
+        (setq position next)))
+    text))
+
+(ert-deftest agent-shell-backgrounded-bash-card-follows-its-task-test ()
+  "A backgrounded Bash card runs until its async task ends, then shows how.
+
+claude-agent-acp's `backgroundedBashToolCall' (tool-calls/background.ts)
+marks the Bash `tool_call_update' of a command that went to the
+background with `_meta.jetbrains.air.asyncTasks.backgrounded: true',
+on the update that reports the call `completed'.  The command's own end
+comes later as an `async_task_state_update' of the task whose
+`toolCallId' names the call (acp-subagents.ts), possibly turns later.
+The spawn can come before or after the marked update."
+  (let* (background-label second-label
+         (marker '(_meta (jetbrains (air (version . 1) (asyncTasks (backgrounded . t))))))
+         (rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send end-turn prompt)
+             ;; Marked update first, spawn after.
+             (funcall send "root" '(sessionUpdate . "tool_call") '(toolCallId . "T1")
+                      '(title . "npm run dev") '(kind . "execute") '(status . "in_progress"))
+             (funcall send "root" '(sessionUpdate . "tool_call_update") '(toolCallId . "T1")
+                      '(status . "completed") marker)
+             (setq background-label (agent-shell-tests--block-text "1-T1"))
+             (funcall send "root" '(sessionUpdate . "async_task_spawned")
+                      '(asyncTaskId . "b1") '(name . "npm run dev") '(taskType . "local_bash")
+                      '(description . "npm run dev") '(showInTranscript) '(canStop . t)
+                      '(toolCallId . "T1"))
+             (funcall end-turn)
+             (funcall prompt "next")
+             ;; Spawn first, marked update after.
+             (funcall send "root" '(sessionUpdate . "tool_call") '(toolCallId . "T2")
+                      '(title . "make watch") '(kind . "execute") '(status . "in_progress"))
+             (funcall send "root" '(sessionUpdate . "async_task_spawned")
+                      '(asyncTaskId . "b2") '(name . "make watch") '(taskType . "local_bash")
+                      '(description . "make watch") '(showInTranscript) '(canStop . t)
+                      '(toolCallId . "T2"))
+             (funcall send "root" '(sessionUpdate . "tool_call_update") '(toolCallId . "T2")
+                      '(status . "completed") marker)
+             (setq second-label (agent-shell-tests--block-text "2-T2"))
+             ;; T1's command ends while the second turn runs.
+             (funcall send "root" '(sessionUpdate . "async_task_state_update")
+                      '(asyncTaskId . "b1") '(state . "completed") '(toolCallId . "T1"))
+             (funcall end-turn)
+             ;; T2's ends after its turn did; the update names no tool call.
+             (funcall send "root" '(sessionUpdate . "async_task_state_update")
+                      '(asyncTaskId . "b2") '(state . "failed")))))
+         (blocks (map-elt rendered :blocks)))
+    (should (string-match-p "\\`[[:space:]]*◔" background-label))
+    (should (string-match-p "background" background-label))
+    (should (string-match-p "\\`[[:space:]]*◔" second-label))
+    ;; Each card updated where it was drawn, not redrawn in a later turn.
+    (should (= 1 (seq-count (lambda (id) (string-suffix-p "-T1" id)) blocks)))
+    (should (= 1 (seq-count (lambda (id) (string-suffix-p "-T2" id)) blocks)))
+    (should (member "1-T1" blocks))
+    (should (member "2-T2" blocks))
+    (should-not (seq-filter (lambda (id) (string-prefix-p "3-" id)) blocks))
+    (should (string-match-p "✓ Command[^\n]*npm run dev" (map-elt rendered :text)))
+    (should (string-match-p "✗ Command[^\n]*make watch" (map-elt rendered :text)))))
+
+(ert-deftest agent-shell-backgrounded-bash-card-of-a-finished-subagent-test ()
+  "A subagent's backgrounded Bash card follows its task after the subagent ends.
+
+claude-agent-acp sends a task a subagent's tool call started to that
+subagent's session, also after the subagent finished
+\(docs/air-extensions.md, \"Async tasks\"), and marks the call as for the
+root (`backgroundedBashToolCall')."
+  (let* (child-text
+         (rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send end-turn _prompt)
+             (agent-shell-tests--rfd-subagent-update
+              send "child" '(title . "Researcher") '(state (state . "running")))
+             (funcall send "child" '(sessionUpdate . "tool_call") '(toolCallId . "C1")
+                      '(title . "npm run dev") '(kind . "execute") '(status . "in_progress"))
+             (funcall send "child" '(sessionUpdate . "tool_call_update") '(toolCallId . "C1")
+                      '(status . "completed")
+                      '(_meta (jetbrains (air (version . 1) (asyncTasks (backgrounded . t))))))
+             (funcall send "child" '(sessionUpdate . "async_task_spawned")
+                      '(asyncTaskId . "b1") '(name . "npm run dev") '(taskType . "local_bash")
+                      '(description . "npm run dev") '(showInTranscript) '(canStop . t)
+                      '(toolCallId . "C1"))
+             (agent-shell-tests--rfd-subagent-update
+              send "child" '(state (state . "idle") (stopReason . "end_turn")))
+             (funcall end-turn)
+             (setq child-text
+                   (map-elt (agent-shell-tests--subagent-buffer-report
+                             (map-elt (agent-shell--native-subagent agent-shell--state "child")
+                                      :buffer))
+                            :text))
+             (funcall send "child" '(sessionUpdate . "async_task_state_update")
+                      '(asyncTaskId . "b1") '(state . "completed")))))
+         (child (agent-shell-tests--subagent-report rendered "child")))
+    (should (string-match-p "◔ Command[^\n]*npm run dev[^\n]*in background" child-text))
+    (should (string-match-p "✓ Command[^\n]*npm run dev" (map-elt child :text)))
+    (should (= 1 (seq-count (lambda (id) (string-suffix-p "-C1" id)) (map-elt child :blocks))))
+    ;; Nothing of it lands in the shell.
+    (should-not (seq-filter (lambda (id) (string-suffix-p "-C1" id))
+                            (map-elt rendered :blocks)))))
+
+(provide 'agent-shell-subagents-tests)
+;;; agent-shell-subagents-tests.el ends here

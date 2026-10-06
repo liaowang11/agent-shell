@@ -73,6 +73,9 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    :shell-prompt "OMP> "
    :shell-prompt-regexp "OMP> "
    :welcome-function #'agent-shell-omp--welcome-message
+   ;; omp relays task subagents in the subagents RFD form once it has the
+   ;; RFD; an older omp answers with AIR's `subagent_spawned' draft.
+   :client-capabilities '((subagents . ()))
    :client-maker (lambda (buffer)
                    (agent-shell-omp-make-client :buffer buffer))
    :install-instructions "See https://github.com/can1357/oh-my-pi omp (Oh My Pi) installation."))
