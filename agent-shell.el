@@ -3105,9 +3105,13 @@ sent separately."
          (command-block (agent-shell--format-console-block saved-command))
          (tool-call-kind (map-elt tool-call :kind))
          (saved-input (map-elt tool-call :raw-input))
+         ;; A questionnaire's input is the questions themselves, which
+         ;; the tool call's own `content' already spells out in prose,
+         ;; so dumping it as JSON only repeats it.
          (input-block (when (and (member tool-call-kind '(nil "other"))
                                  saved-input
-                                 (not saved-command))
+                                 (not saved-command)
+                                 (not (agent-shell-elicitation--questionnaire-p saved-input)))
                         (agent-shell--format-tool-call-input saved-input)))
          (content-text (agent-shell--tool-call-content-text (map-elt tool-call :content)))
          ;; Agents like pi-acp normalize `_meta.terminal_output' into
@@ -3848,7 +3852,12 @@ Clears STATE's `:expanded-activity-group'."
      :group-id (unless row group-id)
      :group-label agent-shell--activity-group-label
      :group-expanded (agent-shell--activity-group-initial-expanded-p)
-     :body (agent-shell--tool-call-body tool-call)
+     ;; A form is showing these questions interactively just below, so
+     ;; repeating them here would ask twice.
+     :body (if (agent-shell-elicitation--pending-for-tool-call-p
+                :state state :tool-call-id tool-call-id)
+               ""
+             (agent-shell--tool-call-body tool-call))
      :expanded agent-shell-tool-use-expand-by-default)
     (if row
         (agent-shell--refresh-subagent-row state row)
