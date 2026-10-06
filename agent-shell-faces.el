@@ -159,6 +159,19 @@ Used for command, capability, config option, model and mode names."
   "Face for the shell prompt."
   :group 'agent-shell-faces)
 
+(defface agent-shell-subagent-name
+  '((t :inherit font-lock-type-face))
+  "Face for a native subagent's name in transcript labels."
+  :group 'agent-shell-faces)
+
+(defface agent-shell-async-task-name
+  '((t :inherit font-lock-constant-face))
+  "Face for a background async task's name in transcript labels.
+Distinct from `agent-shell-subagent-name' so the two read apart in the
+transcript and the subagents list, independent of the \"subagent\" /
+\"background\" kind tag next to them."
+  :group 'agent-shell-faces)
+
 (defface agent-shell-input
   '((t :inherit comint-highlight-input))
   "Face for user input."

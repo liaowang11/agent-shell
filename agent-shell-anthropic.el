@@ -30,6 +30,7 @@
 (require 'shell-maker)
 (require 'acp)
 
+(declare-function agent-shell--air-client-capabilities-meta "agent-shell")
 (declare-function agent-shell--indent-string "agent-shell")
 (declare-function agent-shell-welcome-message "agent-shell")
 (declare-function agent-shell--make-acp-client "agent-shell")
@@ -154,6 +155,12 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    ;; streams signature-only thinking blocks with no visible text.  Request
    ;; "summarized" so thinking is shown.  This is orthogonal to the effort /
    ;; thought level, which the agent advertises as a config option.
+   ;; claude-agent-acp gates background tasks and the session index on
+   ;; the client naming them here (see async-tasks.ts, session-index/).
+   :initialize-meta (agent-shell--air-client-capabilities-meta)
+   ;; The subagents RFD: `subagent_update' on the parent and
+   ;; `session_message' to each child.
+   :client-capabilities '((subagents . ()))
    :session-meta '((claudeCode
                     . ((options
                         . ((thinking
