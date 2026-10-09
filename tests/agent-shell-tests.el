@@ -1293,6 +1293,78 @@ otherwise the debounce stops it."
           (should (memq (map-nested-elt state '(:heartbeat :status)) '(started busy))))
       (agent-shell-heartbeat-stop :heartbeat heartbeat))))
 
+(ert-deftest agent-shell--clear-out-of-turn-activity-renders-deferred-markup-test ()
+  "Clearing the out-of-turn indicator renders held-back markup when idle.
+
+An out-of-turn burst arrives after `end_turn', so the turn's own
+deferred render has already run.  A message ending in a list item
+leaves that item raw in the shell and its viewport until the burst's
+quiet period renders it.  The timer runs in whatever buffer is current,
+so the render must target the state's buffers.  A request in flight
+still owns the trailing line, so nothing renders then."
+  (let ((shell-buffer (generate-new-buffer "*agent-shell-test-shell*"))
+        (viewport-buffer (generate-new-buffer "*agent-shell-test-viewport*"))
+        (other-buffer (generate-new-buffer "*agent-shell-test-other*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (with-current-buffer viewport-buffer
+            (agent-shell-viewport-view-mode))
+          (dolist (buffer (list shell-buffer viewport-buffer))
+            (with-current-buffer buffer
+              (let ((inhibit-read-only t))
+                (insert (propertize "Left:\n\n1. One\n2. Two\n3. Three"
+                                    'agent-shell-ui-section 'body)))))
+          (cl-flet ((last-line-rendered-p (buffer)
+                      (with-current-buffer buffer
+                        (goto-char (point-max))
+                        (beginning-of-line)
+                        (get-text-property (point) 'agent-shell-markdown-list-rendered))))
+            ;; Request in flight: left raw.
+            (with-current-buffer other-buffer
+              (agent-shell--clear-out-of-turn-activity
+               (list (cons :buffer shell-buffer)
+                     (cons :active-requests '(((:method . "session/prompt"))))
+                     (cons :heartbeat nil)
+                     (cons :out-of-turn-timer 'armed))))
+            (should-not (last-line-rendered-p shell-buffer))
+            (should-not (last-line-rendered-p viewport-buffer))
+            ;; Idle: rendered in both buffers.
+            (with-current-buffer other-buffer
+              (agent-shell--clear-out-of-turn-activity
+               (list (cons :buffer shell-buffer)
+                     (cons :active-requests nil)
+                     (cons :heartbeat nil)
+                     (cons :out-of-turn-timer 'armed))))
+            (should (last-line-rendered-p shell-buffer))
+            (should (last-line-rendered-p viewport-buffer))))
+      (mapc #'kill-buffer (list shell-buffer viewport-buffer other-buffer)))))
+
+(ert-deftest agent-shell--note-out-of-turn-activity-arms-without-busy-indicator-test ()
+  "The out-of-turn quiet period is timed even with the busy indicator off.
+
+The timer that clears the indicator is also what renders the burst's
+held-back markup, so leaving it unarmed left that markup raw."
+  (dolist (show '(nil t))
+    (let* ((agent-shell-show-busy-indicator show)
+           (heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
+           (state (list (cons :heartbeat heartbeat)
+                        (cons :out-of-turn-timer nil))))
+      (unwind-protect
+          (progn
+            (agent-shell--note-out-of-turn-activity state)
+            (should (timerp (map-elt state :out-of-turn-timer)))
+            ;; Only the indicator itself depends on the setting.
+            (should (eq (and (memq (map-nested-elt state '(:heartbeat :status))
+                                   '(started busy))
+                             t)
+                        show)))
+        (when-let* ((timer (map-elt state :out-of-turn-timer)))
+          (cancel-timer timer))
+        (agent-shell-heartbeat-stop :heartbeat heartbeat)))))
+
 (ert-deftest agent-shell--busy-indicator-frame-marks-out-of-turn-test ()
   "The busy indicator prefixes an after-turn glyph while an out-of-turn burst streams.
 
@@ -1980,6 +2052,62 @@ The fallback triggers when `agent-shell--build-content-blocks' fails."
         (should (equal (map-elt data :stop-reason) "end_turn"))
         (should (equal (map-elt (map-elt data :usage) :total-tokens)
                        1500))))))
+
+(ert-deftest agent-shell--send-command-renders-deferred-markup-in-viewport-test ()
+  "Test the end of a turn renders the viewport's held-back markup too.
+
+Streaming renders into the viewport alongside the shell, holding back a
+list item on the last line until its newline arrives.  A response
+ending in one never gets that newline, so the viewport's copy stays raw
+unless the turn's end renders it there as well."
+  (let* ((captured-on-success nil)
+         (shell-buffer (current-buffer))
+         (viewport-buffer (generate-new-buffer "*agent-shell-test-viewport*"))
+         (agent-shell--state (list (cons :buffer shell-buffer)
+                                   (cons :event-subscriptions nil)
+                                   (cons :client 'test-client)
+                                   (cons :session (list (cons :id "test-session") (cons :title nil)))
+                                   (cons :last-entry-type nil)
+                                   (cons :tool-calls nil)
+                                   (cons :usage (list (cons :total-tokens 0)))
+                                   (cons :idle-timer nil)))
+         (agent-shell-show-busy-indicator nil)
+         (agent-shell-show-usage-at-turn-end nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--state)
+                   (lambda () agent-shell--state))
+                  ((symbol-function 'agent-shell--send-request)
+                   (lambda (&rest args)
+                     (setq captured-on-success (plist-get args :on-success))))
+                  ((symbol-function 'agent-shell-viewport--buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--showing-latest-p)
+                   (lambda (&rest _) t))
+                  ((symbol-function 'agent-shell-viewport--initialize)
+                   (lambda (&rest _)))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _)))
+                  ((symbol-function 'agent-shell--finish-output)
+                   (lambda (&rest _)))
+                  ((symbol-function 'agent-shell--prompt-queue-process-next)
+                   (lambda (&rest _))))
+          (with-current-buffer viewport-buffer
+            (agent-shell-viewport-view-mode))
+          (agent-shell--send-command
+           :prompt "Hello"
+           :shell-buffer shell-buffer)
+          (with-current-buffer viewport-buffer
+            (let ((inhibit-read-only t))
+              (insert (propertize "Done.\n\n- Last item"
+                                  'agent-shell-ui-section 'body))))
+          (should captured-on-success)
+          (funcall captured-on-success '((stopReason . "end_turn")))
+          (with-current-buffer viewport-buffer
+            (goto-char (point-max))
+            (beginning-of-line)
+            (should (get-text-property (point) 'agent-shell-markdown-list-rendered))
+            (should-not (looking-at-p "- "))))
+      (kill-buffer viewport-buffer))))
 
 (ert-deftest agent-shell--send-command-asks-to-drain-queue-on-cancel-test ()
   "Test a cancelled turn moves on to the queued prompts only if confirmed.

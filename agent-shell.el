@@ -3235,10 +3235,25 @@ silence rather than stopped on a terminal event.")
   "Stop STATE's out-of-turn busy indicator unless a real turn is in flight.
 Runs on the debounce timer armed by `agent-shell--note-out-of-turn-activity'.
 A prompt submitted during the debounce window restarts the heartbeat and drops
-the timer, so the in-flight guard keeps that live turn's indicator running."
+the timer, so the in-flight guard keeps that live turn's indicator running.
+
+The burst arrived after the turn's end already rendered its held-back
+markup, so a message ending in a list item (or table row, image, ...)
+would stay raw.  The quiet period is the burst's only end signal, so
+render that markup now, in the shell and its viewport."
   (map-put! state :out-of-turn-timer nil)
   (unless (agent-shell--active-requests-p state)
-    (agent-shell-heartbeat-stop :heartbeat (map-elt state :heartbeat))))
+    (agent-shell-heartbeat-stop :heartbeat (map-elt state :heartbeat))
+    (when-let* ((shell-buffer (map-elt state :buffer))
+                ((buffer-live-p shell-buffer)))
+      (with-current-buffer shell-buffer
+        (agent-shell--render-deferred-markup))
+      (when-let* ((viewport-buffer (agent-shell-viewport--buffer
+                                    :shell-buffer shell-buffer
+                                    :existing-only t)))
+        (with-current-buffer viewport-buffer
+          (when (derived-mode-p 'agent-shell-viewport-view-mode)
+            (agent-shell--render-deferred-markup)))))))
 
 (defun agent-shell--note-out-of-turn-activity (state)
   "Raise STATE's busy indicator for an out-of-turn update and debounce it off.
@@ -3246,10 +3261,11 @@ Background tasks (e.g. subagents) stream `session/update' notifications after
 `end_turn', when the normal heartbeat has already stopped.  Restart the
 heartbeat so the activity stays visible, and (re)arm a timer to clear it after
 `agent-shell--out-of-turn-idle-seconds' of silence; each further update pushes
-the timer back."
-  (when (and agent-shell-show-busy-indicator
-             (map-elt state :heartbeat))
-    (agent-shell-heartbeat-start :heartbeat (map-elt state :heartbeat))
+the timer back.  The timer runs with the busy indicator off too, since the
+quiet period is also when the burst's held-back markup renders."
+  (when-let* ((heartbeat (map-elt state :heartbeat)))
+    (when agent-shell-show-busy-indicator
+      (agent-shell-heartbeat-start :heartbeat heartbeat))
     (when-let* ((timer (map-elt state :out-of-turn-timer))
                 ((timerp timer)))
       (cancel-timer timer))
@@ -11603,6 +11619,10 @@ reads the buffer's prompt capabilities."
                                                    :shell-buffer shell-buffer
                                                    :existing-only t)))
                        (with-current-buffer viewport-buffer
+                         ;; Streaming renders into the viewport too, so it
+                         ;; holds back the same trailing markup.
+                         (when (derived-mode-p 'agent-shell-viewport-view-mode)
+                           (agent-shell--render-deferred-markup))
                          (agent-shell-viewport--update-header)))
                      (cond
                       (success
