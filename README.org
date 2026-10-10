@@ -1156,6 +1156,8 @@ Use =M-x agent-shell-ui-toggle-all-fragments= to expand or collapse every sectio
 
 *** Session controls
 
+Session titles refresh when a session starts and after each turn.  With claude-agent-acp's =sessionBatchGet= capability, Agent Shell looks up the current session directly, including older or archived sessions outside the recent list.  Other agents use the first session list page when available.
+
 When the active agent advertises the corresponding session option, you can switch it from the shell buffer:
 
 - =C-c C-v= - Set model.
@@ -1383,6 +1385,7 @@ nonblank content also folds the current group.
 | agent-shell-show-context-usage-indicator       | Whether and how to show the context usage indicator.                            |
 | agent-shell-show-cost-indicator                | Whether to show the session’s cumulative cost in the header.                    |
 | agent-shell-show-session-id                    | Non-nil to display the session ID in the header and session selection.          |
+| agent-shell-show-session-model                 | Non-nil to display each session’s model in session selection.                   |
 | agent-shell-show-usage-at-turn-end             | Whether to display usage information when agent turn ends.                      |
 | agent-shell-show-welcome-message               | Non-nil to show welcome message.                                                |
 | agent-shell-status-kind-label-function         | Function to render status and kind labels.                                      |

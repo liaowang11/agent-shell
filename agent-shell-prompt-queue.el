@@ -44,6 +44,7 @@
 (declare-function agent-shell--state "agent-shell")
 (declare-function agent-shell--echo "agent-shell")
 (declare-function agent-shell--ensure-state-key "agent-shell")
+(declare-function agent-shell--ensure-session-not-archived "agent-shell")
 (declare-function agent-shell-status "agent-shell")
 (declare-function agent-shell-steering-supported-p "agent-shell")
 (declare-function agent-shell-experimental--send-steering "agent-shell-experimental")
@@ -116,11 +117,16 @@ and leaves :pending-prompts empty.  With merging off, submits
 
 Does nothing while delivery is paused (see
 `agent-shell--prompt-queue-paused-p'), because a pause means work is
-still running even though the shell does not show as busy."
+still running even though the shell does not show as busy.  Signals a
+`user-error', leaving the queue alone, when the session is archived."
   (unless (derived-mode-p 'agent-shell-mode)
     (error "Not in a shell"))
   (agent-shell--prompt-queue-migrate)
   (unless (map-elt agent-shell--state :prompt-queue-paused)
+    ;; Refused before anything leaves the queue or the prompt.  The submit
+    ;; below refuses too, but only after both are gone.
+    (when (map-elt agent-shell--state :pending-prompts)
+      (agent-shell--ensure-session-not-archived))
     (when-let* ((pending (map-elt agent-shell--state :pending-prompts))
                 (count (if agent-shell-prompt-queue-merge
                            (seq-length pending)
