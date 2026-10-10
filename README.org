@@ -1283,6 +1283,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-screenshot-command                | The program to use for capturing screenshots.                                   |
 | agent-shell-section-functions                 | Abnormal hook run after overlays are applied (experimental).                    |
 | agent-shell-session-choices-function          | Function to transform the choices offered when starting a shell.                |
+| agent-shell-session-list-include-worktrees    | Non-nil to also list sessions from the repository's other worktrees.            |
 | agent-shell-session-list-page-limit           | Maximum number of pages to request when listing sessions.                       |
 | agent-shell-session-restore-verbosity         | How much prior context to show when restoring a session.                        |
 | agent-shell-session-strategy                  | How to handle sessions when starting a new shell.                               |
@@ -1291,6 +1292,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-show-context-usage-indicator      | Whether and how to show the context usage indicator.                            |
 | agent-shell-show-cost-indicator               | Whether to show the session’s cumulative cost in the header.                    |
 | agent-shell-show-session-id                   | Non-nil to display the session ID in the header and session selection.          |
+| agent-shell-show-session-model                | Non-nil to display each session’s model in session selection.                   |
 | agent-shell-show-usage-at-turn-end            | Whether to display usage information when agent turn ends.                      |
 | agent-shell-show-welcome-message              | Non-nil to show welcome message.                                                |
 | agent-shell-status-kind-label-function        | Function to render status and kind labels.                                      |
@@ -1350,6 +1352,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell--display-buffer                             | Toggle agent SHELL-BUFFER display.                                            |
 |                                                       | agent-shell-anthropic-start-claude-code                 | Start an interactive Claude Agent shell.                                      |
 |                                                       | agent-shell-antigravity-start-agent                     | Start an interactive Antigravity agent shell.                                 |
+|                                                       | agent-shell-archive-session                             | Archive the current shell's session, which stops and closes it.               |
 |                                                       | agent-shell-artist-cancel                               | Discard the scratch art and close the buffer.                                 |
 |                                                       | agent-shell-artist-commit                               | Insert scratch art into the calling buffer wrapped in a fence.                |
 |                                                       | agent-shell-artist-help                                 | Show all interactive commands for `agent-shell-artist-mode'.                  |
@@ -1445,6 +1448,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-qwen-start                                  | Start an interactive Qwen Code CLI agent shell.                               |
 |                                                       | agent-shell-reload                                      | Reload the current session by restarting with the same session ID.            |
 | C-x x r                                               | agent-shell-rename-buffer                               | Rename current shell buffer.                                                  |
+|                                                       | agent-shell-rename-session                              | Rename the current shell's session to TITLE on the agent's side.              |
 |                                                       | agent-shell-reset-logs                                  | Reset all log buffers.                                                        |
 |                                                       | agent-shell-restart                                     | Clear conversation by restarting the agent shell in the same project.         |
 |                                                       | agent-shell-resume-session                              | Resume an existing agent session by SESSION-ID.                               |
@@ -1478,6 +1482,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-ui-mode                                     | Minor mode for SUI block navigation.                                          |
 |                                                       | agent-shell-ui-toggle-all-fragments                     | Toggle global fold state: all-expanded ↔ all-collapsed.                       |
 |                                                       | agent-shell-ui-toggle-fragment                          | Toggle fragment fold at or near point.                                        |
+|                                                       | agent-shell-unarchive-session                           | Unarchive the current shell's session.                                        |
 |                                                       | agent-shell-version                                     | Show `agent-shell' mode version.                                              |
 |                                                       | agent-shell-view-acp-logs                               | View agent shell ACP logs buffer.                                             |
 |                                                       | agent-shell-view-traffic                                | View agent shell traffic buffer.                                              |

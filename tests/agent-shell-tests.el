@@ -5538,6 +5538,252 @@ splice back in."
     (should (equal (map-nested-elt (car failure) '(message))
                    "Agent repeated a session/list cursor"))))
 
+(ert-deftest agent-shell--initiate-handshake-reads-session-index-advert-test ()
+  "Test `:supports-session-index' follows the agent's AIR capabilities.
+
+The agent advertises \"sessionIndex\" in the initialize response's
+top-level `_meta.jetbrains.air.capabilities' only to a client that named
+it; an older agent never does."
+  (dolist (case '((((_meta (jetbrains (air (version . 1)
+                                           (capabilities . ["sessionIndex"
+                                                            "sessionArchive"]))))) . t)
+                  (((_meta (jetbrains (air (version . 1)
+                                           (capabilities . ["asyncTasks"]))))) . nil)
+                  (((protocolVersion . 1)) . nil)))
+    (with-temp-buffer
+      (let ((agent-shell--state (agent-shell--make-state :buffer (current-buffer))))
+        (map-put! agent-shell--state :supports-session-index 'unset)
+        (cl-letf (((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                   #'ignore)
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell--send-request)
+                   (cl-function
+                    (lambda (&key on-success &allow-other-keys)
+                      (funcall on-success (car case))))))
+          (agent-shell--initiate-handshake
+           :shell-buffer (current-buffer)
+           :on-initiated #'ignore))
+        (should (eq (map-elt agent-shell--state :supports-session-index)
+                    (cdr case)))))))
+
+(ert-deftest agent-shell--make-session-list-request-test ()
+  "Test the `session/list' request matches acp.el's, plus AIR options."
+  (should (equal (agent-shell--make-session-list-request :cwd "/tmp/")
+                 (acp-make-session-list-request :cwd "/tmp/")))
+  (should (equal (agent-shell--make-session-list-request :cwd "/tmp/" :cursor "c")
+                 (acp-make-session-list-request :cwd "/tmp/" :cursor "c")))
+  (should (equal (agent-shell--make-session-list-request
+                  :cwd "/tmp/" :index-options '((limit . 200)))
+                 '((:method . "session/list")
+                   (:params (cwd . "/tmp")
+                            (_meta (jetbrains (air (version . 1)
+                                                   (list (limit . 200))))))))))
+
+(ert-deftest agent-shell--session-index-list-options-test ()
+  "Test the AIR list options omit unset values instead of sending nil.
+
+A nil `includeWorktrees' would serialize as {}, which the agent rejects."
+  (let ((agent-shell-session-list-include-worktrees nil))
+    (should (equal (agent-shell--session-index-list-options nil)
+                   '((limit . 200))))
+    (should (equal (agent-shell--session-index-list-options "archived")
+                   '((limit . 200) (archived . "archived")))))
+  (let ((agent-shell-session-list-include-worktrees t))
+    (should (equal (agent-shell--session-index-list-options "all")
+                   '((limit . 200) (includeWorktrees . t) (archived . "all"))))))
+
+(ert-deftest agent-shell--list-sessions-sends-index-options-on-every-page-test ()
+  "Test every page resends identical AIR list options with the session index.
+
+The agent binds a cursor to the options it was issued for and answers
+-32602 when a later page differs."
+  (let ((agent-shell-session-list-page-limit nil)
+        (agent-shell-session-list-include-worktrees t)
+        failure
+        requests
+        sessions)
+    (cl-letf (((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (let* ((request (plist-get args :request))
+                        (cursor (map-nested-elt request '(:params cursor))))
+                   (push request requests)
+                   (funcall
+                    (plist-get args :on-success)
+                    (if cursor
+                        '((sessions . [((sessionId . "session-2"))]))
+                      '((sessions . [((sessionId . "session-1"))])
+                        (nextCursor . "page-2"))))))))
+      (agent-shell--list-sessions
+       :state '((:client . test-client) (:supports-session-index . t))
+       :cwd "/tmp"
+       :buffer (current-buffer)
+       :archived "all"
+       :on-success (lambda (result) (setq sessions result))
+       :on-failure (lambda (&rest args) (setq failure args))))
+    (setq requests (nreverse requests))
+    (should-not failure)
+    (should (equal (mapcar (lambda (request)
+                             (map-nested-elt request '(:params cursor)))
+                           requests)
+                   '(nil "page-2")))
+    (dolist (request requests)
+      (should (equal (map-nested-elt request '(:params _meta jetbrains air))
+                     '((version . 1)
+                       (list (limit . 200)
+                             (includeWorktrees . t)
+                             (archived . "all"))))))
+    (should (equal (mapcar (lambda (session) (map-elt session 'sessionId))
+                           sessions)
+                   '("session-1" "session-2")))))
+
+(ert-deftest agent-shell--list-sessions-omits-index-options-without-capability-test ()
+  "Test the request carries no `_meta' when the agent lacks the session index.
+
+`:archived' is ignored, since an older agent knows no such option."
+  (let ((agent-shell-session-list-page-limit nil)
+        requests)
+    (cl-letf (((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (let ((request (plist-get args :request)))
+                   (push request requests)
+                   (funcall (plist-get args :on-success)
+                            (if (map-nested-elt request '(:params cursor))
+                                '((sessions . []))
+                              '((sessions . []) (nextCursor . "page-2"))))))))
+      (agent-shell--list-sessions
+       :state '((:client . test-client))
+       :cwd "/tmp"
+       :buffer (current-buffer)
+       :archived "archived"
+       :on-success #'ignore
+       :on-failure #'ignore))
+    (should (equal (nreverse requests)
+                   (list (acp-make-session-list-request :cwd "/tmp")
+                         (acp-make-session-list-request :cwd "/tmp"
+                                                        :cursor "page-2"))))))
+
+(ert-deftest agent-shell--initiate-session-list-and-load-keeps-index-order-test ()
+  "Test the session index's order is kept, and other agents' is re-sorted.
+
+The index orders by last prompt; re-sorting by `updatedAt' would undo it."
+  (dolist (case '((t . ("older-update" "newer-update"))
+                  (nil . ("newer-update" "older-update"))))
+    (with-temp-buffer
+      (let ((agent-shell-session-strategy 'prompt)
+            offered)
+        (setq-local agent-shell--state
+                    (list (cons :buffer (current-buffer))
+                          (cons :client 'test-client)
+                          (cons :supports-session-index (car case))))
+        (cl-letf (((symbol-function 'agent-shell--state)
+                   (lambda () agent-shell--state))
+                  ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                   #'ignore)
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell-cwd) (lambda () "/tmp"))
+                  ((symbol-function 'agent-shell--resolve-path) (lambda (path) path))
+                  ((symbol-function 'agent-shell--list-sessions)
+                   (cl-function
+                    (lambda (&key on-success &allow-other-keys)
+                      (funcall on-success
+                               '(((sessionId . "older-update")
+                                  (updatedAt . "2026-01-01T00:00:00Z"))
+                                 ((sessionId . "newer-update")
+                                  (updatedAt . "2026-02-01T00:00:00Z")))))))
+                  ((symbol-function 'agent-shell--prompt-select-session)
+                   (lambda (acp-sessions &rest _)
+                     (setq offered acp-sessions)
+                     :other-shell)))
+          (agent-shell--initiate-session-list-and-load
+           :shell-buffer (current-buffer)
+           :on-session-init #'ignore))
+        (should (equal (mapcar (lambda (session) (map-elt session 'sessionId))
+                               offered)
+                       (cdr case)))))))
+
+(ert-deftest agent-shell--initiate-session-list-and-load-show-archived-test ()
+  "Test choosing to show archived sessions lists them all and prompts again.
+
+Only an agent with the session index is offered the choice, and the
+second prompt, which already holds archived sessions, does not offer it."
+  (dolist (supported '(t nil))
+    (with-temp-buffer
+      (let ((agent-shell-session-strategy 'prompt)
+            (listed-archived nil)
+            (offers nil))
+        (setq-local agent-shell--state
+                    (list (cons :buffer (current-buffer))
+                          (cons :client 'test-client)
+                          (cons :supports-session-index supported)))
+        (cl-letf (((symbol-function 'agent-shell--state)
+                   (lambda () agent-shell--state))
+                  ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                   #'ignore)
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell-cwd) (lambda () "/tmp"))
+                  ((symbol-function 'agent-shell--resolve-path) (lambda (path) path))
+                  ((symbol-function 'agent-shell--list-sessions)
+                   (cl-function
+                    (lambda (&key archived on-success &allow-other-keys)
+                      (push archived listed-archived)
+                      (funcall on-success '(((sessionId . "s1")))))))
+                  ((symbol-function 'agent-shell--prompt-select-session)
+                   (lambda (_acp-sessions &optional offer-archived)
+                     (push offer-archived offers)
+                     (if (and offer-archived (= (length offers) 1))
+                         :show-archived
+                       :other-shell))))
+          (agent-shell--initiate-session-list-and-load
+           :shell-buffer (current-buffer)
+           :on-session-init #'ignore))
+        (if supported
+            (progn
+              (should (equal (reverse listed-archived) '(nil "all")))
+              (should (equal (reverse offers) '(t nil))))
+          (should (equal listed-archived '(nil)))
+          (should (equal offers '(nil))))))))
+
+(ert-deftest agent-shell--prompt-select-session-offers-archived-test ()
+  "Test the picker offers archived sessions only when asked to."
+  (let ((noninteractive nil)
+        (session '((sessionId . "session-1") (title . "First")
+                   (cwd . "/home/user/project") (updatedAt . "2026-01-19T14:00:00Z")))
+        (offered-labels nil))
+    (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () nil))
+              ((symbol-function 'agent-shell--emit-event) #'ignore)
+              ((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (setq offered-labels (all-completions "" collection))
+                 (or (car (member "Show archived sessions" offered-labels))
+                     "New shell"))))
+      (should (eq (agent-shell--prompt-select-session (list session) t)
+                  :show-archived))
+      (should (member "Show archived sessions" offered-labels))
+      (should-not (agent-shell--prompt-select-session (list session)))
+      (should-not (member "Show archived sessions" offered-labels)))))
+
+(ert-deftest agent-shell--refresh-session-title-sends-index-options-test ()
+  "Test the title refresh asks the session index for its list when supported."
+  (dolist (supported '(t nil))
+    (with-temp-buffer
+      (let ((agent-shell-session-list-include-worktrees nil)
+            sent)
+        (setq-local agent-shell--state
+                    (list (cons :client 'test-client)
+                          (cons :supports-session-list t)
+                          (cons :supports-session-index supported)
+                          (cons :session (list (cons :id "session-123")))))
+        (cl-letf (((symbol-function 'agent-shell--resolve-path) (lambda (path) path))
+                  ((symbol-function 'acp-send-request)
+                   (lambda (&rest args) (setq sent (plist-get args :request)))))
+          (agent-shell--refresh-session-title))
+        (should (equal sent
+                       (if supported
+                           (agent-shell--make-session-list-request
+                            :cwd default-directory
+                            :index-options '((limit . 200)))
+                         (acp-make-session-list-request :cwd default-directory))))))))
+
 (ert-deftest agent-shell--resume-failure-message-test ()
   "Test the resume failure message describes each strategy's fallback."
   (dolist (case '((latest . "Couldn't resume session abc. Loading the latest session.")
@@ -6126,6 +6372,144 @@ other unknown ones."
       (should (string-match-p "abc-123" label))
       (should (string-match-p "project" label))
       (should (string-match-p "My session" label)))))
+
+(defun agent-shell-tests--air-session (air &rest fields)
+  "Return a session alist with FIELDS and AIR under _meta.jetbrains.air."
+  (append fields `((_meta . ((jetbrains . ((air . ,air))))))))
+
+(ert-deftest agent-shell--air-session-field-test ()
+  "Test `agent-shell--air-session-field' reads _meta.jetbrains.air fields."
+  (let ((session (agent-shell-tests--air-session
+                  '((state . "running") (archived . nil))
+                  '(sessionId . "s1"))))
+    (should (equal (agent-shell--air-session-field session 'state) "running"))
+    (should-not (agent-shell--air-session-field session 'archived))
+    (should-not (agent-shell--air-session-field session 'model))
+    (should-not (agent-shell--air-session-field '((sessionId . "s1")) 'state))))
+
+(ert-deftest agent-shell--session-column-value-date-prefers-last-prompt-test ()
+  "Test the date column prefers lastPromptAt over updatedAt."
+  (let ((session (agent-shell-tests--air-session
+                  '((lastPromptAt . "2025-06-15T12:00:00Z"))
+                  '(updatedAt . "2024-03-01T12:00:00Z")
+                  '(createdAt . "2024-01-01T12:00:00Z"))))
+    (should (equal (agent-shell--session-column-value 'date session)
+                   (agent-shell--format-session-date "2025-06-15T12:00:00Z")))
+    (should (equal (agent-shell--session-column-value
+                    'date '((updatedAt . "2024-03-01T12:00:00Z")
+                            (createdAt . "2024-01-01T12:00:00Z")))
+                   (agent-shell--format-session-date "2024-03-01T12:00:00Z")))))
+
+(ert-deftest agent-shell--session-column-value-state-test ()
+  "Test the state column labels and faces for each AIR session state."
+  (dolist (case '(("running" "running" agent-shell-session-state-running)
+                  ("requires_action" "needs input" agent-shell-session-state-needs-input)
+                  ("error" "error" agent-shell-session-state-error)
+                  ("idle" "" nil)))
+    (let ((session (agent-shell-tests--air-session
+                    `((state . ,(nth 0 case))))))
+      (should (equal (agent-shell--session-column-value 'state session)
+                     (nth 1 case)))
+      (should (eq (agent-shell--session-column-face 'state session)
+                  (nth 2 case)))))
+  (should (equal (agent-shell--session-column-value 'state '((sessionId . "s1")))
+                 ""))
+  (should-not (agent-shell--session-column-face 'state '((sessionId . "s1")))))
+
+(ert-deftest agent-shell--session-column-value-title-markers-test ()
+  "Test the title column marks forked and archived sessions."
+  (should (equal (agent-shell--session-column-value
+                  'title (agent-shell-tests--air-session
+                          '((forkedFrom . "parent") (archived . nil))
+                          '(title . "Child")))
+                 "↳ Child"))
+  (should (equal (agent-shell--session-column-value
+                  'title (agent-shell-tests--air-session
+                          '((archived . t))
+                          '(title . "Old")))
+                 "Old [archived]"))
+  (should (equal (agent-shell--session-column-value
+                  'title (agent-shell-tests--air-session
+                          '((archived . nil))
+                          '(title . "Plain")))
+                 "Plain")))
+
+(ert-deftest agent-shell--session-column-value-model-test ()
+  "Test the model column shows the AIR model or nothing."
+  (should (equal (agent-shell--session-column-value
+                  'model (agent-shell-tests--air-session
+                          '((model . "claude-opus-5-5"))))
+                 "claude-opus-5-5"))
+  (should (equal (agent-shell--session-column-value 'model '((sessionId . "s1")))
+                 "")))
+
+(ert-deftest agent-shell--session-selection-columns-test ()
+  "Test session selection columns adapt to the listed sessions."
+  (let ((agent-shell-show-session-id nil)
+        (agent-shell-show-session-model nil)
+        (plain '((sessionId . "p") (title . "Plain")))
+        (idle (agent-shell-tests--air-session
+               '((archived . nil) (model . "claude-opus-5-5"))))
+        (running (agent-shell-tests--air-session
+                  '((state . "running") (model . "claude-opus-5-5")))))
+    (should (equal (agent-shell--session-selection-columns)
+                   '(directory title date)))
+    (should (equal (agent-shell--session-selection-columns (list plain idle))
+                   '(directory title date)))
+    (should (equal (agent-shell--session-selection-columns (list plain running))
+                   '(directory title date state)))
+    (let ((agent-shell-show-session-id t))
+      (should (equal (agent-shell--session-selection-columns (list running))
+                     '(directory title date state session-id))))
+    (let ((agent-shell-show-session-model t))
+      (should (equal (agent-shell--session-selection-columns (list plain))
+                     '(directory title date)))
+      (should (equal (agent-shell--session-selection-columns (list running))
+                     '(directory title date state model))))))
+
+(ert-deftest agent-shell--session-choice-label-without-meta-unchanged-test ()
+  "Test rows without _meta render exactly as before AIR support."
+  (let* ((agent-shell-show-session-id nil)
+         (agent-shell-show-session-model t)
+         (session '((sessionId . "s1")
+                    (title . "My session")
+                    (cwd . "/home/user/project")
+                    (updatedAt . "2026-01-19T14:00:00Z")))
+         (columns (agent-shell--session-selection-columns (list session)))
+         (date (agent-shell--format-session-date "2026-01-19T14:00:00Z")))
+    (should (equal columns '(directory title date)))
+    (should (equal-including-properties (agent-shell--session-choice-label
+                    :acp-session session
+                    :max-widths '((directory . 10) (title . 15))
+                    :columns columns)
+                   (concat (propertize "project    " 'face 'agent-shell-session-directory)
+                           (propertize "My session      " 'face 'agent-shell-session-title)
+                           (propertize date 'face 'agent-shell-session-date))))))
+
+(ert-deftest agent-shell--session-choice-label-state-column-test ()
+  "Test the state column pads blank values and faces non-idle states."
+  (let* ((agent-shell-show-session-id nil)
+         (agent-shell-show-session-model nil)
+         (idle (agent-shell-tests--air-session
+                '((state . "idle")) '(title . "A") '(cwd . "/p")))
+         (waiting (agent-shell-tests--air-session
+                   '((state . "requires_action")) '(title . "B") '(cwd . "/p")))
+         (columns (agent-shell--session-selection-columns (list idle waiting)))
+         (max-widths '((directory . 1) (title . 1) (date . 5) (state . 11))))
+    (should (equal columns '(directory title date state)))
+    (should (string-suffix-p
+             "needs input"
+             (agent-shell--session-choice-label
+              :acp-session waiting :max-widths max-widths :columns columns)))
+    (let ((label (agent-shell--session-choice-label
+                  :acp-session waiting :max-widths max-widths :columns columns)))
+      (should (eq (get-text-property (1- (length label)) 'face label)
+                  'agent-shell-session-state-needs-input)))
+    ;; Idle leaves the trailing state column blank.
+    (should (string-suffix-p
+             "unknown-time"
+             (agent-shell--session-choice-label
+              :acp-session idle :max-widths max-widths :columns columns)))))
 
 (ert-deftest agent-shell--session-id-indicator-disabled-test ()
   "Test `agent-shell--session-id-indicator' returns nil when disabled."
@@ -13837,6 +14221,196 @@ at or after point, which puts diagnostics from other lines at point."
       (cl-letf (((symbol-function 'flymake-diagnostics)
                  (lambda (&optional _beg _end) (list diagnostic))))
         (should-not (agent-shell--get-flymake-error-context))))))
+
+;;; Session index: rename, archive, unarchive
+
+(ert-deftest agent-shell--make-session-index-requests-test ()
+  "The sessionIndex request builders produce the exact method and params."
+  (should (equal (agent-shell--make-session-rename-request
+                  :session-id "s1" :title "New title")
+                 '((:method . "_session/rename")
+                   (:params . ((sessionId . "s1")
+                               (title . "New title"))))))
+  (should (equal (agent-shell--make-session-archive-request :session-id "s1")
+                 '((:method . "_session/archive")
+                   (:params . ((sessionId . "s1"))))))
+  (should (equal (agent-shell--make-session-unarchive-request :session-id "s1")
+                 '((:method . "_session/unarchive")
+                   (:params . ((sessionId . "s1"))))))
+  (should-error (agent-shell--make-session-archive-request))
+  (should-error (agent-shell--make-session-rename-request :session-id "s1")))
+
+(defun agent-shell-tests--session-index-call (supported body)
+  "Call BODY in an agent shell buffer, with sessionIndex when SUPPORTED.
+BODY gets a function returning the requests sent so far, oldest first,
+each as the plist `agent-shell--send-request' received.  Nothing is
+answered; tests call `:on-success' or `:on-failure' themselves."
+  (with-temp-buffer
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state (agent-shell--make-state :buffer (current-buffer)))
+    (map-put! (map-elt agent-shell--state :session) :id "s1")
+    (map-put! (map-elt agent-shell--state :session) :title "Old title")
+    ;; Owned by the capability work; set it the way a real state will hold it.
+    (setf (map-elt agent-shell--state :supports-session-index) supported)
+    (let ((sent nil))
+      (cl-letf (((symbol-function 'agent-shell--send-request)
+                 (lambda (&rest args) (push args sent)))
+                ((symbol-function 'agent-shell--update-header-and-mode-line)
+                 #'ignore))
+        (funcall body (lambda () (reverse sent)))))))
+
+(ert-deftest agent-shell-session-index-commands-need-capability-test ()
+  "Rename, archive and unarchive refuse when the agent lacks sessionIndex."
+  (agent-shell-tests--session-index-call
+   nil
+   (lambda (sent)
+     (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+       (should-error (agent-shell-rename-session "x") :type 'user-error)
+       (should-error (agent-shell-archive-session) :type 'user-error)
+       (should-error (agent-shell-unarchive-session) :type 'user-error))
+     (should-not (funcall sent)))))
+
+(ert-deftest agent-shell-rename-session-sends-request-test ()
+  "Renaming sends `_session/rename' and leaves the title to the agent's update."
+  (agent-shell-tests--session-index-call
+   t
+   (lambda (sent)
+     (agent-shell-rename-session "New title")
+     (let ((call (car (funcall sent))))
+       (should (equal (plist-get call :request)
+                      '((:method . "_session/rename")
+                        (:params . ((sessionId . "s1")
+                                    (title . "New title"))))))
+       (funcall (plist-get call :on-success) nil))
+     (should (equal (map-nested-elt agent-shell--state '(:session :title))
+                    "Old title"))
+     (should-error (agent-shell-rename-session "  ") :type 'user-error)
+     (should (= (length (funcall sent)) 1)))))
+
+(ert-deftest agent-shell-rename-session-reports-agent-error-test ()
+  "A failed rename shows the agent's own error message."
+  (agent-shell-tests--session-index-call
+   t
+   (lambda (sent)
+     (agent-shell-rename-session "New title")
+     (let ((shown nil))
+       (cl-letf (((symbol-function 'message)
+                  (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
+         (funcall (plist-get (car (funcall sent)) :on-failure)
+                  '((code . -32600) (message . "rename_session is not supported"))
+                  nil))
+       (should (string-match-p "rename_session is not supported" shown))))))
+
+(ert-deftest agent-shell-archive-session-closes-on-success-test ()
+  "Archiving confirms, sends `_session/archive', and closes the shell on success."
+  (agent-shell-tests--session-index-call
+   t
+   (lambda (sent)
+     (let ((asked nil))
+       (cl-letf (((symbol-function 'yes-or-no-p)
+                  (lambda (prompt) (setq asked prompt) t)))
+         (agent-shell-archive-session))
+       (should (string-match-p "stop" asked)))
+     (let ((call (car (funcall sent))))
+       (should (equal (plist-get call :request)
+                      '((:method . "_session/archive")
+                        (:params . ((sessionId . "s1"))))))
+       (should-not (map-elt agent-shell--state :session-archived))
+       (funcall (plist-get call :on-success) nil))
+     (should (eq (map-elt agent-shell--state :session-archived) t)))))
+
+(ert-deftest agent-shell-archive-session-stays-open-on-error-or-decline-test ()
+  "A declined or failed archive leaves the shell open."
+  (agent-shell-tests--session-index-call
+   t
+   (lambda (sent)
+     (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) nil)))
+       (agent-shell-archive-session))
+     (should-not (funcall sent))
+     (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t))
+               ((symbol-function 'message) #'ignore))
+       (agent-shell-archive-session)
+       (funcall (plist-get (car (funcall sent)) :on-failure)
+                '((code . -32002) (message . "Session not found")) nil))
+     (should-not (map-elt agent-shell--state :session-archived)))))
+
+(ert-deftest agent-shell-unarchive-session-clears-closed-state-test ()
+  "Unarchiving sends `_session/unarchive', clears the flag and offers a reload."
+  (agent-shell-tests--session-index-call
+   t
+   (lambda (sent)
+     (setf (map-elt agent-shell--state :session-archived) t)
+     (agent-shell-unarchive-session)
+     (let ((call (car (funcall sent)))
+           (reloaded nil))
+       (should (equal (plist-get call :request)
+                      '((:method . "_session/unarchive")
+                        (:params . ((sessionId . "s1"))))))
+       (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) t))
+                 ((symbol-function 'agent-shell-reload)
+                  (lambda () (setq reloaded t))))
+         (funcall (plist-get call :on-success) nil))
+       (should-not (map-elt agent-shell--state :session-archived))
+       (should reloaded)))))
+
+(defun agent-shell-tests--session-info-archived (state update)
+  "Drive a `session_info_update' carrying UPDATE through STATE."
+  (cl-letf (((symbol-function 'agent-shell--update-header-and-mode-line) #'ignore)
+            ((symbol-function 'agent-shell--emit-event) #'ignore)
+            ((symbol-function 'agent-shell--update-transcript-title) #'ignore))
+    (with-current-buffer (map-elt state :buffer)
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       `((method . "session/update")
+         (params (update (sessionUpdate . "session_info_update") ,@update)))))))
+
+(ert-deftest agent-shell--on-notification-session-info-archived-test ()
+  "`_meta.jetbrains.air.archived' sets and clears the closed state.
+
+acp.el decodes JSON false as nil, so a present-but-false flag clears
+the state, while an update without the flag leaves it alone."
+  (with-temp-buffer
+    (let* ((state (list (cons :buffer (current-buffer))
+                        (cons :session (list (cons :id "s1") (cons :title "Kept")))
+                        (cons :last-entry-type nil)
+                        (cons :last-activity-time nil)))
+           (agent-shell--state state))
+      (agent-shell-tests--session-info-archived
+       state '((_meta (jetbrains (air (archived . t))))))
+      (should (eq (map-elt state :session-archived) t))
+      (should (equal (map-nested-elt state '(:session :title)) "Kept"))
+      (agent-shell-tests--session-info-archived state '((title . "Retitled")))
+      (should (eq (map-elt state :session-archived) t))
+      (agent-shell-tests--session-info-archived
+       state '((_meta (jetbrains (air (archived . nil))))))
+      (should (assq :session-archived state))
+      (should-not (map-elt state :session-archived)))))
+
+(ert-deftest agent-shell-submit-refuses-archived-session-test ()
+  "Submitting in an archived shell errors instead of sending a prompt."
+  (should (equal
+           (agent-shell-tests--with-persistent-prompt-shell
+            (lambda ()
+              (insert "hello")
+              (setf (map-elt agent-shell--state :session-archived) t)
+              (let ((submitted nil))
+                (cl-letf (((symbol-function 'shell-maker-submit)
+                           (lambda (&rest _) (setq submitted t))))
+                  (list :signalled (condition-case err
+                                       (progn (agent-shell-submit) nil)
+                                     (user-error
+                                      (and (string-match-p "unarchive"
+                                                           (cadr err))
+                                           t)))
+                        :inserted (condition-case _
+                                      (progn (agent-shell--insert-to-shell-buffer
+                                              :text "queued" :submit t :no-focus t)
+                                             nil)
+                                    (user-error t))
+                        :submitted submitted))))
+            :busy nil)
+           '(:signalled t :inserted t :submitted nil))))
 
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

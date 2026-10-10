@@ -624,6 +624,14 @@ Only appears when a session is active."
   :type 'boolean
   :group 'agent-shell)
 
+(defcustom agent-shell-show-session-model nil
+  "Non-nil to display each session's model in session selection.
+
+Only agents that report a per-session model (such as claude-agent-acp
+with its session index) populate this column."
+  :type 'boolean
+  :group 'agent-shell)
+
 (defcustom agent-shell-show-welcome-message t
   "Non-nil to show welcome message."
   :type 'boolean
@@ -1051,6 +1059,18 @@ strategy to operate on only a subset of the agent's sessions."
          (set-default symbol value))
   :group 'agent-shell)
 
+(defcustom agent-shell-session-list-include-worktrees nil
+  "Non-nil to also list sessions from the repository's other worktrees.
+
+When non-nil, listing sessions for a directory also returns the sessions
+of the same subdirectory in every other existing worktree of its
+repository.
+
+Applies only to agents that advertise the AIR session index
+\(claude-agent-acp); other agents always list the directory alone."
+  :type 'boolean
+  :group 'agent-shell)
+
 (defcustom agent-shell-session-choices-function nil
   "Function to transform the choices offered when starting a shell.
 
@@ -1323,6 +1343,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-session-resume nil)
         (cons :supports-session-fork nil)
         (cons :supports-fork-point nil)
+        (cons :supports-session-index nil)
         (cons :supports-steering nil)
         (cons :resume-session-id nil)
         (cons :fork-session-id nil)
@@ -1339,6 +1360,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :native-subagents nil)
         (cons :unknown-sessions nil)
         (cons :async-tasks nil)
+        (cons :session-archived nil)
         (cons :plan-signals nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
@@ -1447,6 +1469,7 @@ per-start aliasing is disabled (see the `:alias-commands nil' call in
   (unless (or (map-nested-elt agent-shell--state '(:session :id))
               (eq agent-shell-session-strategy 'new-deferred))
     (user-error "Starting agent, please wait"))
+  (agent-shell--ensure-session-not-archived)
   (if (agent-shell--prompt-submittable-p)
       (shell-maker-submit)
     (when-let* ((prompt (agent-shell--prompt-input)))
@@ -4549,6 +4572,14 @@ around this call to reflect whether the update arrived out of turn."
            (with-current-buffer (map-elt state :buffer)
              (agent-shell--set-session-title
               (map-nested-elt acp-notification '(params update title))))
+           ;; AIR sessionIndex: archiving, possibly from another client,
+           ;; closes the session.  acp.el decodes JSON false as nil, so
+           ;; only a present flag changes the state.
+           (let ((air (map-nested-elt acp-notification
+                                      '(params update _meta jetbrains air))))
+             (when (and (listp air) (assq 'archived air))
+               (agent-shell--set-session-archived
+                state (eq (map-elt air 'archived) t))))
            ;; Note: No need to set :last-entry-type as no text was inserted.
            nil)
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "config_option_update")
@@ -6655,6 +6686,155 @@ actually stops."
                             async-task-id)))
    :on-failure (lambda (acp-error _raw-message)
                  (message "Failed to stop background task: %s" acp-error))))
+
+(cl-defun agent-shell--make-session-rename-request (&key session-id title)
+  "Return a `_session/rename' request setting SESSION-ID's TITLE.
+This is claude-agent-acp's AIR sessionIndex extension."
+  (unless session-id
+    (error ":session-id is required"))
+  (unless title
+    (error ":title is required"))
+  `((:method . "_session/rename")
+    (:params . ((sessionId . ,session-id)
+                (title . ,title)))))
+
+(cl-defun agent-shell--make-session-archive-request (&key session-id)
+  "Return a `_session/archive' request for SESSION-ID.
+This is claude-agent-acp's AIR sessionIndex extension."
+  (unless session-id
+    (error ":session-id is required"))
+  `((:method . "_session/archive")
+    (:params . ((sessionId . ,session-id)))))
+
+(cl-defun agent-shell--make-session-unarchive-request (&key session-id)
+  "Return a `_session/unarchive' request for SESSION-ID.
+This is claude-agent-acp's AIR sessionIndex extension."
+  (unless session-id
+    (error ":session-id is required"))
+  `((:method . "_session/unarchive")
+    (:params . ((sessionId . ,session-id)))))
+
+(defun agent-shell--session-index-session-id ()
+  "Return the current shell's session id for a sessionIndex command.
+Signal a `user-error' outside a shell, when the agent did not advertise
+sessionIndex, or when there is no session yet."
+  (unless (derived-mode-p 'agent-shell-mode)
+    (user-error "Not in an agent-shell buffer"))
+  (unless (map-elt (agent-shell--state) :supports-session-index)
+    (user-error "Agent does not support renaming or archiving sessions"))
+  (or (map-nested-elt (agent-shell--state) '(:session :id))
+      (user-error "No active session")))
+
+(defun agent-shell--acp-error-text (acp-error)
+  "Return ACP-ERROR's message, with its code when it has one."
+  (let ((text (or (map-elt acp-error 'message) (format "%s" acp-error)))
+        (code (map-elt acp-error 'code)))
+    (if code (format "%s (%s)" text code) text)))
+
+(defun agent-shell--session-archived-p (&optional state)
+  "Return non-nil if STATE's session is archived, and therefore closed.
+STATE defaults to the current shell's."
+  (map-elt (or state (agent-shell--state)) :session-archived))
+
+(defun agent-shell--set-session-archived (state archived)
+  "Record in STATE whether its session is ARCHIVED.
+Writes `:session-archived' in place, adding it to STATE when missing,
+so every holder of STATE sees the change."
+  (if-let* ((cell (assq :session-archived state)))
+      (setcdr cell archived)
+    (nconc state (list (cons :session-archived archived))))
+  (when (buffer-live-p (map-elt state :buffer))
+    (with-current-buffer (map-elt state :buffer)
+      (when (derived-mode-p 'agent-shell-mode)
+        (agent-shell--update-header-and-mode-line)))))
+
+(defun agent-shell--ensure-session-not-archived ()
+  "Signal a `user-error' if the current shell's session is archived."
+  (when (agent-shell--session-archived-p)
+    (user-error "Session archived and closed; M-x agent-shell-unarchive-session, then reload")))
+
+(defun agent-shell-rename-session (title)
+  "Rename the current shell's session to TITLE on the agent's side.
+
+Needs an agent with claude-agent-acp's sessionIndex extension.  The
+new title arrives through the agent's `session_info_update', so it is
+not set here.  To rename only the Emacs buffer, use
+`agent-shell-rename-buffer'."
+  (interactive
+   (progn
+     (agent-shell--session-index-session-id)
+     (let ((current (map-nested-elt (agent-shell--state) '(:session :title))))
+       (list (read-string (format-prompt "Session title" current)
+                          nil nil current)))))
+  (let ((session-id (agent-shell--session-index-session-id))
+        (state (agent-shell--state)))
+    (when (string-blank-p (or title ""))
+      (user-error "Session title can't be blank"))
+    (agent-shell--send-request
+     :state state
+     :client (map-elt state :client)
+     :request (agent-shell--make-session-rename-request
+               :session-id session-id
+               :title title)
+     :buffer (map-elt state :buffer)
+     :on-success #'ignore
+     :on-failure (lambda (acp-error _raw-message)
+                   (message "Failed to rename session: %s"
+                            (agent-shell--acp-error-text acp-error))))))
+
+(defun agent-shell-archive-session ()
+  "Archive the current shell's session, which stops and closes it.
+
+Needs an agent with claude-agent-acp's sessionIndex extension.  The
+agent cancels any running turn and closes the session, so the shell
+can't prompt it again until `agent-shell-unarchive-session' and
+`agent-shell-reload'.
+
+The closed state is the shell state's `:session-archived', t while
+archived.  This command sets it on success; the agent's
+`session_info_update' sets or clears it too, so archiving from another
+client closes this shell as well."
+  (interactive)
+  (let ((session-id (agent-shell--session-index-session-id))
+        (state (agent-shell--state)))
+    (when (yes-or-no-p "Archive this session, stopping it and ending any running turn? ")
+      (agent-shell--send-request
+       :state state
+       :client (map-elt state :client)
+       :request (agent-shell--make-session-archive-request
+                 :session-id session-id)
+       :buffer (map-elt state :buffer)
+       :on-success (lambda (_acp-response)
+                     (agent-shell--set-session-archived state t)
+                     (message "Session archived and closed"))
+       :on-failure (lambda (acp-error _raw-message)
+                     (message "Failed to archive session: %s"
+                              (agent-shell--acp-error-text acp-error)))))))
+
+(defun agent-shell-unarchive-session ()
+  "Unarchive the current shell's session.
+
+Needs an agent with claude-agent-acp's sessionIndex extension.  This
+clears the shell state's `:session-archived', but the agent doesn't
+load the session again, so it offers `agent-shell-reload' to resume it."
+  (interactive)
+  (let ((session-id (agent-shell--session-index-session-id))
+        (state (agent-shell--state)))
+    (agent-shell--send-request
+     :state state
+     :client (map-elt state :client)
+     :request (agent-shell--make-session-unarchive-request
+               :session-id session-id)
+     :buffer (map-elt state :buffer)
+     :on-success (lambda (_acp-response)
+                   (agent-shell--set-session-archived state nil)
+                   (with-current-buffer (map-elt state :buffer)
+                     (if (y-or-n-p "Session unarchived but not loaded.  Reload it now? ")
+                         (agent-shell-reload)
+                       (message "Session unarchived; M-x agent-shell-reload to resume it"))))
+     :on-failure (lambda (acp-error _raw-message)
+                   (message "Failed to unarchive session: %s"
+                            (agent-shell--acp-error-text acp-error))))))
 
 (defun agent-shell--format-async-task-body (description summary last-tool-name usage)
   "Format an async task fragment body from DESCRIPTION, SUMMARY,
@@ -8909,12 +9089,18 @@ don't implement the extension ignore the unrecognized `_meta' key."
   "Return the AIR `_meta' naming every extension feature this client renders.
 
 The agent gates each feature on the client naming it here: native
-subagent sessions on \"nativeSubagentSessions\" and background tasks on
-\"asyncTasks\".  A feature rendered but not named is dead code, since the
-agent never sends its notifications; a feature named but not rendered
-leaves its notifications unhandled.  Keep this list and what
-`agent-shell--dispatch-notification' handles in step."
-  (agent-shell--air-capabilities-meta "nativeSubagentSessions" "asyncTasks"))
+subagent sessions on \"nativeSubagentSessions\", background tasks on
+\"asyncTasks\", and the ordered, bounded `session/list' on
+\"sessionIndex\".  A feature rendered but not named is dead code, since
+the agent never sends its notifications; a feature named but not
+rendered leaves its notifications unhandled.  Keep this list and what
+`agent-shell--dispatch-notification' handles in step.
+
+Unlike the others, the agent answers \"sessionIndex\" by advertising it
+back (see `agent-shell--air-capability-advertised-p'), and only then
+accepts the list options of `agent-shell--make-session-list-request'."
+  (agent-shell--air-capabilities-meta "nativeSubagentSessions" "asyncTasks"
+                                      "sessionIndex"))
 
 (defun agent-shell--air-extension-supported-p (acp-response)
   "Return non-nil when ACP-RESPONSE's agent implements the AIR extension.
@@ -8927,6 +9113,23 @@ Read rather than assumed, because the extension is one vendor's: an
 agent that never advertised it ignores AIR `_meta' on the requests we
 send, which turns a feature riding one into a silent no-op."
   (and (map-nested-elt acp-response '(_meta jetbrains air version)) t))
+
+(defun agent-shell--air-capability-advertised-p (acp-response capability)
+  "Return t when ACP-RESPONSE's agent advertises AIR CAPABILITY, else nil.
+
+ACP-RESPONSE is an `initialize' response; CAPABILITY is a capability
+name string.  The agent lists its capabilities as an array under the
+response's top-level `_meta.jetbrains.air.capabilities'.
+
+  (agent-shell--air-capability-advertised-p
+   \='((_meta (jetbrains (air (version . 1)
+                             (capabilities . [\"sessionIndex\"])))))
+   \"sessionIndex\")
+  ;; => t"
+  (and (seq-contains-p (map-nested-elt acp-response
+                                       '(_meta jetbrains air capabilities))
+                       capability)
+       t))
 
 (cl-defun agent-shell--initialize-client ()
   "Initialize ACP client."
@@ -9099,6 +9302,11 @@ Must provide ON-INITIATED (lambda ())."
                    ;; `agent-shell--air-extension-supported-p'.
                    (map-put! agent-shell--state :supports-fork-point
                              (agent-shell--air-extension-supported-p acp-response))
+                   ;; Advertised only to a client that named it in
+                   ;; `agent-shell--air-client-capabilities-meta'.
+                   (map-put! agent-shell--state :supports-session-index
+                             (agent-shell--air-capability-advertised-p
+                              acp-response "sessionIndex"))
                    (when-let* ((agent-capabilities (map-elt acp-response 'agentCapabilities)))
                      (map-put! agent-shell--state :supports-session-load
                                (eq (map-elt agent-capabilities 'loadSession) t))
@@ -9653,17 +9861,57 @@ for the current year, or \"Mon DD, YYYY\" for other years."
   (file-name-nondirectory
    (directory-file-name (or (map-elt acp-session 'cwd) ""))))
 
+(defun agent-shell--air-session-field (acp-session field)
+  "Return FIELD from ACP-SESSION's AIR session index metadata.
+
+claude-agent-acp's session index adds fields under
+`_meta.jetbrains.air' to each `session/list' row.
+
+  (agent-shell--air-session-field
+   \\='((sessionId . \"s1\")
+     (_meta . ((jetbrains . ((air . ((state . \"running\"))))))))
+   \\='state)
+  ;; => \"running\""
+  (map-nested-elt acp-session (list '_meta 'jetbrains 'air field)))
+
 (defun agent-shell--session-title (acp-session)
-  "Return display title for ACP-SESSION, truncated to 50 chars."
+  "Return display title for ACP-SESSION, truncated to 50 chars.
+
+Forked sessions get a \"↳ \" prefix and archived ones an
+\" [archived]\" suffix.
+
+  (agent-shell--session-title
+   \\='((title . \"Fix tests\")
+     (_meta . ((jetbrains . ((air . ((forkedFrom . \"s0\"))))))))
+  ;; => \"↳ Fix tests\""
   (let ((title (or (map-elt acp-session 'title) "Untitled")))
-    (if (> (length title) 50)
-        (concat (substring title 0 47) "...")
-      title)))
+    (concat (when (agent-shell--air-session-field acp-session 'forkedFrom)
+              "↳ ")
+            (if (> (length title) 50)
+                (concat (substring title 0 47) "...")
+              title)
+            (when (agent-shell--air-session-field acp-session 'archived)
+              " [archived]"))))
+
+(defun agent-shell--session-state-label (acp-session)
+  "Return ACP-SESSION's AIR state as a selection label.
+
+Idle and unknown states yield an empty string.
+
+  (agent-shell--session-state-label
+   \\='((_meta . ((jetbrains . ((air . ((state . \"requires_action\")))))))))
+  ;; => \"needs input\""
+  (pcase (agent-shell--air-session-field acp-session 'state)
+    ("running" "running")
+    ("requires_action" "needs input")
+    ("error" "error")
+    (_ "")))
 
 (defun agent-shell--session-column-value (column acp-session)
   "Return the string value for COLUMN from ACP-SESSION.
 
-COLUMN is a symbol: `directory', `title', `date', or `session-id'.
+COLUMN is a symbol: `directory', `title', `date', `state', `model',
+or `session-id'.
 
   (agent-shell--session-column-value
    \\='directory
@@ -9673,14 +9921,19 @@ COLUMN is a symbol: `directory', `title', `date', or `session-id'.
     ('directory (agent-shell--session-dir-name acp-session))
     ('title (agent-shell--session-title acp-session))
     ('date (agent-shell--format-session-date
-            (or (map-elt acp-session 'updatedAt)
+            (or (agent-shell--air-session-field acp-session 'lastPromptAt)
+                (map-elt acp-session 'updatedAt)
                 (map-elt acp-session 'createdAt)
                 "unknown-time")))
+    ('state (agent-shell--session-state-label acp-session))
+    ('model (or (agent-shell--air-session-field acp-session 'model) ""))
     ('session-id (or (map-elt acp-session 'sessionId) ""))
     (_ "")))
 
-(defun agent-shell--session-column-face (column)
+(defun agent-shell--session-column-face (column &optional acp-session)
   "Return the face for COLUMN in the session selection prompt.
+
+The `state' column's face depends on ACP-SESSION's state.
 
   (agent-shell--session-column-face \\='directory)
   ;; => `agent-shell-session-directory'"
@@ -9688,26 +9941,51 @@ COLUMN is a symbol: `directory', `title', `date', or `session-id'.
     ('directory 'agent-shell-session-directory)
     ('title 'agent-shell-session-title)
     ('date 'agent-shell-session-date)
+    ('state (pcase (agent-shell--air-session-field acp-session 'state)
+              ("running" 'agent-shell-session-state-running)
+              ("requires_action" 'agent-shell-session-state-needs-input)
+              ("error" 'agent-shell-session-state-error)))
+    ('model 'agent-shell-session-model)
     ('session-id 'agent-shell-session-id)
     (_ nil)))
 
-(defun agent-shell--session-selection-columns ()
-  "Return the list of columns for session selection.
-Always includes directory, title, and date.  Appends session-id
-when `agent-shell-show-session-id' is non-nil."
-  (if agent-shell-show-session-id
-      '(directory title date session-id)
-    '(directory title date)))
+(defun agent-shell--session-selection-columns (&optional acp-sessions)
+  "Return the list of columns for selecting one of ACP-SESSIONS.
 
-(cl-defun agent-shell--session-choice-label (&key acp-session max-widths)
+Always includes directory, title, and date.  Adds state when any
+session reports one, model when `agent-shell-show-session-model' is
+non-nil and any session reports one, and session-id when
+`agent-shell-show-session-id' is non-nil.
+
+  (agent-shell--session-selection-columns
+   \\='(((sessionId . \"s1\")
+      (_meta . ((jetbrains . ((air . ((state . \"idle\"))))))))))
+  ;; => (directory title date state)"
+  (seq-filter
+   #'identity
+   (list 'directory 'title 'date
+         (when (seq-some (lambda (acp-session)
+                           (agent-shell--air-session-field acp-session 'state))
+                         acp-sessions)
+           'state)
+         (when (and agent-shell-show-session-model
+                    (seq-some (lambda (acp-session)
+                                (agent-shell--air-session-field acp-session 'model))
+                              acp-sessions))
+           'model)
+         (when agent-shell-show-session-id
+           'session-id))))
+
+(cl-defun agent-shell--session-choice-label (&key acp-session max-widths columns)
   "Return completion label for ACP-SESSION.
-MAX-WIDTHS is an alist mapping column symbols to their max widths."
-  (let* ((columns (agent-shell--session-selection-columns))
+MAX-WIDTHS is an alist mapping column symbols to their max widths.
+COLUMNS defaults to `agent-shell--session-selection-columns'."
+  (let* ((columns (or columns (agent-shell--session-selection-columns)))
          parts
          (last-col (car (last columns))))
     (dolist (col columns)
       (let* ((value (agent-shell--session-column-value col acp-session))
-             (face (agent-shell--session-column-face col))
+             (face (agent-shell--session-column-face col acp-session))
              (max-width (or (map-elt max-widths col) (length value)))
              (padded (if (eq col last-col)
                          value
@@ -9718,12 +9996,14 @@ MAX-WIDTHS is an alist mapping column symbols to their max widths."
         (push (if face (propertize padded 'face face) padded) parts)))
     (apply #'concat (nreverse parts))))
 
-(defun agent-shell--prompt-select-session (acp-sessions)
+(defun agent-shell--prompt-select-session (acp-sessions &optional offer-archived)
   "Prompt to choose one from ACP-SESSIONS.
 
-Return selected session alist, nil to start a new session, or
+Return selected session alist, nil to start a new session,
 `:other-shell' when the user chose an existing shell (already
-displayed and bootstrapping shell killed).
+displayed and bootstrapping shell killed), or `:show-archived' when
+OFFER-ARCHIVED is non-nil and the user asked to list archived sessions
+too.
 Falls back to latest session in batch mode (e.g. tests)."
   (when (or acp-sessions (agent-shell-buffers))
     (if noninteractive
@@ -9731,7 +10011,7 @@ Falls back to latest session in batch mode (e.g. tests)."
       (let* ((other-shells (seq-remove (lambda (b) (eq b (current-buffer)))
                                        (agent-shell-buffers)))
              (new-session-choice "New shell")
-             (columns (agent-shell--session-selection-columns))
+             (columns (agent-shell--session-selection-columns acp-sessions))
              (max-widths (when acp-sessions
                            (mapcar (lambda (col)
                                      (cons col (apply #'max
@@ -9746,10 +10026,13 @@ Falls back to latest session in batch mode (e.g. tests)."
                                              (cons "New temp shell" :temp-shell))
                                        (when other-shells
                                          (list (cons "Switch to shell buffer" :other-shell)))
+                                       (when offer-archived
+                                         (list (cons "Show archived sessions" :show-archived)))
                                        (mapcar (lambda (acp-session)
                                                  (cons (agent-shell--session-choice-label
                                                         :acp-session acp-session
-                                                        :max-widths max-widths)
+                                                        :max-widths max-widths
+                                                        :columns columns)
                                                        acp-session))
                                                acp-sessions))))
              ;; Some completion frameworks yielded appended (nil) to each line
@@ -9784,6 +10067,7 @@ Falls back to latest session in batch mode (e.g. tests)."
                              default-choice))))
           (pcase (map-elt session-choices selection)
             (:new-shell nil)
+            (:show-archived :show-archived)
             (:other-shell
              (let ((other-shell (agent-shell--read-shell-buffer
                                  :prompt "Switch to shell buffer: "
@@ -10382,25 +10666,89 @@ session's latest turn; see `agent-shell--fork-message-meta'."
    :on-failure (agent-shell--make-error-handler
                 :state (agent-shell--state) :shell-buffer shell-buffer)))
 
+;;;; AIR session index
+
+;; The AIR session index (claude-agent-acp's `sessionIndex') carries
+;; `session/list' options in the request's `_meta.jetbrains.air'.  These
+;; are expected to become standard ACP fields; keep them together here.
+
+(defun agent-shell--session-index-list-options (archived)
+  "Return the AIR `session/list' options listing ARCHIVED sessions.
+
+ARCHIVED is nil (the agent's default, unarchived only), \"unarchived\",
+\"archived\" or \"all\".  `includeWorktrees' follows
+`agent-shell-session-list-include-worktrees' and is omitted when nil,
+since nil would serialize as {} rather than false, which the agent
+rejects.
+
+  (let ((agent-shell-session-list-include-worktrees t))
+    (agent-shell--session-index-list-options \"all\"))
+  ;; => ((limit . 200) (includeWorktrees . t) (archived . \"all\"))"
+  `((limit . 200)
+    ,@(when agent-shell-session-list-include-worktrees
+        '((includeWorktrees . t)))
+    ,@(when archived `((archived . ,archived)))))
+
+(cl-defun agent-shell--make-session-list-request (&key cwd cursor index-options)
+  "Return a `session/list' request for CWD, starting at CURSOR.
+
+Produces the same request as `acp-make-session-list-request', plus the
+AIR session index's list options when INDEX-OPTIONS is non-nil (see
+`agent-shell--session-index-list-options').  Built here rather than in
+acp.el so that agent-shell need not wait on an acp.el release.  The
+agent binds a cursor to the options it was issued for, so every page
+must carry the same INDEX-OPTIONS.
+
+  (agent-shell--make-session-list-request :cwd \"/tmp/\")
+  ;; => ((:method . \"session/list\")
+  ;;     (:params (cwd . \"/tmp\")))
+
+  (agent-shell--make-session-list-request
+   :cwd \"/tmp/\" :cursor \"c\" :index-options \='((limit . 200)))
+  ;; => ((:method . \"session/list\")
+  ;;     (:params (cwd . \"/tmp\") (cursor . \"c\")
+  ;;              (_meta (jetbrains (air (version . 1)
+  ;;                                     (list (limit . 200)))))))"
+  (unless cwd
+    (error ":cwd is required"))
+  `((:method . "session/list")
+    ;; directory-file-name removes any trailing /
+    (:params . ((cwd . ,(directory-file-name (expand-file-name cwd)))
+                ,@(when cursor `((cursor . ,cursor)))
+                ,@(when index-options
+                    `((_meta . ((jetbrains . ((air . ((version . 1)
+                                                      (list . ,index-options)))))))))))))
+
 (cl-defun agent-shell--list-sessions (&key state cwd buffer cursor seen-cursors
-                                           sessions
+                                           sessions archived index-options
                                            (page-limit agent-shell-session-list-page-limit)
                                            on-success on-failure)
   "Fetch all session/list pages for CWD using STATE and BUFFER.
 
-CURSOR, SEEN-CURSORS, and SESSIONS carry pagination state between
-requests.  SEEN-CURSORS also counts the pages fetched so far: every page
-past the first is reached through exactly one cursor, so this request is
-for page (1+ (length SEEN-CURSORS)).  PAGE-LIMIT is nil to fetch all
+When STATE has `:supports-session-index', the request asks the agent for
+pages of up to 200 sessions, ordered by last prompt, filtered by
+ARCHIVED (nil, \"unarchived\", \"archived\" or \"all\"; see
+`agent-shell--session-index-list-options').  Otherwise ARCHIVED is
+ignored and the agent lists its default sessions.
+
+CURSOR, SEEN-CURSORS, SESSIONS and INDEX-OPTIONS carry pagination state
+between requests; INDEX-OPTIONS is computed on the first page and resent
+unchanged, since the agent rejects a cursor with other options.
+SEEN-CURSORS also counts the pages fetched so far: every page past the
+first is reached through exactly one cursor, so this request is for
+page (1+ (length SEEN-CURSORS)).  PAGE-LIMIT is nil to fetch all
 pages, or a positive integer limiting the number of requests.  Call
 ON-SUCCESS with the fetched sessions when the agent omits `nextCursor'
 or PAGE-LIMIT is reached.  Call ON-FAILURE with the ACP error and raw
 message when a request fails or the agent repeats a cursor."
   (agent-shell--validate-session-list-page-limit page-limit)
+  (when (and (not cursor) (map-elt state :supports-session-index))
+    (setq index-options (agent-shell--session-index-list-options archived)))
   (agent-shell--send-request
    :state state
    :client (map-elt state :client)
-   :request (acp-make-session-list-request :cwd cwd :cursor cursor)
+   :request (agent-shell--make-session-list-request
+             :cwd cwd :cursor cursor :index-options index-options)
    :buffer buffer
    :on-success
    (lambda (acp-response)
@@ -10423,37 +10771,58 @@ message when a request fails or the agent repeats a cursor."
           :cursor next-cursor
           :seen-cursors (cons next-cursor seen-cursors)
           :sessions all-sessions
+          :archived archived
+          :index-options index-options
           :page-limit page-limit
           :on-success on-success
           :on-failure on-failure)))))
    :on-failure on-failure))
 
-(cl-defun agent-shell--initiate-session-list-and-load (&key shell-buffer on-session-init)
-  "Try loading latest existing session with SHELL-BUFFER and ON-SESSION-INIT."
+(cl-defun agent-shell--initiate-session-list-and-load (&key shell-buffer on-session-init archived)
+  "Try loading latest existing session with SHELL-BUFFER and ON-SESSION-INIT.
+
+ARCHIVED is passed to `agent-shell--list-sessions'.  With the session
+index, the picker offers to list archived sessions too, which calls this
+again with ARCHIVED \"all\"."
   (with-current-buffer (map-elt (agent-shell--state) :buffer)
     (agent-shell--update-bootstrapping-fragment
      :state (agent-shell--state)
      :block-id "starting"
-     :body "\n\nLooking for existing sessions..."
+     :body (if archived
+               "\n\nLooking for archived sessions too..."
+             "\n\nLooking for existing sessions...")
      :append t))
   (agent-shell--emit-event :event 'session-list)
   (agent-shell--list-sessions
    :state (agent-shell--state)
    :cwd (agent-shell--resolve-path (agent-shell-cwd))
    :buffer (current-buffer)
+   :archived archived
    :on-success (lambda (acp-sessions)
-                 (let ((acp-sessions (agent-shell--sort-sessions-by-recency acp-sessions)))
+                 ;; The session index already orders by last prompt, which
+                 ;; re-sorting by `updatedAt' would undo.
+                 (let ((acp-sessions (if (map-elt (agent-shell--state) :supports-session-index)
+                                         acp-sessions
+                                       (agent-shell--sort-sessions-by-recency acp-sessions))))
                    (condition-case nil
                        (let* ((acp-session
                                (pcase agent-shell-session-strategy
                                  ('new-deferred nil)
                                  ('new nil)
                                  ('latest (car acp-sessions))
-                                 ('prompt (agent-shell--prompt-select-session acp-sessions))
+                                 ('prompt (agent-shell--prompt-select-session
+                                           acp-sessions
+                                           (and (map-elt (agent-shell--state) :supports-session-index)
+                                                (not archived))))
                                  (_ (message "Unknown session strategy '%s', starting a new session"
                                              agent-shell-session-strategy)
                                     nil))))
-                         (unless (eq acp-session :other-shell)
+                         (when (eq acp-session :show-archived)
+                           (agent-shell--initiate-session-list-and-load
+                            :shell-buffer shell-buffer
+                            :on-session-init on-session-init
+                            :archived "all"))
+                         (unless (memq acp-session '(:other-shell :show-archived))
                            (let ((acp-session-id (and acp-session
                                                       (map-elt acp-session 'sessionId))))
                              (agent-shell--emit-event
@@ -11047,8 +11416,10 @@ capability, since the `session/list' request would otherwise fail."
               (session-id (map-nested-elt agent-shell--state '(:session :id))))
     (acp-send-request
      :client client
-     :request (acp-make-session-list-request
-               :cwd (agent-shell--resolve-path default-directory))
+     :request (agent-shell--make-session-list-request
+               :cwd (agent-shell--resolve-path default-directory)
+               :index-options (when (map-elt agent-shell--state :supports-session-index)
+                                (agent-shell--session-index-list-options nil)))
      :buffer (current-buffer)
      :on-success
      (lambda (acp-response)
@@ -12580,6 +12951,8 @@ Returns an alist with insertion details or nil otherwise:
             (when (and (shell-maker-busy)
                        (or submit (not (agent-shell--prompt-input-start))))
               (user-error "Busy, try later"))
+            (when submit
+              (agent-shell--ensure-session-not-archived))
             (save-excursion
               (save-restriction
                 (goto-char insert-start)

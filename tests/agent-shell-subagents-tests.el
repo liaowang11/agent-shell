@@ -34,13 +34,15 @@ silently fall back to plain tool calls."
 
 claude-agent-acp gates each feature on the client naming it in the
 initialize request's `_meta.jetbrains.air.capabilities': native subagent
-sessions on \"nativeSubagentSessions\" (acp-subagents.ts) and background
-tasks on \"asyncTasks\" (async-tasks.ts).  A feature we render but never
-name is dead code -- the agent simply never sends those notifications."
+sessions on \"nativeSubagentSessions\" (acp-subagents.ts), background
+tasks on \"asyncTasks\" (async-tasks.ts), and the ordered, bounded
+`session/list' on \"sessionIndex\".  A feature we render but never name
+is dead code -- the agent simply never sends those notifications."
   (let ((advertised (map-nested-elt (agent-shell--air-client-capabilities-meta)
                                     '(jetbrains air capabilities))))
     (should (seq-contains-p advertised "nativeSubagentSessions"))
-    (should (seq-contains-p advertised "asyncTasks"))))
+    (should (seq-contains-p advertised "asyncTasks"))
+    (should (seq-contains-p advertised "sessionIndex"))))
 
 (ert-deftest agent-shell-air-capabilities-are-per-agent-test ()
   "Only agents that implement the AIR extension are told about it.
