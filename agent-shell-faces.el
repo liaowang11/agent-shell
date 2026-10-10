@@ -85,6 +85,26 @@
   "Face for a session's date."
   :group 'agent-shell-faces)
 
+(defface agent-shell-session-model
+  '((t :inherit font-lock-type-face))
+  "Face for a session's model in session selection."
+  :group 'agent-shell-faces)
+
+(defface agent-shell-session-state-running
+  '((t :inherit success))
+  "Face for a running session in session selection."
+  :group 'agent-shell-faces)
+
+(defface agent-shell-session-state-needs-input
+  '((t :inherit warning))
+  "Face for a session waiting on user input in session selection."
+  :group 'agent-shell-faces)
+
+(defface agent-shell-session-state-error
+  '((t :inherit error))
+  "Face for a session in an error state in session selection."
+  :group 'agent-shell-faces)
+
 
 ;;; Collapsible sections (magit-like sections)
 
