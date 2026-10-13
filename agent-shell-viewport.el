@@ -60,7 +60,10 @@
 (declare-function agent-shell--prompt-steer "agent-shell-prompt-queue")
 (declare-function agent-shell--prompt-steerable-p "agent-shell-prompt-queue")
 (declare-function agent-shell--busy-submit-steers-p "agent-shell-prompt-queue")
-(declare-function agent-shell--make-header "agent-shell")
+(declare-function agent-shell--make-header-model "agent-shell")
+(declare-function agent-shell--render-header-model "agent-shell")
+(declare-function agent-shell--busy-indicator-frame "agent-shell")
+(defvar agent-shell--header-last-model)
 (declare-function agent-shell--context "agent-shell")
 (declare-function agent-shell--shell-buffer "agent-shell")
 (declare-function agent-shell--state "agent-shell")
@@ -1950,19 +1953,76 @@ by the graphical and text headers, which render the same entry."
                            agent-shell-viewport--compose-disposition)))
     "Reply…"))
 
-(defun agent-shell-viewport--update-header ()
+(defvar-local agent-shell-viewport--header-last-model nil
+  "Header model from the last full viewport header update.
+
+Like `agent-shell--header-last-model', reused by heartbeat ticks.")
+
+(defvar-local agent-shell-viewport--header-last-inputs nil
+  "Inputs `agent-shell-viewport--header-last-model' was built from.
+
+See `agent-shell-viewport--header-inputs'.")
+
+(cl-defun agent-shell-viewport--update-header (&key cache-enabled)
   "Update header and mode line based on `agent-shell-header-style'.
 
 Automatically determines position, status, key hints and menu keys based
-on current major mode."
+on current major mode.
+
+With CACHE-ENABLED non-nil (used by heartbeat ticks), reuse the model
+from the last full update while its inputs hold, refreshing only the
+page position and the animated busy frame."
   (agent-shell-viewport--ensure-buffer)
+  (when-let* ((shell-buffer (agent-shell-viewport--shell-buffer)))
+    (let* ((inputs (agent-shell-viewport--header-inputs shell-buffer))
+           (model (if (and cache-enabled
+                           agent-shell-viewport--header-last-model
+                           (equal inputs agent-shell-viewport--header-last-inputs))
+                      (let ((copy (copy-alist agent-shell-viewport--header-last-model)))
+                        (map-put! copy :position (agent-shell-viewport--position-label))
+                        (map-put! copy :busy-indicator-frame
+                                  (with-current-buffer shell-buffer
+                                    (agent-shell--busy-indicator-frame)))
+                        copy)
+                    (setq agent-shell-viewport--header-last-inputs inputs)
+                    (setq agent-shell-viewport--header-last-model
+                          (agent-shell-viewport--make-header-model shell-buffer)))))
+      (when-let* ((header (with-current-buffer shell-buffer
+                            (agent-shell--render-header-model model))))
+        (setq-local header-line-format header))))
+  (agent-shell-viewport--sync-layout-spacer))
+
+(defun agent-shell-viewport--header-inputs (shell-buffer)
+  "Return what the viewport header model depends on, besides its position.
+
+Status and key hints follow the major mode, whether SHELL-BUFFER is busy
+and what a send would do then.  Everything else comes from the shell, so
+any full update of its own header (usage, model or mode changes) also
+invalidates the viewport's, as does a frame resize.
+
+For example:
+
+  (agent-shell-viewport-view-mode \"queue\" ((:buffer-name . ...) ...) 1920)"
+  (list major-mode
+        (when (agent-shell-viewport--busy-p)
+          (agent-shell-viewport--compose-disposition-label
+           agent-shell-viewport--compose-disposition))
+        (buffer-local-value 'agent-shell--header-last-model shell-buffer)
+        (frame-pixel-width)))
+
+(defun agent-shell-viewport--position-label ()
+  "Return the page position label, e.g. \"2/5\", or nil on the compose page."
   ;; No position label on the compose page: `status' already says "Edit"
   ;; there, and a page count has nothing left to disambiguate once there's
   ;; only one compose page to be on.
-  (let* ((position-label (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
-                           (let ((pos (or (agent-shell-viewport--position)
-                                          (list (cons :current 1) (cons :total 1)))))
-                             (format "%d/%d" (map-elt pos :current) (map-elt pos :total)))))
+  (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
+    (let ((pos (or (agent-shell-viewport--position)
+                   (list (cons :current 1) (cons :total 1)))))
+      (format "%d/%d" (map-elt pos :current) (map-elt pos :total)))))
+
+(defun agent-shell-viewport--make-header-model (shell-buffer)
+  "Return a full header model for this viewport, built in SHELL-BUFFER."
+  (let* ((position-label (agent-shell-viewport--position-label))
          (status (cond
                   ((and (agent-shell-viewport--busy-p)
                         (derived-mode-p 'agent-shell-viewport-edit-mode))
@@ -2038,17 +2098,14 @@ on current major mode."
                                   (key-description (where-is-internal
                                                     'agent-shell-viewport-set-session-thought-level
                                                     keymap t)))))
-    (when-let* ((shell-buffer (agent-shell-viewport--shell-buffer))
-                (header (with-current-buffer shell-buffer
-                          (agent-shell--make-header (agent-shell--state)
-                                                    :position position-label
-                                                    :status status
-                                                    :key-hints key-hints
-                                                    :menu-keys `((:model . ,model-binding)
-                                                                 (:mode . ,mode-binding)
-                                                                 (:thought-level . ,thought-level-binding))))))
-      (setq-local header-line-format header))
-    (agent-shell-viewport--sync-layout-spacer)))
+    (with-current-buffer shell-buffer
+      (agent-shell--make-header-model (agent-shell--state)
+                                      :position position-label
+                                      :status status
+                                      :key-hints key-hints
+                                      :menu-keys `((:model . ,model-binding)
+                                                   (:mode . ,mode-binding)
+                                                   (:thought-level . ,thought-level-binding))))))
 
 (cl-defun agent-shell-viewport--shell-buffer (&optional viewport-buffer)
   "Get the shell buffer associated with VIEWPORT-BUFFER.

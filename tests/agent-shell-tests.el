@@ -7956,13 +7956,115 @@ page to disambiguate, so a position label would just repeat it."
           (with-current-buffer viewport-buffer
             (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
                        (lambda (&rest _) shell-buffer))
-                      ((symbol-function 'agent-shell--make-header)
+                      ((symbol-function 'agent-shell--make-header-model)
                        (lambda (_state &rest args)
                          (setq captured-position (plist-get args :position))
-                         ""))
+                         nil))
+                      ((symbol-function 'agent-shell--render-header-model)
+                       (lambda (_model) ""))
                       ((symbol-function 'agent-shell--state) (lambda () nil)))
               (agent-shell-viewport--update-header)
               (should-not captured-position))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell-viewport--update-header-cache-enabled-reuses-model-test ()
+  "Test a cached header update reuses the last model but not its position.
+
+Heartbeat ticks pass CACHE-ENABLED, so the header model is not rebuilt
+on every beat.  The page position still streams in per tick, and a
+change of mode, busy state or the shell's own header model rebuilds."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (builds 0)
+        (busy t)
+        (position '((:current . 1) (:total . 1))))
+    (unwind-protect
+        (progn
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda (&rest _) nil)))
+              (agent-shell-viewport-view-mode)))
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) position))
+                      ((symbol-function 'agent-shell-viewport--busy-p)
+                       (lambda (&rest _) busy))
+                      ((symbol-function 'agent-shell--busy-indicator-frame)
+                       (lambda () "*"))
+                      ((symbol-function 'agent-shell--prompt-steerable-p)
+                       (lambda () nil))
+                      ((symbol-function 'agent-shell--make-header-model)
+                       (lambda (_state &rest args)
+                         (setq builds (1+ builds))
+                         `((:position . ,(plist-get args :position))
+                           (:status . ,(plist-get args :status))
+                           (:busy-indicator-frame . "*"))))
+                      ((symbol-function 'agent-shell--render-header-model)
+                       (lambda (model)
+                         (format "%s %s"
+                                 (map-elt model :position)
+                                 (map-elt model :status))))
+                      ((symbol-function 'agent-shell--state) (lambda () nil)))
+              (agent-shell-viewport--update-header)
+              (should (= builds 1))
+              (should (equal header-line-format "1/1 Busy"))
+              ;; A tick reuses the model, yet shows the new page count.
+              (setq position '((:current . 2) (:total . 2)))
+              (agent-shell-viewport--update-header :cache-enabled t)
+              (should (= builds 1))
+              (should (equal header-line-format "2/2 Busy"))
+              ;; A full update always rebuilds.
+              (agent-shell-viewport--update-header)
+              (should (= builds 2))
+              ;; So does a tick after the shell rebuilt its own header
+              ;; model (e.g. on a usage update).
+              (with-current-buffer shell-buffer
+                (setq-local agent-shell--header-last-model '((:width . 1))))
+              (agent-shell-viewport--update-header :cache-enabled t)
+              (should (= builds 3))
+              (agent-shell-viewport--update-header :cache-enabled t)
+              (should (= builds 3))
+              ;; And a tick whose busy state changed, which drives the
+              ;; status and key hints.
+              (setq busy nil)
+              (agent-shell-viewport--update-header :cache-enabled t)
+              (should (= builds 4))
+              (should (equal header-line-format "2/2 View")))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
+(ert-deftest agent-shell--make-heartbeat-handler-caches-viewport-busy-ticks-test ()
+  "A busy tick updates the viewport header from its cached model.
+Starting and ending ticks take the full path."
+  (let ((shell-buffer (generate-new-buffer "*agent-shell-heartbeat-test*"))
+        (viewport-buffer (generate-new-buffer "*agent-shell-heartbeat-test* [viewport]"))
+        (frame nil)
+        (calls nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--busy-indicator-frame)
+                   (lambda () frame))
+                  ((symbol-function 'agent-shell-viewport--buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'get-buffer-window)
+                   (lambda (buffer &rest _) (eq buffer viewport-buffer)))
+                  ((symbol-function 'agent-shell--update-header-and-mode-line)
+                   (lambda (&rest _)))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest args) (push args calls))))
+          (let ((handler (agent-shell--make-heartbeat-handler shell-buffer))
+                (agent-shell-chat-mode nil))
+            (funcall handler nil 'started)
+            (setq frame " busy")
+            (funcall handler nil 'busy)
+            (setq frame nil)
+            (funcall handler nil 'ended)
+            (should (equal (reverse calls)
+                           '((:cache-enabled nil)
+                             (:cache-enabled t)
+                             (:cache-enabled nil))))))
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
 

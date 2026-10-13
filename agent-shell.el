@@ -14247,7 +14247,8 @@ tick, its first busy tick and its ending tick, and on none in between."
                            (equal frames viewport-frames))
                 (setq viewport-frames frames)
                 (with-current-buffer viewport-buffer
-                  (agent-shell-viewport--update-header)))
+                  (agent-shell-viewport--update-header
+                   :cache-enabled (eq status 'busy))))
             (setq viewport-frames nil)))))))
 
 (defun agent-shell--mode-line-model-menu ()
