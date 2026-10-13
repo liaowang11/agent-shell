@@ -11052,13 +11052,26 @@ session's latest turn; see `agent-shell--fork-message-meta'."
                                         (propertize "Forked session" 'font-lock-face 'agent-shell-section-heading))
                     :expanded t
                     :body (or new-session-id ""))
-                   ;; Some agents (e.g. claude-agent-acp) fork by copying the
-                   ;; transcript only, returning neither models nor modes and
-                   ;; leaving the new session inactive (prompts fail with
-                   ;; "Session not found").  Resuming activates it and also
-                   ;; replays the forked history when loading.
-                   (if (or (map-elt (agent-shell--state) :supports-session-load)
-                           (map-elt (agent-shell--state) :supports-session-resume))
+                   ;; An agent that starts the forked session answers with its
+                   ;; `modes' or `configOptions' (claude-agent-acp since its
+                   ;; PR 1317), and the fork can be prompted at once.
+                   ;; Older agents copy the transcript only and answer with
+                   ;; neither, so prompting the fork fails with "Session not
+                   ;; found" until it is resumed or loaded.  A load is still
+                   ;; sent to a started fork when the restore verbosity wants
+                   ;; its history replayed into this buffer; claude-agent-acp
+                   ;; replays into the running session without restarting it.
+                   (if (and (or (map-elt (agent-shell--state) :supports-session-load)
+                                (map-elt (agent-shell--state) :supports-session-resume))
+                            (or (not (or (map-elt acp-fork-response 'modes)
+                                         (map-elt acp-fork-response 'configOptions)))
+                                ;; Not `agent-shell--use-session-load-p', which
+                                ;; also loads for `minimal' when resume is
+                                ;; missing: that is a restore, and a started
+                                ;; fork needs none.
+                                (and (memq agent-shell-session-restore-verbosity
+                                           '(last first-last full))
+                                     (map-elt (agent-shell--state) :supports-session-load))))
                        (agent-shell--initiate-session-resume-by-id
                         :session-id new-session-id
                         :shell-buffer shell-buffer

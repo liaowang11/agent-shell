@@ -6044,6 +6044,56 @@ second prompt, which already holds archived sessions, does not offer it."
           (should session-init-called)
           (should-not list-and-load-called))))))
 
+(ert-deftest agent-shell--initiate-session-fork-by-id-skips-resume-of-a-started-fork-test ()
+  "Test a fork that the agent started is not resumed, only loaded for replay.
+
+claude-agent-acp starts the forked session inside `session/fork' and
+answers with its `modes' and `configOptions'.  Resuming it again does
+nothing, while a `session/load' still replays its history."
+  (dolist (case '((minimal ((modes (currentModeId . "default"))) ("session/fork"))
+                  (minimal ((configOptions . [])) ("session/fork"))
+                  (full ((modes (currentModeId . "default"))) ("session/fork" "session/load"))
+                  ;; Without resume, `minimal' would restore by loading, but
+                  ;; a started fork needs no restore at all.
+                  (minimal ((modes (currentModeId . "default"))) ("session/fork") :no-resume)
+                  ;; Not started: it still has to be resumed before prompting.
+                  (minimal ((title . "fork")) ("session/fork" "session/resume"))))
+    (with-temp-buffer
+      (let ((agent-shell-session-restore-verbosity (nth 0 case))
+            (methods '())
+            (session-init-called nil))
+        (setq-local agent-shell--state
+                    (list (cons :buffer (current-buffer))
+                          (cons :client 'test-client)
+                          (cons :supports-session-resume (not (nth 3 case)))
+                          (cons :supports-session-load t)
+                          (cons :pending-restore nil)))
+        (cl-letf (((symbol-function 'agent-shell--state)
+                   (lambda () agent-shell--state))
+                  ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                   #'ignore)
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'agent-shell--set-session-from-response) #'ignore)
+                  ((symbol-function 'agent-shell--render-pending-restore) #'ignore)
+                  ((symbol-function 'agent-shell-cwd) (lambda () "/tmp"))
+                  ((symbol-function 'agent-shell--mcp-servers) (lambda () []))
+                  ((symbol-function 'agent-shell--finalize-session-init)
+                   (lambda (&rest args)
+                     (funcall (plist-get args :on-session-init))))
+                  ((symbol-function 'agent-shell--send-request)
+                   (lambda (&rest args)
+                     (push (map-elt (plist-get args :request) :method) methods)
+                     (funcall (plist-get args :on-success)
+                              (cons '(sessionId . "forked-id") (nth 1 case))))))
+          (let ((inhibit-message t))
+            (agent-shell--initiate-session-fork-by-id
+             :session-id "parent-id"
+             :shell-buffer (current-buffer)
+             :on-session-init (lambda () (setq session-init-called t))))
+          (should (equal (cons (nth 0 case) (nreverse methods))
+                         (cons (nth 0 case) (nth 2 case))))
+          (should session-init-called))))))
+
 (ert-deftest agent-shell--initiate-session-prefers-list-and-load-when-supported ()
   "Test `agent-shell--initiate-session' prefers session/list + session/load."
   (with-temp-buffer
