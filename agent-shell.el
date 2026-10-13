@@ -14769,7 +14769,8 @@ are skipped; the next one catches up."
                            (equal frames viewport-frames))
                 (setq viewport-frames frames)
                 (with-current-buffer viewport-buffer
-                  (agent-shell-viewport--update-header)))
+                  (agent-shell-viewport--update-header
+                   :cache-enabled (eq status 'busy))))
             (setq viewport-frames nil)))))))
 
 (defun agent-shell--mode-line-model-menu ()
