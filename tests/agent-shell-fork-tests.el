@@ -9,10 +9,13 @@
 (ert-deftest agent-shell--initiate-handshake-trusts-fork-point-only-from-an-air-client-test ()
   "Test `:supports-fork-point' needs this client to have sent AIR `_meta'.
 
-omp advertises `_meta.jetbrains.air.version' to every client but ignores
-the fork point, so trusting its advert alone would fork the latest turn."
+An omp build before its AIR gating advertises `_meta.jetbrains.air.version'
+to every client but ignores the fork point, so trusting the advert alone
+would fork the latest turn.  A config that sends no AIR `_meta' stands
+for such a client."
   (dolist (case `((,(agent-shell-anthropic-make-claude-code-config) . t)
-                  (,(agent-shell-omp-make-agent-config) . nil)))
+                  (,(agent-shell-omp-make-agent-config) . t)
+                  (,(agent-shell-make-agent-config :identifier 'nobody) . nil)))
     (with-temp-buffer
       (let ((agent-shell--state (agent-shell--make-state :agent-config (car case)
                                                          :buffer (current-buffer))))

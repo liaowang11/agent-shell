@@ -9690,8 +9690,11 @@ Must provide ON-INITIATED (lambda ())."
                    ;; agent that never advertised the extension ignores it and
                    ;; forks the latest turn instead.  See
                    ;; `agent-shell--air-extension-supported-p'.  The advert
-                   ;; only counts when this client sent AIR `_meta' too: omp
-                   ;; advertises AIR to every client but ignores a fork point.
+                   ;; only counts when this client sent AIR `_meta' too: an
+                   ;; agent can advertise AIR to every client yet honor a fork
+                   ;; point only for one that named the extension, as current
+                   ;; omp does.  Older omp builds advertised AIR but ignored
+                   ;; fork points even then, which this cannot tell apart.
                    (map-put! agent-shell--state :supports-fork-point
                              (and (map-nested-elt agent-shell--state
                                                   '(:agent-config :initialize-meta))

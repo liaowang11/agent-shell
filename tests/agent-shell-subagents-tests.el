@@ -54,8 +54,9 @@ advertising it to codex, gemini and the rest would grow a union of every
 vendor's keys sent to everyone.  Agent configs already carry per-agent
 wire extras."
   (should (agent-shell--air-client-capabilities-meta))
-  ;; Claude implements it.
+  ;; Claude and omp implement it.
   (should (map-elt (agent-shell-anthropic-make-claude-code-config) :initialize-meta))
+  (should (map-elt (agent-shell-omp-make-agent-config) :initialize-meta))
   ;; A config that never opted in advertises nothing.
   (should-not (map-elt (agent-shell-make-agent-config :identifier 'nobody)
                        :initialize-meta)))
