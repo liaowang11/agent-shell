@@ -2370,10 +2370,9 @@ back does.  With no interaction to show, compose stays as it is."
 (ert-deftest agent-shell-viewport-leaving-compose-without-draft-parks-nothing-test ()
   "Test leaving compose parks no draft when its text was discarded or sent.
 
-`agent-shell-viewport-view-last' parks whatever compose holds, so a
-discarded draft, a prompt sent into a busy shell and an edited pending
-prompt must be cleared first, or the next `agent-shell-viewport-reply'
-restores them."
+Leaving compose parks whatever it holds, so a discarded draft, a prompt
+sent into a busy shell and an edited pending prompt must be cleared
+first, or the next `agent-shell-viewport-reply' restores them."
   (dolist (leave '(cancel hold edit-pending))
     (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
           (agent-shell-prefer-viewport-interaction t)
@@ -2383,6 +2382,8 @@ restores them."
             (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
                        (lambda () nil))
                       ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) '((:current . 1) (:total . 1))))
+                      ((symbol-function 'agent-shell-viewport--show-page)
                        (lambda (&rest _) nil))
                       ((symbol-function 'agent-shell-viewport--shell-buffer)
                        (lambda () viewport-buffer))
@@ -5235,7 +5236,7 @@ remaining subscribers nor propagate out of `agent-shell--emit-event'."
                 (with-current-buffer shell-buffer
                   (agent-shell--emit-event :event 'session-selected))
                 (should (equal (plist-get show-buffer-args :shell-buffer) shell-buffer))
-                (should (equal (plist-get show-buffer-args :append)
+                (should (equal (plist-get show-buffer-args :context)
                                "context from source"))))
           (kill-buffer shell-buffer))))))
 
@@ -5271,7 +5272,9 @@ so the command must not append a second time."
                          (lambda (&rest _) nil))
                         ((symbol-function 'agent-shell-viewport--show-buffer)
                          (lambda (&rest args)
-                           (push (plist-get args :append) appends))))
+                           (push (or (plist-get args :append)
+                                     (plist-get args :context))
+                                 appends))))
                 (with-current-buffer source-buffer
                   (agent-shell-send-dwim '(16)))
                 (should (equal appends '("context from source")))))
@@ -7901,8 +7904,10 @@ for), :initialized (the last keyword plist passed to
                        (setq initialized args)
                        (let ((inhibit-read-only t))
                          (erase-buffer)
-                         (insert (plist-get args :prompt) "\n"
-                                 (plist-get args :response))))))
+                         ;; Called with no arguments to clear compose.
+                         (when args
+                           (insert (plist-get args :prompt) "\n"
+                                   (plist-get args :response)))))))
             (agent-shell-viewport-edit-mode)
             (setq agent-shell-viewport--page-cursor cursor)
             (insert "my draft")
@@ -7933,6 +7938,211 @@ than walking back from the newest one."
     (should (equal (map-elt result :snapshot)
                    '((:content . "my draft") (:location . 9))))))
 
+(ert-deftest agent-shell-viewport-previous-page-from-compose-recenters-test ()
+  "Test leaving compose recenters on the restored reading point.
+
+Re-rendering the page resets the window to its top, so without a recenter
+the restored point sits on the window's last line."
+  (let* ((recentered nil)
+         (result (cl-letf (((symbol-function 'agent-shell-viewport--recenter)
+                            (lambda () (setq recentered (point)))))
+                   (agent-shell-viewport-tests--leave-compose
+                    '((:index . 2) (:point . 5))
+                    #'agent-shell-viewport-previous-page))))
+    (should (equal (map-elt result :point) 5))
+    (should (equal recentered 5))))
+
+(defun agent-shell-viewport-tests--reenter-compose (snapshot body)
+  "Park SNAPSHOT in a view-mode viewport, call BODY, and report the result.
+Returns an alist of :mode, :content, :point, :recentered (point at the
+`agent-shell-viewport--recenter' call, or nil) and :sent (buffer text when
+`agent-shell-viewport-compose-send' was called, or nil)."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (recentered nil)
+        (sent nil))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     #'ignore)
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--busy-p)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--response)
+                     (lambda (&rest _) "the answer"))
+                    ((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest _)
+                       (let ((inhibit-read-only t))
+                         (erase-buffer))))
+                    ((symbol-function 'agent-shell-viewport--recenter)
+                     (lambda () (setq recentered (point))))
+                    ((symbol-function 'agent-shell-viewport-compose-send)
+                     (lambda (&rest _) (setq sent (buffer-string)))))
+            (agent-shell-viewport-view-mode)
+            (setq agent-shell-viewport--compose-snapshot snapshot)
+            (funcall body)
+            `((:mode . ,major-mode)
+              (:content . ,(buffer-string))
+              (:point . ,(point))
+              (:recentered . ,recentered)
+              (:sent . ,sent))))
+      (with-current-buffer viewport-buffer
+        (setq agent-shell-viewport--clean-up nil))
+      (kill-buffer viewport-buffer))))
+
+(ert-deftest agent-shell-viewport-reply-restores-draft-location-test ()
+  "Test `agent-shell-viewport-reply' puts point back where the draft left it.
+
+The draft is parked with its point when compose is left, so coming back
+with nothing to insert resumes there, recentered, rather than at the end."
+  (let ((result (agent-shell-viewport-tests--reenter-compose
+                 '((:content . "first line\nsecond line") (:location . 3))
+                 #'agent-shell-viewport-reply)))
+    (should (eq (map-elt result :mode) 'agent-shell-viewport-edit-mode))
+    (should (equal (map-elt result :content) "first line\nsecond line"))
+    (should (equal (map-elt result :point) 3))
+    (should (equal (map-elt result :recentered) 3))))
+
+(ert-deftest agent-shell-viewport-quote-reply-leaves-point-after-quote-test ()
+  "Test a quoting reply leaves point after the quote, not at the parked point.
+
+Inserted text wins over the parked point, so the user types right after
+what was just added."
+  (let ((result (agent-shell-viewport-tests--reenter-compose
+                 '((:content . "my draft") (:location . 3))
+                 #'agent-shell-viewport-quote-reply)))
+    (should (string-prefix-p "my draft\n\n" (map-elt result :content)))
+    (should (string-match-p "the answer" (map-elt result :content)))
+    (should (equal (map-elt result :point) (1+ (length (map-elt result :content)))))
+    (should-not (map-elt result :recentered))))
+
+(ert-deftest agent-shell-viewport-reply-n-appends-after-restored-draft-test ()
+  "Test `agent-shell-viewport-reply-1' appends its answer at the draft's end.
+
+`agent-shell-viewport-reply' now resumes at the parked point, which may be
+mid-draft; the quick replies must still add their text at the end."
+  (let ((result (agent-shell-viewport-tests--reenter-compose
+                 '((:content . "my draft") (:location . 3))
+                 #'agent-shell-viewport-reply-1)))
+    (should (equal (map-elt result :sent) "my draft1"))))
+
+(ert-deftest agent-shell-viewport-show-buffer-point-follows-inserted-text-test ()
+  "Test `agent-shell-viewport--show-buffer' leaves point after appended text.
+
+From view mode the parked draft comes back with the text appended; in
+edit mode the text is appended to the draft.  Either way point lands on
+a blank line after what was appended, and appending again keeps one
+blank line between the two.  With nothing to insert, the
+parked point is restored and recentered.  CONTEXT on a fresh compose (no
+parked draft) leaves point at the front, to type the prompt above it,
+while APPEND on a fresh compose still leaves point after the text."
+  (dolist (case '((view-with-text :append "ctx")
+                  (view-without-text :append nil)
+                  (fresh-with-text :append "ctx")
+                  (fresh-with-context :context "ctx")
+                  (view-with-context :context "ctx")
+                  (new-with-context :context "ctx")
+                  (edit-with-text :append "ctx")
+                  (edit-after-append :append "ctx")
+                  (view-after-append :append "ctx")))
+    (let ((viewport-buffer (generate-new-buffer " *test-shell* [viewport]"))
+          (shell-buffer (generate-new-buffer " *test-shell*"))
+          (recentered nil)
+          result)
+      (unwind-protect
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     #'ignore)
+                    ((symbol-function 'agent-shell-viewport--buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--busy-p)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell--context)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest _)
+                       (let ((inhibit-read-only t))
+                         (erase-buffer))))
+                    ((symbol-function 'agent-shell-viewport--recenter)
+                     (lambda () (setq recentered (point))))
+                    ((symbol-function 'agent-shell--display-buffer)
+                     (lambda (buf) (set-buffer buf))))
+            (with-current-buffer viewport-buffer
+              (pcase (car case)
+                ;; A new session's viewport buffer is created in edit mode.
+                ('new-with-context
+                 (agent-shell-viewport-edit-mode))
+                ('edit-with-text
+                 (agent-shell-viewport-edit-mode)
+                 (insert "my draft")
+                 (goto-char 3))
+                ;; A previous append left the draft on a blank line.
+                ('edit-after-append
+                 (agent-shell-viewport-edit-mode)
+                 (insert "my draft\n\n"))
+                ('view-after-append
+                 (agent-shell-viewport-view-mode)
+                 (setq agent-shell-viewport--compose-snapshot
+                       '((:content . "my draft\n\n") (:location . 3))))
+                (_
+                 (agent-shell-viewport-view-mode)
+                 (setq agent-shell-viewport--compose-snapshot
+                       (unless (memq (car case) '(fresh-with-text fresh-with-context))
+                         '((:content . "my draft") (:location . 3)))))))
+            (setq result (apply #'agent-shell-viewport--show-buffer
+                                (cadr case) (caddr case)
+                                (list :shell-buffer shell-buffer)))
+            (with-current-buffer viewport-buffer
+              (pcase (car case)
+                ('view-without-text
+                 (should (equal (buffer-string) "my draft"))
+                 (should (equal (point) 3))
+                 (should (equal recentered 3)))
+                ('fresh-with-text
+                 (should (equal (buffer-string) "\n\nctx\n\n"))
+                 (should (equal (point) (point-max))))
+                ((or 'fresh-with-context 'new-with-context)
+                 (should (equal (buffer-string) "\n\nctx"))
+                 (should (equal (point) (point-min))))
+                ('view-with-context
+                 (should (equal (buffer-string) "my draft\n\nctx"))
+                 (should (equal (point) (map-elt result :end)))
+                 (should (equal (point) (point-max))))
+                (_
+                 (should (equal (buffer-string) "my draft\n\nctx\n\n"))
+                 (should (equal (map-elt result :end) (- (point-max) 2)))
+                 (should (equal (point) (point-max)))))))
+        (with-current-buffer viewport-buffer
+          (setq agent-shell-viewport--clean-up nil))
+        (kill-buffer viewport-buffer)
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell-viewport--recenter-test ()
+  "Test `agent-shell-viewport--recenter' recenters the showing window on point.
+
+The window may not be selected, so its own point is moved to the buffer's
+point before recentering; a buffer shown in no window is left alone."
+  (let ((buffer (generate-new-buffer " *recenter-test*"))
+        (recentered nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'recenter)
+                   (lambda (&rest _) (setq recentered (point)))))
+          (with-current-buffer buffer
+            (insert (make-string 200 ?x))
+            (goto-char 50)
+            (agent-shell-viewport--recenter)
+            (should-not recentered))
+          (save-window-excursion
+            (set-window-buffer (selected-window) buffer)
+            (set-window-point (selected-window) 1)
+            (with-current-buffer buffer
+              (goto-char 50)
+              (agent-shell-viewport--recenter))
+            (should (equal recentered 50))
+            (should (equal (window-point (selected-window)) 50))))
+      (kill-buffer buffer))))
+
 (ert-deftest agent-shell-viewport-previous-page-from-compose-jumps-n-pages-test ()
   "Test a prefix argument from compose steps back from the recorded page.
 
@@ -7958,6 +8168,42 @@ shows the page before it -- the same as returning and pressing back once."
     (should (equal (map-elt result :indexes) '(3)))
     (should (equal (map-elt result :point) 1))
     (should (eq (map-elt result :mode) 'agent-shell-viewport-view-mode))))
+
+(ert-deftest agent-shell-viewport-previous-page-from-blank-compose-parks-nothing-test ()
+  "Test leaving a blank compose page parks no draft.
+
+Parking blank text would have the next `agent-shell-viewport-reply'
+restore an empty draft at its old point instead of starting fresh."
+  (let ((result (agent-shell-viewport-tests--leave-compose
+                 '((:index . 2) (:point . 5))
+                 (lambda ()
+                   (erase-buffer)
+                   (insert "  \n")
+                   (agent-shell-viewport-previous-page)))))
+    (should (equal (map-elt result :indexes) '(2)))
+    (should-not (map-elt result :snapshot))))
+
+(ert-deftest agent-shell-viewport-compose-cancel-returns-to-remembered-page-test ()
+  "Test cancelling compose returns to the page read before composing.
+
+Cancel backs out of compose the same way `agent-shell-viewport-previous-page'
+does, so it lands on the recorded page and point rather than the newest
+page, and parks nothing since the draft was discarded."
+  (let ((agent-shell-prefer-viewport-interaction t)
+        (agent-shell-viewport-dismiss-on-send nil))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) t)))
+      (let ((result (agent-shell-viewport-tests--leave-compose
+                     '((:index . 2) (:point . 5))
+                     #'agent-shell-viewport-compose-cancel)))
+        (should (equal (map-elt result :indexes) '(2)))
+        (should (eq (map-elt result :mode) 'agent-shell-viewport-view-mode))
+        (should (equal (map-elt result :point) 5))
+        (should-not (map-elt result :snapshot)))
+      (let ((result (agent-shell-viewport-tests--leave-compose
+                     nil #'agent-shell-viewport-compose-cancel)))
+        (should (equal (map-elt result :indexes) '(3)))
+        (should (equal (map-elt result :point) 1))
+        (should-not (map-elt result :snapshot))))))
 
 (ert-deftest agent-shell-viewport-previous-page-from-compose-refuses-forward-test ()
   "Test a negative N from compose errors: there is no page after compose."

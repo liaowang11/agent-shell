@@ -1543,14 +1543,14 @@ with no turn to queue behind or steer into, both simply submit."
       (agent-shell--insert-to-shell-buffer :text text
                                            :shell-buffer shell-buffer))))
 
-(cl-defun agent-shell--display-viewport-when-ready (&key shell-buffer append override edit disposition)
+(cl-defun agent-shell--display-viewport-when-ready (&key shell-buffer append context override edit disposition)
   "Show the viewport for SHELL-BUFFER, deferring until its session is ready.
 
 When SHELL-BUFFER uses the `prompt' session strategy and has no session id
 yet, wait for the `session-selected' event before showing the viewport.
 Otherwise the session picker `completing-read' races a visible compose
-buffer, which is confusing.  APPEND, OVERRIDE, EDIT and DISPOSITION are
-forwarded to `agent-shell-viewport--show-buffer'."
+buffer, which is confusing.  APPEND, CONTEXT, OVERRIDE, EDIT and
+DISPOSITION are forwarded to `agent-shell-viewport--show-buffer'."
   (if (and (eq (buffer-local-value 'agent-shell-session-strategy shell-buffer) 'prompt)
            (not (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
                                 '(:session :id))))
@@ -1560,10 +1560,10 @@ forwarded to `agent-shell-viewport--show-buffer'."
        :on-event (agent-shell--preserving-display-override
                   (lambda (_event)
                     (agent-shell-viewport--show-buffer
-                     :append append :override override :edit edit
+                     :append append :context context :override override :edit edit
                      :disposition disposition :shell-buffer shell-buffer))))
     (agent-shell-viewport--show-buffer
-     :append append :override override :edit edit
+     :append append :context context :override override :edit edit
      :disposition disposition :shell-buffer shell-buffer)))
 
 (cl-defun agent-shell--dwim (&key config new-shell switch-to-shell)
@@ -1600,7 +1600,7 @@ handles viewport mode detection, existing shell reuse, and project context."
                (text (agent-shell--context :shell-buffer shell-buffer)))
           (agent-shell--display-viewport-when-ready
            :shell-buffer shell-buffer
-           :append text)))
+           :context text)))
     (cond (switch-to-shell
            (let* ((shell-buffer (agent-shell--read-shell-buffer
                                  :prompt "Switch to shell: "))
@@ -13750,7 +13750,7 @@ command's name said, however
     (if agent-shell-prefer-viewport-interaction
         (agent-shell--display-viewport-when-ready
          :shell-buffer shell-buffer
-         :append (or (agent-shell--context :shell-buffer shell-buffer) "")
+         :context (or (agent-shell--context :shell-buffer shell-buffer) "")
          :edit t
          :disposition disposition)
       (let* ((context (when-let* ((text (agent-shell--context :shell-buffer shell-buffer)))

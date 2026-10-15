@@ -166,10 +166,22 @@ is, since the draft outlives the command that started it.")
   "Non-nil while this compose buffer awaits a steer outcome.")
 (put 'agent-shell-viewport--steer-pending 'permanent-local t)
 
-(cl-defun agent-shell-viewport--show-buffer (&key append override submit no-focus shell-buffer edit disposition)
+(defun agent-shell-viewport--goto-separator ()
+  "Move to the end of the draft, dropping its trailing newlines.
+The caller inserts a blank-line separator next.  An append leaves its
+own blank line for typing, so without this a second append would stack
+three blank lines."
+  (goto-char (point-max))
+  (delete-region (progn (skip-chars-backward "\n") (point)) (point-max)))
+
+(cl-defun agent-shell-viewport--show-buffer (&key append context override submit no-focus shell-buffer edit disposition)
   "Show a viewport compose buffer for the agent shell.
 
-APPEND is appended to the viewport compose buffer.
+APPEND is appended to the viewport compose buffer, leaving point on a
+blank line after it.
+CONTEXT is appended like APPEND, but a fresh draft leaves point in front
+of it, to type the prompt above.  Without APPEND or CONTEXT, the shell's
+`agent-shell--context' is used as CONTEXT.
 OVERRIDE, when non-nil, replaces content verbatim (no trimming).
 SUBMIT, when non-nil, submits after insertion.
 NO-FOCUS, when non-nil, avoids focusing the viewport compose buffer.
@@ -195,9 +207,12 @@ Returns an alist with insertion details or nil otherwise:
     (error "Not yet supported"))
   (when (and append override)
     (error "Use :append or :override but not both"))
+  (when (and append context)
+    (error "Use :append or :context but not both"))
   (when-let* ((shell-buffer (or shell-buffer (agent-shell--shell-buffer)))
               (viewport-buffer (agent-shell-viewport--buffer :shell-buffer shell-buffer))
-              (text (or append (agent-shell--context :shell-buffer shell-buffer) "")))
+              (text (or append context
+                        (agent-shell--context :shell-buffer shell-buffer) "")))
     (when (and override (not (string-empty-p text)))
       (error "Cannot override"))
     (let ((insert-start nil)
@@ -236,27 +251,45 @@ Returns an alist with insertion details or nil otherwise:
         (insert override)
         (setq insert-end (point)))
        ((derived-mode-p 'agent-shell-viewport-edit-mode)
+        ;; Leave point after the appended text, ready to type about it.
+        ;; Context on an empty draft, as a new session's freshly created
+        ;; compose buffer has, leaves point at the front instead.
         (unless (string-empty-p text)
-          (save-excursion
-            (goto-char (point-max))
+          (let ((fresh (= (buffer-size) 0)))
+            (agent-shell-viewport--goto-separator)
             (setq insert-start (point))
             (insert "\n\n" text)
-            (setq insert-end (point)))))
+            (setq insert-end (point))
+            (cond (append
+                   (insert "\n\n"))
+                  (fresh
+                   (goto-char (point-min)))))))
        (t
         (agent-shell-viewport-edit-mode)
         ;; Transitioned to edit mode. Wipe content.
         (agent-shell-viewport--initialize)
         ;; Restore snapshot if needed.
-        (when-let* ((snapshot agent-shell-viewport--compose-snapshot))
-          (insert (map-elt snapshot :content))
-          (goto-char (map-elt snapshot :location))
-          (setq agent-shell-viewport--compose-snapshot nil))
-        (save-excursion
-          (goto-char (point-max))
-          (setq insert-start (point))
-          (unless (string-empty-p text)
-            (insert "\n\n" text))
-          (setq insert-end (point)))))
+        (let ((snapshot agent-shell-viewport--compose-snapshot))
+          (when snapshot
+            (insert (map-elt snapshot :content))
+            (goto-char (map-elt snapshot :location))
+            (setq agent-shell-viewport--compose-snapshot nil)
+            (when (string-empty-p text)
+              (agent-shell-viewport--recenter)))
+          ;; Inserted text wins over the restored point: leave point
+          ;; after it.  Context on a fresh draft leaves point at the
+          ;; front instead, to type the prompt above it.
+          (if (string-empty-p text)
+              (setq insert-start (point-max)
+                    insert-end (point-max))
+            (agent-shell-viewport--goto-separator)
+            (setq insert-start (point))
+            (insert "\n\n" text)
+            (setq insert-end (point))
+            (cond (append
+                   (insert "\n\n"))
+                  ((not snapshot)
+                   (goto-char (point-min))))))))
       ;; After the mode switches above, which is where a compose buffer
       ;; comes into being.
       (with-current-buffer viewport-buffer
@@ -276,6 +309,18 @@ the next draft."
   (setq agent-shell-viewport--compose-snapshot nil)
   (setq agent-shell-viewport--ring-index nil)
   (setq agent-shell-viewport--page-cursor nil))
+
+(defun agent-shell-viewport--recenter ()
+  "Recenter the window showing the current buffer on point.
+
+Restoring a point after a re-render leaves it on the window's last line,
+since the window starts back at the top.  Does nothing when no window
+shows the buffer."
+  (when-let* ((window (get-buffer-window (current-buffer)))
+              (pos (point)))
+    (with-selected-window window
+      (goto-char pos)
+      (recenter))))
 
 (defun agent-shell-viewport-compose-send (&optional keep-composing)
   "Send the viewport composed prompt to the agent shell.
@@ -807,10 +852,11 @@ buffer."
                 (y-or-n-p "Discard composed prompt? "))
         (if agent-shell-prefer-viewport-interaction
             (progn
-              ;; Clear first: `agent-shell-viewport-view-last' parks
-              ;; what compose holds, which would keep the discarded draft.
+              ;; Clear first: leaving compose parks what it holds, which
+              ;; would keep the discarded draft.  Return to the page read
+              ;; before composing, as `agent-shell-viewport-previous-page' does.
               (agent-shell-viewport--initialize)
-              (agent-shell-viewport-view-last))
+              (agent-shell-viewport--leave-compose-page))
           (agent-shell-other-buffer)
           (kill-buffer viewport-buffer)))))))
 
@@ -912,9 +958,11 @@ page."
            (cursor agent-shell-viewport--page-cursor)
            (remembered (min total (or (map-elt cursor :index) total)))
            (target (max 1 (- remembered (1- n)))))
-      (setq agent-shell-viewport--compose-snapshot
-            `((:content . ,(buffer-string))
-              (:location . ,(point))))
+      ;; A discarded draft was cleared first, so there is nothing to park.
+      (unless (string-empty-p (string-trim (buffer-string)))
+        (setq agent-shell-viewport--compose-snapshot
+              `((:content . ,(buffer-string))
+                (:location . ,(point)))))
       (agent-shell-viewport-view-mode)
       (agent-shell-viewport--show-page target)
       ;; Restore the exact reading point on the remembered page, but only
@@ -924,6 +972,7 @@ page."
                   (point (map-elt cursor :point))
                   ((<= (point-min) point (point-max))))
         (goto-char point)
+        (agent-shell-viewport--recenter)
         (setf (map-elt agent-shell-viewport--page-cursor :point) point)))))
 
 (defun agent-shell-viewport--interaction-response (interaction)
@@ -1143,6 +1192,10 @@ QUOTED-TEXT, when non-nil, is inserted as a block quote as part of the
 draft -- used when replying to a selected region or a whole response.
 Called with no QUOTED-TEXT by a plain `agent-shell-viewport-reply'.
 
+Point lands after QUOTED-TEXT when given, else at the parked draft's
+point (recentered), else at the end.  Callers that append, like
+`agent-shell-viewport-reply-1', must move to the end themselves.
+
 Remembers the page being left so a later `agent-shell-viewport-previous-page'
 can return to it."
   (when-let* ((pos (agent-shell-viewport--position :force-refresh t)))
@@ -1157,13 +1210,17 @@ can return to it."
     (when snapshot
       (insert (map-elt snapshot :content))
       (setq agent-shell-viewport--compose-snapshot nil))
-    (when quoted-text
-      (goto-char (point-max))
-      (insert (if snapshot "\n\n" "")
-              (agent-shell--block-quote quoted-text) "\n\n"))
-    ;; Leave point at the end of any prefilled content so callers like
-    ;; `agent-shell-viewport-reply-1' can insert after it.
-    (goto-char (point-max))))
+    (if quoted-text
+        ;; Inserted text wins over the parked point: leave point after it.
+        (progn
+          (goto-char (point-max))
+          (insert (if snapshot "\n\n" "")
+                  (agent-shell--block-quote quoted-text) "\n\n"))
+      (if snapshot
+          (progn
+            (goto-char (map-elt snapshot :location))
+            (agent-shell-viewport--recenter))
+        (goto-char (point-max))))))
 
 (defun agent-shell-viewport-reply ()
   "Reply as a follow-up and compose another prompt/query."
@@ -1171,11 +1228,14 @@ can return to it."
   (interactive)
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)
     (user-error "Not in a shell viewport buffer"))
-  (let ((region (map-elt (agent-shell--get-region :deactivate t) :content)))
+  (let* ((region (map-elt (agent-shell--get-region :deactivate t) :content))
+         (resuming (and agent-shell-viewport--compose-snapshot (not region))))
     (agent-shell-viewport--enter-compose-page
-     :quoted-text (when region (string-trim region))))
-  ;; Setting point isn't enough at times. Force scrolling.
-  (set-window-start (selected-window) (point-min)))
+     :quoted-text (when region (string-trim region)))
+    ;; Setting point isn't enough at times. Force scrolling, unless a
+    ;; resumed draft's point was just recentered.
+    (unless resuming
+      (set-window-start (selected-window) (point-min)))))
 
 (defun agent-shell-viewport-quote-reply ()
   "Reply with the entire response block-quoted."
@@ -1194,6 +1254,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "yes")
   (agent-shell-viewport-compose-send))
 
@@ -1204,6 +1265,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "1")
   (agent-shell-viewport-compose-send))
 
@@ -1214,6 +1276,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "2")
   (agent-shell-viewport-compose-send))
 
@@ -1224,6 +1287,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "3")
   (agent-shell-viewport-compose-send))
 
@@ -1234,6 +1298,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "4")
   (agent-shell-viewport-compose-send))
 
@@ -1244,6 +1309,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "5")
   (agent-shell-viewport-compose-send))
 
@@ -1254,6 +1320,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "6")
   (agent-shell-viewport-compose-send))
 
@@ -1264,6 +1331,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "7")
   (agent-shell-viewport-compose-send))
 
@@ -1274,6 +1342,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "8")
   (agent-shell-viewport-compose-send))
 
@@ -1284,6 +1353,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "9")
   (agent-shell-viewport-compose-send))
 
@@ -1294,6 +1364,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "more")
   (agent-shell-viewport-compose-send))
 
@@ -1304,6 +1375,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "again")
   (agent-shell-viewport-compose-send))
 
@@ -1314,6 +1386,7 @@ can return to it."
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
   (agent-shell-viewport-reply)
+  (goto-char (point-max))
   (insert "continue")
   (agent-shell-viewport-compose-send))
 
