@@ -12207,6 +12207,33 @@ body to measure."
                      (agent-shell--fit-to-window-line
                       :text "cd /tmp" :buffer (current-buffer)))))))
 
+(ert-deftest agent-shell-make-tool-call-label-prefix-description-test ()
+  "A title and description where one extends the other render once.
+
+claude-agent-acp titles an Agent call with its description plus an
+effort suffix, so showing both repeats the description."
+  (let ((label (lambda (title description)
+                 (map-elt (agent-shell-make-tool-call-label
+                           `((:tool-calls . (("t1" . ((:kind . "think")
+                                                      (:status . "completed")
+                                                      (:title . ,title)
+                                                      (:description . ,description))))))
+                           "t1")
+                          :title))))
+    ;; The title extends the description.
+    (let ((rendered (funcall label "Fix bug (medium effort)" "Fix bug")))
+      (should (equal "Fix bug (medium effort)" (substring-no-properties rendered)))
+      (should (equal 'default (get-text-property 0 'font-lock-face rendered))))
+    ;; The description extends the title.
+    (let ((rendered (funcall label "Fix bug" "Fix bug in the parser")))
+      (should (equal "Fix bug in the parser" (substring-no-properties rendered)))
+      (should (equal 'default (get-text-property 0 'font-lock-face rendered))))
+    ;; A prefix ending mid-word is a different string, so both render.
+    (should (equal "Read Readme update"
+                   (substring-no-properties (funcall label "Read" "Readme update"))))
+    (should (equal "Readme update Read"
+                   (substring-no-properties (funcall label "Readme update" "Read"))))))
+
 (ert-deftest agent-shell--tag-untagged-output-tags-same-chars-test ()
   "Tagging only the untagged tail covers what a whole-range tag would."
   (with-temp-buffer

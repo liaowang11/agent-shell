@@ -5866,6 +5866,20 @@ does when it sends `title' \"read\" with the path only in
   (or (map-nested-elt tool-call '(:raw-input path))
       (map-elt (seq-first (map-elt tool-call :locations)) 'path)))
 
+(defun agent-shell--label-extends-p (short long)
+  "Return non-nil if LONG repeats SHORT, possibly with more words after it.
+
+Both are compared trimmed of whitespace and enclosing backticks.  SHORT
+must end at a word boundary in LONG, so \"Read\" does not match
+\"Readme update\".
+
+\"Fix bug\" and \"Fix bug (medium effort)\" -> t"
+  (let ((short (string-remove-prefix "`" (string-remove-suffix "`" (string-trim short))))
+        (long (string-remove-prefix "`" (string-remove-suffix "`" (string-trim long)))))
+    (and (string-prefix-p short long)
+         (or (= (length short) (length long))
+             (not (eq (char-syntax (aref long (length short))) ?w))))))
+
 (cl-defun agent-shell--fit-to-window-line (&key text buffer reserved)
   "Return TEXT ellipsized to fit on one line of BUFFER's window.
 
@@ -5933,8 +5947,12 @@ Returns propertized labels in :status and :title propertized."
            ;; Append a "+N -M" diff summary to edit titles.
            (stats (agent-shell--format-diffs-line-stats (map-elt tool-call :diffs)))
            (label (cond ((and title description
-                              (not (equal (string-remove-prefix "`" (string-remove-suffix "`" (string-trim title)))
-                                          (string-remove-prefix "`" (string-remove-suffix "`" (string-trim description))))))
+                              (agent-shell--label-extends-p description title))
+                         (propertize title 'font-lock-face 'default))
+                        ((and title description
+                              (agent-shell--label-extends-p title description))
+                         (propertize description 'font-lock-face 'default))
+                        ((and title description)
                          (concat
                           (propertize title 'font-lock-face 'default)
                           " "
