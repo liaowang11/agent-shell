@@ -4701,6 +4701,19 @@ around this call to reflect whether the update arrived out of turn."
             :append t
             :above-last-prompt (not (shell-maker-busy)))
            (agent-shell--activity-group-note-entry-type state nil))))
+        ((and (equal (map-elt acp-notification 'method) "_claude/sdkMessage")
+              (equal (map-nested-elt acp-notification '(params message subtype))
+                     "vcs_state_changed"))
+         ;; claude-agent-acp forwards the raw SDK messages a session's
+         ;; `emitRawSDKMessages' filter names.  The CLI sends this one
+         ;; after a shell command it sees commit, push, merge or rebase.
+         ;; Nothing renders: subscribers act on it.
+         (let ((message (map-nested-elt acp-notification '(params message))))
+           (agent-shell--emit-event
+            :event 'vcs-state-changed
+            :data (list (cons :kind (map-elt message 'kind))
+                        (cons :branch (map-elt message 'branch))
+                        (cons :cwd (map-elt message 'cwd))))))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
@@ -9308,6 +9321,10 @@ Session events:
     :data contains :stop-reason and :usage
   `session-title-changed' - Session title updated
     :data contains :title
+  `vcs-state-changed'     - The agent's shell command changed git state
+    :data contains :kind (\"commit\", \"push\", \"merge\", \"rebase\"
+    or a newer kind), :branch (may be nil) and :cwd (the directory the
+    command ran in).  Only agents that report it: Claude Code.
   `session-restored'      - Reloaded session fully replayed and settled
   `input-submitted'       - User submitted input to the agent
     :data contains :prompt (the text sent to the agent, with any
