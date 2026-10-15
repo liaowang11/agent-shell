@@ -126,6 +126,17 @@
     (let ((agent-shell-anthropic-default-model-id (lambda () nil)))
       (should (null (funcall default-model-id-fn))))))
 
+(ert-deftest agent-shell-anthropic-claude-code-session-meta-vcs-test ()
+  "Test that the Claude config asks for the CLI's git change messages.
+
+claude-agent-acp forwards only the raw SDK messages a session's
+`emitRawSDKMessages' filter names, as `_claude/sdkMessage'."
+  (let ((meta (map-elt (agent-shell-anthropic-make-claude-code-config) :session-meta)))
+    (should (equal (map-nested-elt meta '(claudeCode emitRawSDKMessages))
+                   [((type . "system") (subtype . "vcs_state_changed"))]))
+    ;; Thinking options sit beside the filter, not replaced by it.
+    (should (map-nested-elt meta '(claudeCode options thinking)))))
+
 (ert-deftest agent-shell-anthropic-claude-code-session-meta-test ()
   "Test that the Claude config requests summarized thinking via session meta."
   (let* ((config (agent-shell-anthropic-make-claude-code-config))
