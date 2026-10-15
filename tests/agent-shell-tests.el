@@ -878,6 +878,56 @@ block -- covering the dispatch path, not just the helper in isolation."
                                       (uri . "file:///tmp/x.png"))))))
       (should (equal rendered "\n\n![image](file:///tmp/x.png)\n\n")))))
 
+(ert-deftest agent-shell--on-notification-vcs-state-changed-test ()
+  "A forwarded `vcs_state_changed' SDK message emits `vcs-state-changed'.
+
+It renders nothing, not even the unhandled-notification fragment shown
+while traffic logging is on."
+  (let ((acp-logging-enabled t)
+        (state (list (cons :last-activity-time nil)))
+        (events nil)
+        (rendered nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--emit-event)
+               (lambda (&rest args) (push args events)))
+              ((symbol-function 'shell-maker-busy) #'ignore)
+              ((symbol-function 'agent-shell--activity-group-note-entry-type) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _) (setq rendered t))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((jsonrpc . "2.0")
+                           (method . "_claude/sdkMessage")
+                           (params
+                            (sessionId . "s1")
+                            (message (type . "system")
+                                     (subtype . "vcs_state_changed")
+                                     (kind . "commit")
+                                     (branch . "main")
+                                     (cwd . "/tmp/repo")
+                                     (uuid . "u1")
+                                     (session_id . "s1")))))
+      (should (equal events
+                     '((:event vcs-state-changed
+                        :data ((:kind . "commit")
+                               (:branch . "main")
+                               (:cwd . "/tmp/repo"))))))
+      (should-not rendered)
+      ;; Another raw SDK message is not a git change: no event, and it
+      ;; still reaches the unhandled fragment as before.
+      (setq events nil)
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((jsonrpc . "2.0")
+                           (method . "_claude/sdkMessage")
+                           (params
+                            (sessionId . "s1")
+                            (message (type . "system")
+                                     (subtype . "status")))))
+      (should-not events)
+      (should rendered))))
+
 (ert-deftest agent-shell--stream-render-coalesces-chunks-test ()
   "Render consecutive chunks once, without postponing the batch timer."
   (with-temp-buffer
