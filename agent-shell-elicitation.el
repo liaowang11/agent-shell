@@ -1376,6 +1376,19 @@ is never coming."
               nil))
 
 
+(cl-defun agent-shell-elicitation--abandon-pending (&key state)
+  "Settle STATE's pending forms as cancelled, answering nothing.
+
+For a turn that failed: the agent no longer waits for an answer and may
+no longer be running, but the forms on screen would still offer one."
+  (dolist (entry (copy-sequence (map-elt state :elicitations)))
+    (when (eq (map-elt (cdr entry) :status) 'pending)
+      (agent-shell-elicitation--put
+       state (car entry)
+       (agent-shell-elicitation--assoc-put (cdr entry) :status 'cancelled))
+      (agent-shell-elicitation--settle :state state :id (car entry)))))
+
+
 ;;; Commands
 
 (defun agent-shell-elicitation--control-at-point ()
