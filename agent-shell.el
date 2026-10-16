@@ -9290,6 +9290,27 @@ reads the buffer's prompt capabilities."
       (agent-shell--display-attached-files attached-files))
     content-blocks))
 
+(defun agent-shell--forget-failed-turn (state)
+  "Drop the tool calls and forms STATE's failed turn left behind.
+
+A failed `session/prompt' (an error response, or the agent process
+exiting) ends the turn just as a response does, so clear what the
+success path clears.  A failed turn may also leave permission requests
+unanswered.  Kept, they make `agent-shell-status' report `blocked' on
+every later turn, and their dialogs, along with any diff opened from
+one, would answer a request nothing waits on any more.
+
+Nothing is sent to the agent, which may no longer be running."
+  (map-do (lambda (tool-call-id tool-call)
+            (when (map-elt tool-call :permission-request-id)
+              (when-let* ((diff-buffer (map-elt tool-call :diff-buffer)))
+                (agent-shell-diff-kill-buffer diff-buffer))
+              (agent-shell--delete-fragment
+               :state state :block-id (format "permission-%s" tool-call-id))))
+          (map-elt state :tool-calls))
+  (map-put! state :tool-calls nil)
+  (agent-shell-elicitation--clear :state state))
+
 (cl-defun agent-shell--send-command (&key prompt shell-buffer)
   "Send PROMPT to agent using SHELL-BUFFER."
   (let* ((expanded-prompt (agent-shell--expand-truncated-regions prompt))
@@ -9419,6 +9440,10 @@ Continue?" (agent-shell--prompt-queue-summary)))
                    (agent-shell--separate-transcript-after-agent-message
                     :last-entry-type (map-elt agent-shell--state :last-entry-type)
                     :file-path agent-shell--transcript-file)
+                   (agent-shell--forget-failed-turn agent-shell--state)
+                   ;; A permission or form request armed the idle timer,
+                   ;; and nothing waits on either any more.
+                   (agent-shell--cancel-idle-timer)
                    ;; An interrupted turn leaves no group active either.
                    (agent-shell--collapse-expanded-activity-group agent-shell--state)
                    ;; Display pending requests on failure.

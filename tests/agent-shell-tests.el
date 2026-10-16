@@ -1278,6 +1278,88 @@ them again: the question already did."
         (should (eq processed answer))
         (should (equal displayed (unless answer '(:skip-summary t))))))))
 
+(ert-deftest agent-shell--send-command-failure-clears-turn-requests-test ()
+  "Test a failed turn drops the requests it left unanswered.
+
+A `session/prompt' that fails, from an error response or from the agent
+process dying, ends the turn as surely as a response does.  A permission
+request or form left over from it would otherwise read as pending on
+every later turn, and its dialog would still answer a request nobody is
+waiting on."
+  (let* ((captured-on-failure nil)
+         (deleted-blocks nil)
+         (killed-diffs nil)
+         (sent-responses nil)
+         (idle-timer (run-at-time 1000 nil #'ignore))
+         (agent-shell--state
+          (list (cons :buffer (current-buffer))
+                (cons :event-subscriptions nil)
+                (cons :client 'test-client)
+                (cons :session (list (cons :id "test-session") (cons :title nil)))
+                (cons :last-entry-type nil)
+                (cons :tool-calls
+                      (list (cons "root-call"
+                                  (list (cons :title "Edit file")
+                                        (cons :diff-buffer 'root-diff)
+                                        (cons :permission-request-id 7)))
+                            (cons "done-call"
+                                  (list (cons :title "List files")))))
+                (cons :elicitations
+                      (list (cons 9 (list (cons :id 9)
+                                          (cons :status 'pending)))))
+                (cons :active-requests
+                      (list (list (cons :method "elicitation/create")
+                                  (cons :id 9))))
+                (cons :usage (list (cons :total-tokens 0)))
+                (cons :idle-timer nil)))
+         (agent-shell-show-busy-indicator nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--state)
+                   (lambda () agent-shell--state))
+                  ((symbol-function 'agent-shell--send-request)
+                   (lambda (&rest args)
+                     (setq captured-on-failure (plist-get args :on-failure))))
+                  ((symbol-function 'agent-shell-viewport--buffer)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell--finish-output)
+                   (lambda (&rest _)))
+                  ((symbol-function 'agent-shell--update-fragment)
+                   (lambda (&rest _)))
+                  ((symbol-function 'agent-shell--delete-fragment)
+                   (lambda (&rest args)
+                     (push (plist-get args :block-id) deleted-blocks)))
+                  ((symbol-function 'agent-shell--prompt-queue-display)
+                   (lambda (&rest _)))
+                  ((symbol-function 'shell-maker-busy)
+                   (lambda () t))
+                  ((symbol-function 'agent-shell-diff-kill-buffer)
+                   (lambda (buffer) (push buffer killed-diffs)))
+                  ;; The agent may be gone, so nothing is answered.
+                  ((symbol-function 'acp-send-response)
+                   (lambda (&rest args) (push args sent-responses))))
+          (agent-shell--send-command
+           :prompt "Hello"
+           :shell-buffer (current-buffer))
+          ;; Sending cancels the idle timer, so arm it again as a
+          ;; permission request mid-turn would.
+          (map-put! agent-shell--state :idle-timer idle-timer)
+          (should captured-on-failure)
+          (funcall captured-on-failure
+                   '((code . -32603)
+                     (message . "Agent process ended before completing request"))
+                   nil)
+          (should-not (agent-shell--permission-pending-p))
+          (should-not (map-elt agent-shell--state :tool-calls))
+          (should (member "permission-root-call" deleted-blocks))
+          (should (equal killed-diffs '(root-diff)))
+          (should-not (agent-shell-elicitation--pending-p))
+          (should-not (map-elt agent-shell--state :elicitations))
+          (should-not (map-elt agent-shell--state :active-requests))
+          (should-not (map-elt agent-shell--state :idle-timer))
+          (should-not (memq idle-timer timer-list))
+          (should-not sent-responses))
+      (cancel-timer idle-timer))))
+
 (ert-deftest agent-shell--send-command-emits-input-submitted-with-prompt-test ()
   "Test `input-submitted' carries the expanded prompt text."
   (let ((received-events nil)
