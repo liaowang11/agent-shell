@@ -61,6 +61,10 @@
     ;; Subagent-only terminal states.
     ("cancelled" '((:label . "cancelled") (:icon . "⊘") (:face . agent-shell-secondary)))
     ("disconnected" '((:label . "lost") (:icon . "✗") (:face . agent-shell-error)))
+    ;; Tool calls the agent reports as failed without having run them,
+    ;; see `agent-shell--tool-call-display-status'.
+    ("interrupted" '((:label . "interrupted") (:icon . "⏹") (:face . agent-shell-secondary)))
+    ("rejected" '((:label . "rejected") (:icon . "⊘") (:face . agent-shell-warning)))
     (_ '((:label . "unknown") (:icon . "?") (:face . agent-shell-warning)))))
 
 (defun agent-shell--inverse-label-status-kind-label (status kind)
