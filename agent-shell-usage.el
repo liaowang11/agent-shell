@@ -39,6 +39,7 @@
 (defvar agent-shell-mode)
 (declare-function agent-shell--state "agent-shell")
 (declare-function agent-shell--ensure-state-key "agent-shell")
+(declare-function agent-shell--emit-event "agent-shell")
 
 (defcustom agent-shell-show-usage-at-turn-end nil
   "Whether to display usage information when agent turn ends.
@@ -117,7 +118,151 @@ Extracts context window and cost information from usage_update notification."
         (map-put! usage-state :cost-amount amount))
       (when-let* ((currency (map-elt cost 'currency)))
         (map-put! usage-state :cost-currency currency)))
+    (when-let* ((info (map-nested-elt acp-update '(_meta _claude/rateLimit))))
+      (agent-shell--save-rate-limit usage-state info))
     (map-put! state :usage usage-state)))
+
+(defun agent-shell--save-rate-limit (usage-state info)
+  "Record claude-agent-acp's rate-limit INFO in USAGE-STATE's `:rate-limits'.
+
+INFO is the SDK's `rate_limit_info': `status' is \"allowed\",
+\"allowed_warning\" or \"rejected\", `rateLimitType' names the window
+\(for example \"five_hour\" or \"seven_day\"), `utilization' is a
+fraction from 0 to 1 and `resetsAt' is in epoch seconds.  Each report
+replaces the earlier one for its type.
+
+Once no limit is hit, the CLI reports a plain \"allowed\" with no type,
+utilization or reset time, which clears every recorded warning while
+keeping the last known numbers.
+
+Entering \"rejected\" notifies once, via a message and the
+`rate-limit-rejected' event, rather than on every rejected request."
+  (agent-shell--ensure-state-key usage-state :rate-limits)
+  (let ((type (map-elt info 'rateLimitType))
+        (status (map-elt info 'status))
+        (limits (map-elt usage-state :rate-limits)))
+    (if (and (not type) (equal status "allowed"))
+        (map-put! usage-state :rate-limits
+                  (mapcar (lambda (limit)
+                            (cons (cons :status "allowed")
+                                  (assq-delete-all :status (copy-alist limit))))
+                          limits))
+      (let ((previous (seq-find (lambda (limit)
+                                  (equal (map-elt limit :type) type))
+                                limits))
+            (limit (list (cons :type type)
+                         (cons :status status)
+                         (cons :utilization (map-elt info 'utilization))
+                         (cons :resets-at (map-elt info 'resetsAt)))))
+        (map-put! usage-state :rate-limits
+                  (if previous
+                      (mapcar (lambda (old) (if (eq old previous) limit old))
+                              limits)
+                    (append limits (list limit))))
+        (when (and (equal status "rejected")
+                   (not (equal (map-elt previous :status) "rejected")))
+          (message "agent-shell: %s limit reached%s"
+                   (agent-shell--rate-limit-type-label type)
+                   (if-let* ((resets-at (map-elt limit :resets-at)))
+                       (concat ", resets "
+                               (agent-shell--format-rate-limit-reset resets-at))
+                     ""))
+          (agent-shell--emit-event :event 'rate-limit-rejected
+                                   :data limit))))))
+
+(defun agent-shell--rate-limit-type-label (type)
+  "Return a short label for rate-limit TYPE, as `rateLimitType' names it.
+
+For example, \"five_hour\" gives \"5h\" and \"seven_day_opus\" gives
+\"7d Opus\".  Unknown types are shown as sent; no type gives \"usage\"."
+  (pcase type
+    ('nil "usage")
+    ("five_hour" "5h")
+    ("seven_day" "7d")
+    ("seven_day_opus" "7d Opus")
+    ("seven_day_sonnet" "7d Sonnet")
+    ("seven_day_overage_included" "7d incl. overage")
+    ("overage" "overage")
+    (_ type)))
+
+(defun agent-shell--format-rate-limit-reset (resets-at &optional now zone)
+  "Format RESETS-AT, in epoch seconds, as a short reset time.
+
+Shows the clock time when the reset falls on NOW's day (default: the
+current time), otherwise the weekday too.  ZONE is passed to
+`format-time-string'.
+
+For example, \"14:30\" today and \"Sun 09:00\" on another day."
+  (format-time-string
+   (if (equal (format-time-string "%F" resets-at zone)
+              (format-time-string "%F" now zone))
+       "%H:%M"
+     "%a %H:%M")
+   resets-at zone))
+
+(defun agent-shell--rate-limit-flagged (usage)
+  "Return USAGE's rate limits that warn or reject and haven't reset yet."
+  (seq-filter (lambda (limit)
+                (and (member (map-elt limit :status)
+                             '("allowed_warning" "rejected"))
+                     (or (not (map-elt limit :resets-at))
+                         (> (map-elt limit :resets-at) (float-time)))))
+              (map-elt usage :rate-limits)))
+
+(defun agent-shell--rate-limit-summary (limit)
+  "Return a short summary of rate LIMIT for the header or mode line.
+
+For example, \"5h 92%% resets 14:30\".  `%' is doubled, since header
+and mode lines read it as a construct."
+  (string-join
+   (delq nil
+         (list (agent-shell--rate-limit-type-label (map-elt limit :type))
+               (when-let* ((utilization (map-elt limit :utilization)))
+                 (format "%.0f%%%%" (* 100 utilization)))
+               (when-let* ((resets-at (map-elt limit :resets-at)))
+                 (concat "resets "
+                         (agent-shell--format-rate-limit-reset resets-at)))))
+   " "))
+
+(defun agent-shell--rate-limit-indicator (usage)
+  "Return the header indicator for USAGE's rate limits, or nil.
+
+Shown only while some limit warns or rejects, in the error face when
+any rejects and the warning face otherwise.  The help echo lists every
+known limit.
+
+For example, \"5h 92%% resets 14:30\"."
+  (when-let* ((flagged (agent-shell--rate-limit-flagged usage)))
+    (propertize (mapconcat #'agent-shell--rate-limit-summary flagged " · ")
+                'face (if (seq-find (lambda (limit)
+                                      (equal (map-elt limit :status) "rejected"))
+                                    flagged)
+                          'agent-shell-error
+                        'agent-shell-warning)
+                'help-echo (agent-shell--format-rate-limits usage))))
+
+(defun agent-shell--format-rate-limits (usage &optional indent)
+  "Describe every rate limit in USAGE, one per line, or return nil.
+
+Each line has the full utilization, status and reset time, for example
+\"5h 42.0% allowed, resets Fri Oct 16 14:30\".  Lines after the first
+are prefixed with INDENT."
+  (when-let* ((limits (map-elt usage :rate-limits)))
+    (mapconcat
+     (lambda (limit)
+       (string-join
+        (delq nil
+              (list (agent-shell--rate-limit-type-label (map-elt limit :type))
+                    (when-let* ((utilization (map-elt limit :utilization)))
+                      (format "%.1f%%" (* 100 utilization)))
+                    (concat (map-elt limit :status)
+                            (when-let* ((resets-at (map-elt limit :resets-at)))
+                              (concat ", resets "
+                                      (format-time-string "%a %b %-d %H:%M"
+                                                          resets-at))))))
+        " "))
+     limits
+     (concat "\n" indent))))
 
 (defun agent-shell--format-number-compact (num)
   "Format NUM compactly with k/m/b suffixes."
@@ -216,6 +361,12 @@ When MULTILINE is non-nil, format as right-aligned labeled rows."
                         'face 'agent-shell-secondary
                         'font-lock-face 'agent-shell-secondary)
             models "\n"))
+         (when-let* ((limits (agent-shell--format-rate-limits usage "          ")))
+           (concat
+            (propertize "  Limits: "
+                        'face 'agent-shell-secondary
+                        'font-lock-face 'agent-shell-secondary)
+            limits "\n"))
          (propertize "    Cost: "
                      'face 'agent-shell-secondary
                      'font-lock-face 'agent-shell-secondary)
