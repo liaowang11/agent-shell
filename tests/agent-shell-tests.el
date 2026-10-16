@@ -16704,5 +16704,503 @@ queue and the draft had left the prompt, so both were lost."
             :busy nil)
            '(:signalled t :pending ("a") :draft t))))
 
+;;; Session delete
+
+(ert-deftest agent-shell--session-capability-advertised-p-test ()
+  "Session capabilities are read from either place agents put them."
+  (should (agent-shell--session-capability-advertised-p
+           '((sessionCapabilities (delete) (list)))
+           'delete))
+  (should (agent-shell--session-capability-advertised-p
+           '((agentCapabilities (sessionCapabilities (delete))))
+           'delete))
+  (should-not (agent-shell--session-capability-advertised-p
+               '((sessionCapabilities (list) (fork)))
+               'delete))
+  (should-not (agent-shell--session-capability-advertised-p nil 'delete)))
+
+(ert-deftest agent-shell--transcript-header-session-id-test ()
+  "The session id comes from the header only, in either header format."
+  (should (equal (agent-shell--transcript-header-session-id
+                  "---\nagent: \"Claude\"\nsession_id: \"s1\"\ntitle: \"T\"\n---\n\n# Agent Shell Transcript\n")
+                 "s1"))
+  (should (equal (agent-shell--transcript-header-session-id
+                  "# Agent Shell Transcript\n\n**Agent:** Claude\n**Session ID:** s1\n\n---\n\n## User\n")
+                 "s1"))
+  ;; Ids quoted in the body, as when an agent echoes another transcript.
+  (should-not (agent-shell--transcript-header-session-id
+               "---\nagent: \"Claude\"\n---\n\nsession_id: \"s1\"\n**Session ID:** s1\n"))
+  (should-not (agent-shell--transcript-header-session-id
+               "# Agent Shell Transcript\n\n**Agent:** Claude\n\n---\n\n**Session ID:** s1\n"))
+  (should-not (agent-shell--transcript-header-session-id "")))
+
+(defun agent-shell-tests--write-transcript (file text)
+  "Write TEXT to FILE, creating its directory."
+  (make-directory (file-name-directory file) t)
+  (with-temp-file file (insert text)))
+
+(defun agent-shell-tests--session-transcript-store (dir)
+  "Fill DIR with transcripts of sessions s1 and s2 and return DIR.
+s1 has a YAML-header transcript with a subagent, and an older
+Markdown-header one; s2 has one transcript that quotes s1's header."
+  (agent-shell-tests--write-transcript
+   (expand-file-name "2026-10-01-10-00-00.md" dir)
+   "---\nagent: \"Claude\"\nsession_id: \"s1\"\n---\n\n# Agent Shell Transcript\n")
+  (agent-shell-tests--write-transcript
+   (expand-file-name "2026-10-01-10-00-00/subagents/researcher-a1.md" dir)
+   "# Agent Shell Subagent Transcript\n\n**Session ID:** a1\n**Parent Session ID:** s1\n")
+  (agent-shell-tests--write-transcript
+   (expand-file-name "2026-09-01-10-00-00.md" dir)
+   "# Agent Shell Transcript\n\n**Agent:** Claude\n**Session ID:** s1\n\n---\n")
+  (agent-shell-tests--write-transcript
+   (expand-file-name "2026-10-02-10-00-00.md" dir)
+   "---\nagent: \"Claude\"\nsession_id: \"s2\"\n---\n\nsession_id: \"s1\"\n")
+  (agent-shell-tests--write-transcript
+   (expand-file-name "2026-10-02-10-00-00/subagents/researcher-b1.md" dir)
+   "# Agent Shell Subagent Transcript\n\n**Parent Session ID:** s2\n")
+  dir)
+
+(ert-deftest agent-shell--session-transcript-files-test ()
+  "Only transcripts whose header names the session are found."
+  (let ((dir (make-temp-file "agent-shell-transcripts" t)))
+    (unwind-protect
+        (progn
+          (agent-shell-tests--session-transcript-store dir)
+          (should (equal (mapcar #'file-name-nondirectory
+                                 (agent-shell--session-transcript-files (list dir) "s1"))
+                         '("2026-09-01-10-00-00.md" "2026-10-01-10-00-00.md")))
+          (should (equal (mapcar #'file-name-nondirectory
+                                 (agent-shell--session-transcript-files (list dir) "s2"))
+                         '("2026-10-02-10-00-00.md")))
+          (should-not (agent-shell--session-transcript-files (list dir) "s3"))
+          ;; A title longer than the bytes first read.
+          (agent-shell-tests--write-transcript
+           (expand-file-name "2026-10-03-10-00-00.md" dir)
+           (format "---\nsession_id: \"s3\"\ntitle: \"%s\"\n---\n"
+                   (make-string (* 2 agent-shell--transcript-header-bytes) ?x)))
+          (should (equal (mapcar #'file-name-nondirectory
+                                 (agent-shell--session-transcript-files (list dir) "s3"))
+                         '("2026-10-03-10-00-00.md")))
+          (should-not (agent-shell--session-transcript-files
+                       (list (expand-file-name "missing" dir)) "s1")))
+      (delete-directory dir t))))
+
+(ert-deftest agent-shell--delete-transcripts-test ()
+  "Deleting transcripts removes their subagent transcripts too, and nothing else."
+  (let ((dir (make-temp-file "agent-shell-transcripts" t)))
+    (unwind-protect
+        (progn
+          (agent-shell-tests--session-transcript-store dir)
+          (agent-shell--delete-transcripts
+           (agent-shell--session-transcript-files (list dir) "s1")
+           (list dir))
+          (should (equal (directory-files dir nil "\\`[^.]")
+                         '("2026-10-02-10-00-00" "2026-10-02-10-00-00.md")))
+          (should (file-exists-p (expand-file-name
+                                  "2026-10-02-10-00-00/subagents/researcher-b1.md"
+                                  dir))))
+      (delete-directory dir t))))
+
+;; The layout of a store whose `agent-shell-transcript-file-path-function'
+;; files each transcript under its date and a directory of its own, which
+;; also holds its screenshots.
+
+(defun agent-shell-tests--nested-transcript-store (root)
+  "Fill ROOT with a dated, nested transcript store and return ROOT.
+Session s1 has two transcripts: one with a subagent, whose directory
+is otherwise empty, and an older one whose directory keeps a
+screenshot.  Session s2 has one.  A subagent's header that names s1
+must not count as a transcript of it."
+  (dolist (entry
+           '(("2026/10/01/2026-10-01-10-00-00/2026-10-01-10-00-00.md"
+              . "---\nagent: \"Claude\"\nsession_id: \"s1\"\n---\n")
+             ("2026/10/01/2026-10-01-10-00-00/2026-10-01-10-00-00/subagents/r-a1.md"
+              . "# Agent Shell Subagent Transcript\n\n**Session ID:** s1\n\n---\n")
+             ("2026/09/01/2026-09-01-10-00-00/2026-09-01-10-00-00.md"
+              . "# Agent Shell Transcript\n\n**Session ID:** s1\n\n---\n")
+             ("2026/09/01/2026-09-01-10-00-00/screenshots/shot.png" . "png")
+             ("2026/10/02/2026-10-02-10-00-00/2026-10-02-10-00-00.md"
+              . "---\nagent: \"Claude\"\nsession_id: \"s2\"\n---\n")))
+    (agent-shell-tests--write-transcript (expand-file-name (car entry) root) (cdr entry)))
+  root)
+
+(ert-deftest agent-shell--session-transcript-files-nested-test ()
+  "Transcripts are found anywhere under the store, but not subagents'."
+  (let ((root (make-temp-file "agent-shell-transcripts" t)))
+    (unwind-protect
+        (progn
+          (agent-shell-tests--nested-transcript-store root)
+          (should (equal (mapcar (lambda (file) (file-relative-name file root))
+                                 (agent-shell--session-transcript-files (list root) "s1"))
+                         '("2026/09/01/2026-09-01-10-00-00/2026-09-01-10-00-00.md"
+                           "2026/10/01/2026-10-01-10-00-00/2026-10-01-10-00-00.md")))
+          ;; A directory inside another is searched once.
+          (should (length= (agent-shell--session-transcript-files
+                            (list root (expand-file-name "2026/10/01/" root))
+                            "s1")
+                           2)))
+      (delete-directory root t))))
+
+(ert-deftest agent-shell--delete-transcripts-nested-test ()
+  "Deleting removes a transcript's directory only once nothing else is in it.
+Screenshots stay, and so do the date directories and the store."
+  (let ((root (make-temp-file "agent-shell-transcripts" t)))
+    (unwind-protect
+        (progn
+          (agent-shell-tests--nested-transcript-store root)
+          (agent-shell--delete-transcripts
+           (agent-shell--session-transcript-files (list root) "s1")
+           (list root))
+          (should (equal (sort (mapcar (lambda (file) (file-relative-name file root))
+                                       (directory-files-recursively root "" t))
+                               #'string<)
+                         '("2026" "2026/09" "2026/09/01"
+                           "2026/09/01/2026-09-01-10-00-00"
+                           "2026/09/01/2026-09-01-10-00-00/screenshots"
+                           "2026/09/01/2026-09-01-10-00-00/screenshots/shot.png"
+                           "2026/10" "2026/10/01" "2026/10/02"
+                           "2026/10/02/2026-10-02-10-00-00"
+                           "2026/10/02/2026-10-02-10-00-00/2026-10-02-10-00-00.md"))))
+      (delete-directory root t))))
+
+(ert-deftest agent-shell--delete-transcripts-keeps-roots-test ()
+  "A transcript directly in a searched directory leaves that directory."
+  (let ((root (make-temp-file "agent-shell-transcripts" t)))
+    (unwind-protect
+        (let ((file (expand-file-name "a.md" root)))
+          (agent-shell-tests--write-transcript file "x")
+          (agent-shell--delete-transcripts (list file) (list root))
+          (should (file-directory-p root))
+          (should-not (file-exists-p file)))
+      (delete-directory root t))))
+
+(ert-deftest agent-shell--transcript-search-directories-test ()
+  "The store root and the shell's own transcript directory are searched.
+A missing root is skipped and not created."
+  (let ((root (make-temp-file "agent-shell-transcripts" t))
+        (elsewhere (make-temp-file "agent-shell-elsewhere" t)))
+    (unwind-protect
+        (with-temp-buffer
+          (setq-local agent-shell--state (agent-shell--make-state :buffer (current-buffer)))
+          (let ((agent-shell-dot-subdir-function (lambda (_subdir) root)))
+            (setq-local agent-shell--transcript-file
+                        (expand-file-name "2026/10/16/s/s.md" root))
+            (should (equal (agent-shell--transcript-search-directories (current-buffer))
+                           (list (file-name-as-directory root))))
+            (setq-local agent-shell--transcript-file
+                        (expand-file-name "t.md" elsewhere))
+            (should (equal (agent-shell--transcript-search-directories (current-buffer))
+                           (list (file-name-as-directory root)
+                                 (file-name-as-directory elsewhere)))))
+          (let* ((missing (expand-file-name "missing" root))
+                 (agent-shell-dot-subdir-function (lambda (_subdir) missing)))
+            (should (equal (agent-shell--transcript-search-directories (current-buffer))
+                           (list (file-name-as-directory elsewhere))))
+            (should-not (file-exists-p missing))))
+      (delete-directory root t)
+      (delete-directory elsewhere t))))
+
+(defun agent-shell-tests--session-delete-call (supported body)
+  "Call BODY in a live agent shell buffer, with session delete when SUPPORTED.
+The shell's transcripts are in a temporary store holding sessions s1
+and s2 (see `agent-shell-tests--session-transcript-store'); s1 is the
+shell's session.  BODY gets the store directory and a function
+returning the requests sent so far, oldest first, as the plists
+`agent-shell--send-request' received.  Nothing is answered."
+  (let ((dir (make-temp-file "agent-shell-transcripts" t))
+        (buffer (generate-new-buffer "*agent-shell-delete-test*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq major-mode 'agent-shell-mode)
+          (setq-local agent-shell--state (agent-shell--make-state :buffer buffer))
+          (map-put! (map-elt agent-shell--state :session) :id "s1")
+          (map-put! (map-elt agent-shell--state :session) :title "Fix the reader")
+          (map-put! agent-shell--state :supports-session-delete supported)
+          (agent-shell-tests--session-transcript-store dir)
+          (setq-local agent-shell--transcript-file
+                      (expand-file-name "2026-10-01-10-00-00.md" dir))
+          (let ((sent nil)
+                (agent-shell-dot-subdir-function (lambda (_subdir) dir)))
+            (cl-letf (((symbol-function 'agent-shell--send-request)
+                       (lambda (&rest args) (push args sent))))
+              (funcall body dir (lambda () (reverse sent))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (delete-directory dir t))))
+
+(ert-deftest agent-shell-delete-session-needs-capability-test ()
+  "Deleting refuses when the agent does not advertise session delete."
+  (agent-shell-tests--session-delete-call
+   nil
+   (lambda (_dir sent)
+     (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t)))
+       (should-error (agent-shell-delete-session) :type 'user-error))
+     (should-not (funcall sent)))))
+
+(ert-deftest agent-shell-delete-session-declined-test ()
+  "Declining sends nothing; the prompt names the session and warns."
+  (agent-shell-tests--session-delete-call
+   t
+   (lambda (_dir sent)
+     (let ((asked nil))
+       (cl-letf (((symbol-function 'yes-or-no-p)
+                  (lambda (prompt) (setq asked prompt) nil)))
+         (agent-shell-delete-session))
+       (should (string-match-p "Fix the reader" asked))
+       (should (string-match-p "cannot be undone" asked)))
+     (should-not (funcall sent)))))
+
+(ert-deftest agent-shell-delete-session-success-test ()
+  "A confirmed delete removes the session's transcripts and the shell."
+  (agent-shell-tests--session-delete-call
+   t
+   (lambda (dir sent)
+     (let ((buffer (current-buffer)))
+       (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t)))
+         (agent-shell-delete-session))
+       (let ((call (car (funcall sent))))
+         (should (equal (plist-get call :request)
+                        '((:method . "session/delete")
+                          (:params . ((sessionId . "s1"))))))
+         ;; Nothing is deleted until the agent has.
+         (should (file-exists-p (expand-file-name "2026-10-01-10-00-00.md" dir)))
+         (cl-letf (((symbol-function 'message) #'ignore))
+           (funcall (plist-get call :on-success) nil)))
+       (should-not (buffer-live-p buffer))
+       (should (equal (directory-files dir nil "\\`[^.]")
+                      '("2026-10-02-10-00-00" "2026-10-02-10-00-00.md")))))))
+
+(ert-deftest agent-shell-delete-session-from-viewport-test ()
+  "Deleting from a viewport buffer deletes its shell's session and shell."
+  (agent-shell-tests--session-delete-call
+   t
+   (lambda (_dir sent)
+     (let ((shell-buffer (current-buffer)))
+       (with-temp-buffer
+         (setq-local major-mode 'agent-shell-viewport-view-mode)
+         (cl-letf (((symbol-function 'agent-shell--current-shell)
+                    (lambda () shell-buffer))
+                   ((symbol-function 'yes-or-no-p) (lambda (_) t)))
+           (agent-shell-delete-session)))
+       (let ((call (car (funcall sent))))
+         (should (equal (map-nested-elt (plist-get call :request)
+                                        '(:params sessionId))
+                        "s1"))
+         (cl-letf (((symbol-function 'message) #'ignore))
+           (funcall (plist-get call :on-success) nil)))
+       (should-not (buffer-live-p shell-buffer))))))
+
+(ert-deftest agent-shell-delete-session-failure-keeps-everything-test ()
+  "A failed delete reports the agent's error and deletes nothing."
+  (agent-shell-tests--session-delete-call
+   t
+   (lambda (dir sent)
+     (let ((buffer (current-buffer))
+           (files (directory-files-recursively dir "" t))
+           (shown nil))
+       (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t)))
+         (agent-shell-delete-session))
+       (cl-letf (((symbol-function 'message)
+                  (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
+         (funcall (plist-get (car (funcall sent)) :on-failure)
+                  '((code . -32002) (message . "Resource not found: s1")) nil))
+       (should (string-match-p "Resource not found: s1" shown))
+       (should (buffer-live-p buffer))
+       (should (equal (directory-files-recursively dir "" t) files))))))
+
+(ert-deftest agent-shell-delete-session-runs-deleted-hook-test ()
+  "A deleted session is announced on `agent-shell-session-deleted-functions'.
+After its transcripts are gone and before the shell is killed, so a
+hook function can still read the shell."
+  (agent-shell-tests--session-delete-call
+   t
+   (lambda (dir sent)
+     (let* ((buffer (current-buffer))
+            (seen nil)
+            (agent-shell-session-deleted-functions
+             (list (lambda (session-id)
+                     (push (list session-id
+                                 (buffer-live-p buffer)
+                                 (file-exists-p
+                                  (expand-file-name "2026-10-01-10-00-00.md" dir)))
+                           seen)))))
+       (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t)))
+         (agent-shell-delete-session))
+       (should-not seen)
+       (cl-letf (((symbol-function 'message) #'ignore))
+         (funcall (plist-get (car (funcall sent)) :on-success) nil))
+       (should (equal seen '(("s1" t nil))))
+       (should-not (buffer-live-p buffer))))))
+
+(ert-deftest agent-shell-delete-session-failure-runs-no-hook-test ()
+  "A delete the agent refuses announces nothing."
+  (agent-shell-tests--session-delete-call
+   t
+   (lambda (_dir sent)
+     (let* ((seen nil)
+            (agent-shell-session-deleted-functions
+             (list (lambda (session-id) (push session-id seen)))))
+       (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t)))
+         (agent-shell-delete-session))
+       (cl-letf (((symbol-function 'message) #'ignore))
+         (funcall (plist-get (car (funcall sent)) :on-failure)
+                  '((code . -32002) (message . "Resource not found: s1")) nil))
+       (should-not seen)))))
+
+(ert-deftest agent-shell-delete-session-hook-error-still-finishes-test ()
+  "A failing hook function neither stops the others nor the shell's kill."
+  (agent-shell-tests--session-delete-call
+   t
+   (lambda (_dir sent)
+     (let* ((buffer (current-buffer))
+            (seen nil)
+            (agent-shell-session-deleted-functions
+             (list (lambda (_session-id) (error "Boom"))
+                   (lambda (session-id) (push session-id seen)))))
+       (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t)))
+         (agent-shell-delete-session))
+       (cl-letf (((symbol-function 'message) #'ignore))
+         (funcall (plist-get (car (funcall sent)) :on-success) nil))
+       (should (equal seen '("s1")))
+       (should-not (buffer-live-p buffer))))))
+
+(ert-deftest agent-shell--prompt-select-session-offers-delete-test ()
+  "The picker offers to delete a session only when the agent can."
+  (let ((noninteractive nil)
+        (session '((sessionId . "session-1") (title . "First")
+                   (cwd . "/home/user/project") (updatedAt . "2026-01-19T14:00:00Z")))
+        (offered-labels nil))
+    (dolist (supported '(t nil))
+      (with-temp-buffer
+        (setq-local agent-shell--state
+                    (list (cons :buffer (current-buffer))
+                          (cons :supports-session-delete supported)))
+        (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () nil))
+                  ((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                  ((symbol-function 'agent-shell--emit-event) #'ignore)
+                  ((symbol-function 'completing-read)
+                   (lambda (_prompt collection &rest _)
+                     (setq offered-labels (all-completions "" collection))
+                     (or (car (member "Delete a session" offered-labels))
+                         "New shell"))))
+          (if supported
+              (progn
+                (should (eq (agent-shell--prompt-select-session (list session))
+                            :delete-session))
+                (should (member "Delete a session" offered-labels))
+                ;; Nothing to delete, though the picker still prompts.
+                (let ((other (generate-new-buffer " *other-shell*")))
+                  (unwind-protect
+                      (cl-letf (((symbol-function 'agent-shell-buffers)
+                                 (lambda () (list other))))
+                        (setq offered-labels nil)
+                        (agent-shell--prompt-select-session nil)
+                        (should (member "New shell" offered-labels))
+                        (should-not (member "Delete a session" offered-labels)))
+                    (kill-buffer other))))
+            (should-not (agent-shell--prompt-select-session (list session)))
+            (should-not (member "Delete a session" offered-labels))))))))
+
+(defun agent-shell-tests--picker-delete (choose-id confirm body)
+  "Drive the session picker's delete choice in a bootstrapping shell.
+The picker deletes the session CHOOSE-ID, confirming when CONFIRM is
+non-nil, then picks `:other-shell'.  Calls BODY with the transcript
+store (see `agent-shell-tests--session-transcript-store'), a function
+returning the requests sent so far, oldest first, and a function
+returning the `archived' argument of each listing, oldest first."
+  (let* ((dir (make-temp-file "agent-shell-transcripts" t))
+         (agent-shell-session-strategy 'prompt)
+         (agent-shell-dot-subdir-function (lambda (_subdir) dir)))
+    (unwind-protect
+        (with-temp-buffer
+          (setq-local agent-shell--state
+                      (list (cons :buffer (current-buffer))
+                            (cons :client 'test-client)
+                            (cons :supports-session-index t)
+                            (cons :supports-session-delete t)))
+          (agent-shell-tests--session-transcript-store dir)
+          ;; A bootstrapping shell's transcript, not written yet.
+          (setq-local agent-shell--transcript-file
+                      (expand-file-name "2026-10-16-10-00-00.md" dir))
+          (let ((sent nil)
+                (listed nil)
+                (prompts 0))
+            (cl-letf (((symbol-function 'agent-shell--state)
+                       (lambda () agent-shell--state))
+                      ((symbol-function 'agent-shell--update-bootstrapping-fragment)
+                       #'ignore)
+                      ((symbol-function 'agent-shell--emit-event) #'ignore)
+                      ((symbol-function 'agent-shell-cwd) (lambda () "/tmp"))
+                      ((symbol-function 'agent-shell--resolve-path) (lambda (path) path))
+                      ((symbol-function 'agent-shell--send-request)
+                       (lambda (&rest args) (push args sent)))
+                      ((symbol-function 'agent-shell--list-sessions)
+                       (cl-function
+                        (lambda (&key archived on-success &allow-other-keys)
+                          (push archived listed)
+                          (funcall on-success
+                                   '(((sessionId . "s1") (title . "Fix the reader"))
+                                     ((sessionId . "s2") (title . "Other")))))))
+                      ((symbol-function 'agent-shell--prompt-select-session)
+                       (lambda (&rest _)
+                         (if (= (cl-incf prompts) 1) :delete-session :other-shell)))
+                      ((symbol-function 'agent-shell--read-session)
+                       (lambda (_prompt acp-sessions)
+                         (seq-find (lambda (s) (equal (map-elt s 'sessionId) choose-id))
+                                   acp-sessions)))
+                      ((symbol-function 'yes-or-no-p) (lambda (_) confirm)))
+              (agent-shell--initiate-session-list-and-load
+               :shell-buffer (current-buffer)
+               :on-session-init #'ignore
+               :archived "all")
+              (funcall body dir
+                       (lambda () (reverse sent))
+                       (lambda () (reverse listed))))))
+      (delete-directory dir t))))
+
+(ert-deftest agent-shell--initiate-session-list-and-load-delete-test ()
+  "Deleting from the picker deletes the chosen session, then lists again."
+  (agent-shell-tests--picker-delete
+   "s1" t
+   (lambda (dir sent listed)
+     (let ((call (car (funcall sent))))
+       (should (equal (plist-get call :request)
+                      '((:method . "session/delete")
+                        (:params . ((sessionId . "s1"))))))
+       (should (equal (funcall listed) '("all")))
+       (cl-letf (((symbol-function 'message) #'ignore))
+         (funcall (plist-get call :on-success) nil)))
+     (should (equal (directory-files dir nil "\\`[^.]")
+                    '("2026-10-02-10-00-00" "2026-10-02-10-00-00.md")))
+     ;; Listed again, with the same filter.
+     (should (equal (funcall listed) '("all" "all"))))))
+
+(ert-deftest agent-shell--initiate-session-list-and-load-delete-declined-test ()
+  "Declining a delete from the picker sends nothing and lists again."
+  (agent-shell-tests--picker-delete
+   "s1" nil
+   (lambda (_dir sent listed)
+     (should-not (funcall sent))
+     (should (equal (funcall listed) '("all" "all"))))))
+
+(ert-deftest agent-shell--initiate-session-list-and-load-delete-open-session-test ()
+  "The picker refuses to delete a session another shell has open."
+  (let ((other (generate-new-buffer "*agent-shell-other*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer other
+            (setq major-mode 'agent-shell-mode)
+            (setq-local agent-shell--state (agent-shell--make-state :buffer other))
+            (map-put! (map-elt agent-shell--state :session) :id "s2"))
+          (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () (list other)))
+                    ((symbol-function 'message) #'ignore))
+            (agent-shell-tests--picker-delete
+             "s2" t
+             (lambda (dir sent listed)
+               (should-not (funcall sent))
+               (should (file-exists-p (expand-file-name "2026-10-02-10-00-00.md" dir)))
+               (should (equal (funcall listed) '("all" "all")))))))
+      (kill-buffer other))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here

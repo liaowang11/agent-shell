@@ -1445,6 +1445,7 @@ nonblank content also folds the current group.
 | C-<tab>                                               | agent-shell-cycle-session-mode                          | Cycle through available session modes for the current `agent-shell' session.  |
 |                                                       | agent-shell-deepseek-start-agent                        | Start an interactive DeepSeek Harness agent shell.                            |
 |                                                       | agent-shell-delete-interaction-at-point                 | Delete interaction (request and response) at point.                           |
+|                                                       | agent-shell-delete-session                              | Delete the current shell's session for good, then kill the shell.             |
 |                                                       | agent-shell-diff-accept-all                             | Accept all changes in the current diff buffer.                                |
 |                                                       | agent-shell-diff-mode                                   | Major mode for `agent-shell' diff buffers.                                    |
 |                                                       | agent-shell-diff-open-file                              | Open the file for the diff at point and jump to the change.                   |
