@@ -7706,6 +7706,29 @@ Scaling an exact cent overshoots it, for example (* 0.07 100) is
                          (agent-shell--svg-fill-color 'agent-shell-secondary))
                  svg-data))))))
 
+;;; Tests for the rate-limit indicator
+
+(ert-deftest agent-shell--mode-line-format-includes-rate-limit-test ()
+  "Test the mode line shows the rate-limit indicator when there's no header."
+  (with-temp-buffer
+    ;; Only the mode check matters here, not the mode's setup.
+    (setq major-mode 'agent-shell-mode)
+    (setq-local agent-shell--state
+                `((:session . ((:id . "abc")))
+                  (:usage . ((:rate-limits
+                              . (((:type . "five_hour")
+                                  (:status . "rejected")
+                                  (:utilization . 1.0)
+                                  (:resets-at . ,(+ (truncate (float-time)) 3600)))))))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--busy-indicator-frame)
+               (lambda () nil)))
+      (let ((agent-shell-header-style nil))
+        (should (string-match-p "➤ 5h 100%% resets "
+                                (substring-no-properties
+                                 (agent-shell--mode-line-format))))))))
+
 (ert-deftest agent-shell-viewport-next-page-allows-busy-history-navigation-test ()
   "Test `agent-shell-viewport-next-page' allows history navigation while busy."
   (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
