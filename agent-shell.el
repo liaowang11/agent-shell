@@ -1488,6 +1488,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
                            (cons :context-size 0)
                            (cons :cost-amount 0.0)
                            (cons :cost-currency nil)
+                           (cons :rate-limits nil)
                            (cons :model-usage nil)))))
 
 (defun agent-shell--ensure-state-key (state key)
@@ -9687,6 +9688,11 @@ Session events:
     :data contains :kind (\"commit\", \"push\", \"merge\", \"rebase\"
     or a newer kind), :branch (may be nil) and :cwd (the directory the
     command ran in).  Only agents that report it: Claude Code.
+  `rate-limit-rejected'   - A subscription usage limit was reached
+    :data contains :type (for example \"five_hour\", nil when not
+    reported), :status, :utilization (0 to 1) and :resets-at (epoch
+    seconds).  Emitted once per limit until it is allowed again.  Only
+    agents that report it: Claude Code.
   `session-restored'      - Reloaded session fully replayed and settled
   `input-submitted'       - User submitted input to the agent
     :data contains :prompt (the text sent to the agent, with any
@@ -14710,6 +14716,9 @@ Shows \" ⧉\" when a command prefix is used."
                                                                  (agent-shell--mode-line-mode-menu))
                                                      map))))
             (when-let* ((indicator (agent-shell--context-usage-indicator)))
+              (concat " ➤ " indicator))
+            (when-let* ((indicator (agent-shell--rate-limit-indicator
+                                    (map-elt (agent-shell--state) :usage))))
               (concat " ➤ " indicator))
             (agent-shell--busy-indicator-frame))))
 
