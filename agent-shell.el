@@ -6857,12 +6857,45 @@ original row stays pending forever.  They are released when the
 subagent reports a terminal state (see `agent-shell--retire-subagent').
 So is a call whose command still runs in the background (see
 `agent-shell--tool-call-awaits-task-p'), whose card shows how it ends."
-  (let ((row-block-ids (agent-shell--subagent-row-block-ids state)))
-    (map-put! state :tool-calls
-              (seq-filter (lambda (pair)
-                            (or (member (map-elt (cdr pair) :group-id) row-block-ids)
-                                (agent-shell--tool-call-awaits-task-p state (car pair))))
-                          (map-elt state :tool-calls)))))
+  (map-put! state :tool-calls
+            (seq-filter (lambda (pair)
+                          (agent-shell--tool-call-outlives-turn-p state (car pair)))
+                        (map-elt state :tool-calls))))
+
+(defun agent-shell--tool-call-outlives-turn-p (state tool-call-id)
+  "Return non-nil if STATE keeps TOOL-CALL-ID past the end of its turn.
+See `agent-shell--forget-turn-tool-calls' for which calls those are."
+  (or (member (map-nested-elt state (list :tool-calls tool-call-id :group-id))
+              (agent-shell--subagent-row-block-ids state))
+      (agent-shell--tool-call-awaits-task-p state tool-call-id)))
+
+(defun agent-shell--forget-failed-turn (state)
+  "Drop what STATE's failed turn left waiting on an answer.
+
+A `session/prompt' that fails, because the agent answered with an error
+or its process died, ends the turn as surely as a response does, so
+this drops what the end of a turn drops (see
+`agent-shell--forget-turn-tool-calls' and
+`agent-shell-elicitation--clear').  A turn that ends normally has
+answered its permission requests, but a failed one can leave some
+open: without this they read as pending, making the shell `blocked' on
+every later turn.  Their dialogs go too, since their buttons answer a
+request directly and nothing is waiting on it any more, and so does a
+diff opened from one, whose accept and exit answer it as well.  A native
+subagent's are kept with the rest of its tool calls, as they are when a
+turn ends normally.
+
+Nothing is sent to the agent, which may no longer be running."
+  (map-do (lambda (tool-call-id tool-call)
+            (when (and (map-elt tool-call :permission-request-id)
+                       (not (agent-shell--tool-call-outlives-turn-p
+                             state tool-call-id)))
+              (when-let* ((diff-buffer (map-elt tool-call :diff-buffer)))
+                (agent-shell-diff-kill-buffer diff-buffer))
+              (agent-shell--delete-permission-fragment state tool-call-id)))
+          (map-elt state :tool-calls))
+  (agent-shell--forget-turn-tool-calls state)
+  (agent-shell-elicitation--clear :state state))
 
 (defun agent-shell--retire-subagent (state subagent-session-id)
   "Release SUBAGENT-SESSION-ID's tool calls in STATE now that it is done.
@@ -12469,6 +12502,10 @@ Continue?" (agent-shell--prompt-queue-summary)))
                    (agent-shell--separate-transcript-after-agent-message
                     :last-entry-type (map-elt agent-shell--state :last-entry-type)
                     :file-path agent-shell--transcript-file)
+                   (agent-shell--forget-failed-turn agent-shell--state)
+                   ;; A permission or form request armed the idle timer,
+                   ;; and nothing waits on either any more.
+                   (agent-shell--cancel-idle-timer)
                    ;; An interrupted turn leaves no group active either.
                    (agent-shell--collapse-expanded-activity-group agent-shell--state)
                    ;; Display pending requests on failure.
