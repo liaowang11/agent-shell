@@ -934,6 +934,8 @@ block -- covering the dispatch path, not just the helper in isolation."
     (let ((agent-shell--stream-render-interval 0.01)
           (state (agent-shell--make-state :buffer (current-buffer)))
           (rendered nil))
+      ;; The timer renders only into a buffer still holding its state.
+      (setq-local agent-shell--state state)
       (cl-letf (((symbol-function 'agent-shell--update-fragment)
                  (lambda (&rest args) (push (plist-get args :body) rendered))))
         (agent-shell--update-streamed-fragment :state state :block-id "a" :body "tail")
@@ -944,6 +946,21 @@ block -- covering the dispatch path, not just the helper in isolation."
         (should (equal rendered '("tail")))
         (should-not (map-elt state :stream-render-timer))
         (should-not (map-elt state :stream-render-pending))))))
+
+(ert-deftest agent-shell--stream-render-timer-skips-replaced-state-test ()
+  "A batch left by a state the buffer no longer holds is dropped, not rendered."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 0.01)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (setq-local agent-shell--state (agent-shell--make-state :buffer (current-buffer)))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push (plist-get args :body) rendered))))
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "stale")
+        (with-timeout (2 (ert-fail "Timer never ran"))
+          (while (map-elt state :stream-render-timer)
+            (accept-process-output nil 0.005)))
+        (should-not rendered)))))
 
 (ert-deftest agent-shell--stream-render-flush-without-pending-is-noop-test ()
   "Flushing with nothing pending renders nothing."
@@ -968,6 +985,20 @@ block -- covering the dispatch path, not just the helper in isolation."
         (should (equal (nreverse rendered) '("one" "two")))
         (should-not (map-elt state :stream-render-timer))
         (should-not (map-elt state :stream-render-pending))))))
+
+(ert-deftest agent-shell--stream-render-adds-state-keys-test ()
+  "A state built before the batch keys existed gains them on first use."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 30)
+          (state (list (cons :buffer (current-buffer))))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push (plist-get args :body) rendered))))
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "late")
+        (should (map-elt state :stream-render-pending))
+        (should (timerp (map-elt state :stream-render-timer)))
+        (agent-shell--flush-stream-render state)
+        (should (equal rendered '("late")))))))
 
 (ert-deftest agent-shell--stream-render-restore-preserves-turn-order-test ()
   "Restored answers must precede the next user prompt."
@@ -1213,8 +1244,7 @@ The subagent burst arriving after `end_turn' has no request in flight and the
 normal heartbeat already stopped, so activity would otherwise appear with no
 notice.  Re-raise the heartbeat and arm a timer to clear it once the burst
 goes quiet."
-  (let ((agent-shell--stream-render-interval nil)
-        (heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
+  (let ((heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
         (state nil))
     (setq state (list (cons :chunked-group-count 0)
                       (cons :last-entry-type nil)
@@ -1246,8 +1276,7 @@ goes quiet."
 
 While a request is in flight the normal heartbeat already runs, so the
 out-of-turn re-raise must not apply."
-  (let ((agent-shell--stream-render-interval nil)
-        (heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
+  (let ((heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
         (state nil))
     (setq state (list (cons :chunked-group-count 0)
                       (cons :last-entry-type "agent_message_chunk")
@@ -4495,8 +4524,7 @@ newline, so the header glued onto the agent's last words:
 The replay path must emit the same blank-line separators the live
 path does, write the prompt raw rather than as a `> ' blockquote,
 and avoid inserting paragraph breaks between chunks of one prompt."
-  (let ((agent-shell--stream-render-interval nil)
-        (file (make-temp-file "agent-shell-transcript"))
+  (let ((file (make-temp-file "agent-shell-transcript"))
         (agent-shell--transcript-file nil)
         ;; Replayed into a plain buffer, which holds no live prompt to
         ;; render above: what is under test is the transcript the replay

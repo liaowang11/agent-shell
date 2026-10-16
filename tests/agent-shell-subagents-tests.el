@@ -800,6 +800,77 @@ it lands in the turn the root is streaming."
     (should (equal (map-nested-elt rendered '(:state :tool-calls "C1" :group-id))
                    "subagent-child"))))
 
+(ert-deftest agent-shell-subagent-batched-chunks-flush-into-their-own-buffers-test ()
+  "Batched message chunks render where they were headed when they arrived.
+
+A batch is flushed by whatever write comes next, which may belong to
+another session, or by the timer, which belongs to none.  The child's
+first chunk is flushed by its own row relabelling, under the root's
+binding; the root's chunk by the child's next tool call, under the
+child's; the child's last chunk by the timer.  Each must still land in
+the buffer and namespace of the session it came from."
+  (let* ((rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send _end-turn _prompt)
+             (let ((agent-shell--stream-render-interval 0.01))
+               (agent-shell-tests--spawn-and-work send)
+               ;; The root's "Delegating." is still batched.
+               (should (map-elt agent-shell--state :stream-render-pending))
+               (funcall send "child" '(sessionUpdate . "tool_call") '(toolCallId . "C2")
+                        '(title . "Read bar.el") '(kind . "read") '(status . "pending"))
+               (should-not (map-elt agent-shell--state :stream-render-pending))
+               (funcall send "child" '(sessionUpdate . "agent_message_chunk")
+                        '(messageId . "m-child")
+                        '(content (type . "text") (text . " and found it")))
+               ;; Same message, same activity: nothing relabels the row, so
+               ;; this chunk waits for the timer.
+               (funcall send "child" '(sessionUpdate . "agent_message_chunk")
+                        '(messageId . "m-child")
+                        '(content (type . "text") (text . " twice")))
+               (should (map-elt agent-shell--state :stream-render-pending))
+               (with-timeout (2 (ert-fail "Timer never flushed the batch"))
+                 (while (map-elt agent-shell--state :stream-render-pending)
+                   (accept-process-output nil 0.005)))))))
+         (child (agent-shell-tests--subagent-report rendered "child")))
+    (should (member "1-m-root-agent_message_chunk" (map-elt rendered :blocks)))
+    (should (string-match-p "Delegating\\." (map-elt rendered :text)))
+    (should-not (string-match-p "I looked" (map-elt rendered :text)))
+    (should-not (string-match-p "found it" (map-elt rendered :text)))
+    (should (member "1-m-child-agent_message_chunk" (map-elt child :blocks)))
+    (should (string-match-p "I looked and found it twice" (map-elt child :text)))
+    (should-not (string-match-p "Delegating" (map-elt child :text)))))
+
+(ert-deftest agent-shell-out-of-turn-batched-chunk-keeps-above-prompt-placement-test ()
+  "A batched out-of-turn chunk still renders above the prompt once flushed.
+
+Out of turn, the chunk's dispatch binds above-prompt placement.  The
+timer flushing it later runs outside that binding, so the batch has to
+carry it, or the text lands in the input area after the prompt."
+  (let* ((rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send end-turn _prompt)
+             ;; The turn's own text renders at once: `end-turn' here does
+             ;; not flush the way `session/prompt' succeeding does.
+             (let ((agent-shell--stream-render-interval nil))
+               (funcall send "root" '(sessionUpdate . "agent_message_chunk")
+                        '(messageId . "m-root")
+                        '(content (type . "text") (text . "Done."))))
+             (funcall end-turn)
+             (let ((agent-shell--stream-render-interval 30))
+               (funcall send "root" '(sessionUpdate . "agent_message_chunk")
+                        '(messageId . "m-late")
+                        '(content (type . "text") (text . "Late news")))
+               (should-not (string-match-p "Late news" (buffer-string)))
+               ;; As the timer does: no dispatch is binding anything.
+               (agent-shell--flush-stream-render agent-shell--state)))))
+         (text (map-elt rendered :text))
+         (late (string-search "Late news" text)))
+    (should (member "out-of-turn-m-late-agent_message_chunk" (map-elt rendered :blocks)))
+    (should late)
+    ;; The live prompt still follows the late text.
+    (should (string-search "Claude> " text late))
+    (should (string-match-p "Claude> \\'" text))))
+
 (ert-deftest agent-shell-subagent-row-name-opens-its-buffer-test ()
   "RET on the name in a subagent's row opens its buffer.
 

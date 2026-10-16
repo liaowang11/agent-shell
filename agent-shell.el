@@ -2908,6 +2908,10 @@ Flow:
                (not (eq agent-shell-session-strategy 'new-deferred))
                (not (map-nested-elt (agent-shell--state) '(:session :id))))
       (user-error "Starting agent, please wait"))
+    ;; A new turn starts here.  Streamed text still batched belongs to the
+    ;; turn before it: render it before the request count moves on and
+    ;; before the prompt, out-of-turn text included, renders anything else.
+    (agent-shell--flush-stream-render (agent-shell--state))
     (map-put! (agent-shell--state) :request-count
               ;; TODO: Make public in shell-maker.
               (shell-maker--current-request-id))
@@ -3270,6 +3274,9 @@ render that markup now, in the shell and its viewport."
     (when-let* ((shell-buffer (map-elt state :buffer))
                 ((buffer-live-p shell-buffer)))
       (with-current-buffer shell-buffer
+        ;; The burst's last chunks may still be batched; render them so
+        ;; the pass below sees them.
+        (agent-shell--flush-stream-render state)
         (agent-shell--render-deferred-markup))
       (when-let* ((viewport-buffer (agent-shell-viewport--buffer
                                     :shell-buffer shell-buffer
@@ -5601,6 +5608,10 @@ For example, shut down ACP client."
               ((timerp timer)))
     (cancel-timer timer)
     (map-put! (agent-shell--state) :out-of-turn-timer nil))
+  ;; Batched text is dropped with its timer: the shell is going away.
+  (when (map-elt (agent-shell--state) :stream-render-timer)
+    (agent-shell--cancel-stream-render-timer (agent-shell--state))
+    (map-put! (agent-shell--state) :stream-render-pending nil))
   (agent-shell-heartbeat-stop
    :heartbeat (map-elt (agent-shell--state) :heartbeat)))
 
@@ -6322,6 +6333,8 @@ later non-terminal state makes it running once more.
         ;; Nothing more streams into its buffer, so markup held back for
         ;; a following chunk (a trailing image or list item) can render
         ;; now.  The root's turn ending only does this for its own buffer.
+        ;; Its last chunks may still be batched; render them first.
+        (agent-shell--flush-stream-render state)
         (when-let* ((buffer (agent-shell-subagents--buffer
                              :state state :session-id subagent-session-id)))
           (with-current-buffer buffer
@@ -7716,7 +7729,11 @@ MESSAGE-ID and RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
         (goto-char (point-max))))))
 
 (defun agent-shell--arm-stream-render-timer (state)
-  "Schedule STATE's pending batch without postponing an existing timer."
+  "Schedule STATE's pending batch without postponing an existing timer.
+
+The timer renders nothing once STATE's buffer is gone or holds another
+state (the shell was started over), so a batch never outlives its
+session."
   (agent-shell--ensure-state-key state :stream-render-timer)
   (unless (map-elt state :stream-render-timer)
     (map-put! state :stream-render-timer
@@ -7724,7 +7741,9 @@ MESSAGE-ID and RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
                            (lambda ()
                              (map-put! state :stream-render-timer nil)
                              (when-let* ((buffer (map-elt state :buffer))
-                                         ((buffer-live-p buffer)))
+                                         ((buffer-live-p buffer))
+                                         ((eq (buffer-local-value 'agent-shell--state buffer)
+                                              state)))
                                (with-current-buffer buffer
                                  (agent-shell--flush-stream-render state))))))))
 
