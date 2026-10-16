@@ -1725,6 +1725,102 @@ header should stay one-line while the body shows the full multi-line command."
                (regexp-quote "### Tool Call [failed]")
                (car transcript-entries))))))
 
+(ert-deftest agent-shell--on-notification-tool-call-non-execution-kind-test ()
+  "A tool call that never ran shows why instead of a plain failure.
+claude-agent-acp reports such calls as \"failed\" with
+`_meta.claudeCode.nonExecutionKind'.  The stored status stays \"failed\",
+which is what removes a stale permission dialog."
+  (let ((agent-shell-status-kind-label-function
+         #'agent-shell--plain-colored-status-kind-label)
+        (transcript-entries nil))
+    (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+               (lambda (_state) t))
+              ((symbol-function 'agent-shell--append-transcript)
+               (lambda (&rest args)
+                 (push (plist-get args :text) transcript-entries)))
+              ((symbol-function 'agent-shell--cancel-idle-timer)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               #'ignore)
+              ((symbol-function 'agent-shell--delete-fragment)
+               #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _args) nil)))
+      (pcase-dolist (`(,kind ,expected-status ,expected-label)
+                     '(("interrupted" "interrupted" "interrupted")
+                       ("cancelled" "interrupted" "interrupted")
+                       ("user-rejected" "rejected" "rejected")
+                       ("permission-rule" "rejected" "rejected")
+                       ("automode-blocked" "rejected" "rejected")
+                       (nil "failed" "error")))
+        (let ((state (list (cons :buffer (current-buffer))
+                           (cons :tool-calls nil)
+                           (cons :activity-group-count 0)
+                           (cons :expanded-activity-group nil)
+                           (cons :last-entry-type "agent_message_chunk")
+                           (cons :last-activity-time nil))))
+          (setq transcript-entries nil)
+          (agent-shell--on-notification
+           :state state
+           :acp-notification
+           '((method . "session/update")
+             (params
+              (update
+               (sessionUpdate . "tool_call")
+               (toolCallId . "tc1")
+               (title . "Bash")
+               (status . "pending")
+               (kind . "execute")))))
+          (agent-shell--on-notification
+           :state state
+           :acp-notification
+           `((method . "session/update")
+             (params
+              (update
+               (sessionUpdate . "tool_call_update")
+               (toolCallId . "tc1")
+               (status . "failed")
+               ,@(when kind
+                   `((_meta (claudeCode (toolName . "Bash")
+                                        (nonExecutionKind . ,kind)))))))))
+          (should (equal (map-nested-elt state '(:tool-calls "tc1" :status))
+                         "failed"))
+          (should (equal (agent-shell--tool-call-display-status
+                          (map-nested-elt state '(:tool-calls "tc1")))
+                         expected-status))
+          (should (string-match-p
+                   (regexp-quote expected-label)
+                   (map-elt (agent-shell-make-tool-call-label state "tc1") :status)))
+          (should (equal (agent-shell--group-tool-statuses
+                          state (map-nested-elt state '(:tool-calls "tc1" :group-id)))
+                         (list expected-status)))
+          (should (string-match-p
+                   (regexp-quote (format "### Tool Call [%s]" expected-status))
+                   (car transcript-entries))))))))
+
+(ert-deftest agent-shell--activity-group-header-label-non-execution-test ()
+  "A group header surfaces an interrupted or rejected member by its own glyph."
+  (should (equal (substring-no-properties
+                  (agent-shell--activity-group-header-label
+                   '("completed" "interrupted")))
+                 (format "%s Activity 1/2"
+                         (map-elt (agent-shell--status-config "interrupted") :icon))))
+  (should (equal (substring-no-properties
+                  (agent-shell--activity-group-header-label
+                   '("completed" "rejected" "interrupted")))
+                 (format "%s Activity 1/3"
+                         (map-elt (agent-shell--status-config "rejected") :icon))))
+  ;; A real failure still outranks both.
+  (should (equal (substring-no-properties
+                  (agent-shell--activity-group-header-label
+                   '("failed" "rejected")))
+                 "✗ Activity 0/2"))
+  (dolist (status '("interrupted" "rejected"))
+    (should-not (equal (map-elt (agent-shell--status-config status) :label)
+                       "unknown"))
+    (should-not (equal (map-elt (agent-shell--status-config status) :face)
+                       'agent-shell-error))))
+
 (ert-deftest agent-shell--on-notification-tool-call-rawinput-command-still-renders-test ()
   "Execute calls with `rawInput.command' should keep rendering as before."
   (let ((state (list (cons :buffer (current-buffer))
