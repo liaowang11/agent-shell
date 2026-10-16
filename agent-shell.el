@@ -3638,8 +3638,27 @@ are kept per dispatching session, while root IDs retain their old shape."
         (agent-shell--save-tool-call state tool-call-id (list (cons :group-id group-id)))
         group-id)))
 
+(defun agent-shell--tool-call-display-status (tool-call)
+  "Return the status to show for TOOL-CALL.
+
+A tool call that failed without running shows why: claude-agent-acp
+sends `_meta.claudeCode.nonExecutionKind' with such a failure.
+\"interrupted\" and \"cancelled\" (its run was stopped) show as
+\"interrupted\"; any other kind, such as \"user-rejected\" or
+\"permission-rule\", means the call was refused and shows as
+\"rejected\".  Every other tool call shows its own `:status'.
+
+  (agent-shell--tool-call-display-status
+   \='((:status . \"failed\") (:non-execution-kind . \"user-rejected\")))
+  ;; => \"rejected\""
+  (let ((status (map-elt tool-call :status))
+        (kind (map-elt tool-call :non-execution-kind)))
+    (cond ((not (and kind (equal status "failed"))) status)
+          ((member kind '("interrupted" "cancelled")) "interrupted")
+          (t "rejected"))))
+
 (defconst agent-shell--tool-call-status-precedence
-  '("failed" "in_progress" "pending" "completed")
+  '("failed" "rejected" "interrupted" "in_progress" "pending" "completed")
   "Tool-call statuses from most to least severe, for group aggregation.
 A group header shows `completed' only when every member completed;
 otherwise the worst present status surfaces (one failure shows `failed').")
@@ -3654,7 +3673,7 @@ otherwise the worst present status surfaces (one failure shows `failed').")
   ;; => (\"completed\" \"failed\")"
   (seq-keep (lambda (pair)
               (when (equal (map-elt (cdr pair) :group-id) group-id)
-                (map-elt (cdr pair) :status)))
+                (agent-shell--tool-call-display-status (cdr pair))))
             (map-elt state :tool-calls)))
 
 (defun agent-shell--activity-group-status-glyph (status)
@@ -4723,6 +4742,9 @@ around this call to reflect whether the update arrived out of turn."
                         (list (cons :raw-output raw-output)))
                       (when-let* ((locations (map-nested-elt acp-notification '(params update locations))))
                         (list (cons :locations locations)))
+                      ;; Why a failed call never ran (claude-agent-acp).
+                      (when-let* ((kind (map-elt (map-elt meta 'claudeCode) 'nonExecutionKind)))
+                        (list (cons :non-execution-kind kind)))
                       (when display-terminal-p
                         (list (cons :display-terminal-p t)))
                       ;; claude-agent-acp's AIR `asyncTasks' marker: the
@@ -4770,7 +4792,7 @@ around this call to reflect whether the update arrived out of turn."
                         (not (map-elt tool-call :transcript-logged-p)))
                (agent-shell--append-transcript
                 :text (agent-shell--make-transcript-tool-call-entry
-                       :status status
+                       :status (agent-shell--tool-call-display-status tool-call)
                        :title (map-elt tool-call :title)
                        :kind (map-elt tool-call :kind)
                        :description (map-elt tool-call :description)
@@ -6010,6 +6032,8 @@ Should return a propertized string or nil.
 
 STATUS is one of: \"pending\", \"in_progress\", \"completed\", \"failed\".
 See URL `https://agentclientprotocol.com/protocol/schema#toolcallstatus'.
+A failed tool call that never ran is passed as \"interrupted\" or
+\"rejected\" instead, see `agent-shell--tool-call-display-status'.
 
 KIND is the tool call kind string (e.g. \"read\", \"edit\", \"execute\") or nil.
 See URL `https://agentclientprotocol.com/protocol/tool-calls'.
@@ -6117,7 +6141,7 @@ For example, the \"(10 - 20)\" in \"file.el (10 - 20)\" is dimmed."
 Returns propertized labels in :status and :title propertized."
   (when-let* ((tool-call (map-nested-elt state `(:tool-calls ,tool-call-id))))
     (let* ((status (agent-shell--make-status-kind-label
-                    :status (map-elt tool-call :status)
+                    :status (agent-shell--tool-call-display-status tool-call)
                     ;; A call carrying a questionnaire is a question,
                     ;; whatever kind the agent gave it: those bridged from
                     ;; an ask-the-user tool arrive as the catch-all "other".
