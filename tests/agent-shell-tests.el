@@ -935,6 +935,8 @@ block -- covering the dispatch path, not just the helper in isolation."
     (let ((agent-shell--stream-render-interval 0.01)
           (state (agent-shell--make-state :buffer (current-buffer)))
           (rendered nil))
+      ;; The timer renders only into a buffer still holding its state.
+      (setq-local agent-shell--state state)
       (cl-letf (((symbol-function 'agent-shell--update-fragment)
                  (lambda (&rest args) (push (plist-get args :body) rendered))))
         (agent-shell--update-streamed-fragment :state state :block-id "a" :body "tail")
@@ -945,6 +947,21 @@ block -- covering the dispatch path, not just the helper in isolation."
         (should (equal rendered '("tail")))
         (should-not (map-elt state :stream-render-timer))
         (should-not (map-elt state :stream-render-pending))))))
+
+(ert-deftest agent-shell--stream-render-timer-skips-replaced-state-test ()
+  "A batch left by a state the buffer no longer holds is dropped, not rendered."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 0.01)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (setq-local agent-shell--state (agent-shell--make-state :buffer (current-buffer)))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push (plist-get args :body) rendered))))
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "stale")
+        (with-timeout (2 (ert-fail "Timer never ran"))
+          (while (map-elt state :stream-render-timer)
+            (accept-process-output nil 0.005)))
+        (should-not rendered)))))
 
 (ert-deftest agent-shell--stream-render-flush-without-pending-is-noop-test ()
   "Flushing with nothing pending renders nothing."
@@ -969,6 +986,20 @@ block -- covering the dispatch path, not just the helper in isolation."
         (should (equal (nreverse rendered) '("one" "two")))
         (should-not (map-elt state :stream-render-timer))
         (should-not (map-elt state :stream-render-pending))))))
+
+(ert-deftest agent-shell--stream-render-adds-state-keys-test ()
+  "A state built before the batch keys existed gains them on first use."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 30)
+          (state (list (cons :buffer (current-buffer))))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args) (push (plist-get args :body) rendered))))
+        (agent-shell--update-streamed-fragment :state state :block-id "a" :body "late")
+        (should (map-elt state :stream-render-pending))
+        (should (timerp (map-elt state :stream-render-timer)))
+        (agent-shell--flush-stream-render state)
+        (should (equal rendered '("late")))))))
 
 (ert-deftest agent-shell--stream-render-restore-preserves-turn-order-test ()
   "Restored answers must precede the next user prompt."
@@ -1245,8 +1276,7 @@ The subagent burst arriving after `end_turn' has no request in flight and the
 normal heartbeat already stopped, so activity would otherwise appear with no
 notice.  Re-raise the heartbeat and arm a timer to clear it once the burst
 goes quiet."
-  (let ((agent-shell--stream-render-interval nil)
-        (heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
+  (let ((heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
         (state nil))
     (setq state (list (cons :chunked-group-count 0)
                       (cons :last-entry-type nil)
@@ -1278,8 +1308,7 @@ goes quiet."
 
 While a request is in flight the normal heartbeat already runs, so the
 out-of-turn re-raise must not apply."
-  (let ((agent-shell--stream-render-interval nil)
-        (heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
+  (let ((heartbeat (agent-shell-heartbeat-make :on-heartbeat (lambda (_value _status))))
         (state nil))
     (setq state (list (cons :chunked-group-count 0)
                       (cons :last-entry-type "agent_message_chunk")
@@ -4525,8 +4554,7 @@ newline, so the header glued onto the agent's last words:
 The replay path must emit the same blank-line separators the live
 path does, write the prompt raw rather than as a `> ' blockquote,
 and avoid inserting paragraph breaks between chunks of one prompt."
-  (let ((agent-shell--stream-render-interval nil)
-        (file (make-temp-file "agent-shell-transcript"))
+  (let ((file (make-temp-file "agent-shell-transcript"))
         (agent-shell--transcript-file nil)
         ;; Replayed into a plain buffer, which holds no live prompt to
         ;; render above: what is under test is the transcript the replay
@@ -11262,6 +11290,49 @@ such a body layers its own faces ahead of the base one."
         (should (equal '(agent-shell-markdown-inline-code agent-shell-thought-body)
                        (get-text-property 11 'face markdown)))))))
 
+;; A thought streams in many small chunks, and each render reflows its
+;; whole body; batching them is what keeps a long thought cheap.
+(ert-deftest agent-shell--on-notification-thought-chunks-batch-test ()
+  "Render a thought's first chunk at once and batch its continuations."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 30)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (cl-letf (((symbol-function 'agent-shell--active-requests-p)
+                 (lambda (_state) t))
+                ((symbol-function 'agent-shell--append-transcript) #'ignore)
+                ((symbol-function 'agent-shell--emit-event) #'ignore)
+                ((symbol-function 'agent-shell--refresh-activity-group-header) #'ignore)
+                ((symbol-function 'agent-shell--sync-activity-group-fold) #'ignore)
+                ((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest args)
+                   (when (plist-get args :body)
+                     (push args rendered)))))
+        (dolist (text '("one " "two " "three"))
+          (agent-shell--on-notification
+           :state state
+           :acp-notification `((method . "session/update")
+                               (params
+                                (update
+                                 (sessionUpdate . "agent_thought_chunk")
+                                 (content (type . "text") (text . ,text)))))))
+        ;; The first chunk opens the thought (and its group) right away.
+        (should (= (length rendered) 1))
+        (should (equal (substring-no-properties (plist-get (car rendered) :body)) "one "))
+        (should-not (plist-get (car rendered) :append))
+        (agent-shell--flush-stream-render state)
+        (should (= (length rendered) 2))
+        (let ((batch (car rendered))
+              (first (cadr rendered)))
+          (should (equal (substring-no-properties (plist-get batch :body)) "two three"))
+          (should (eq 'agent-shell-thought-body
+                      (get-text-property 0 'font-lock-face (plist-get batch :body))))
+          (should (plist-get batch :append))
+          (should-not (plist-get batch :create-new))
+          (should-not (plist-get batch :navigation))
+          (dolist (key '(:block-id :group-id :label-left :expanded :above-last-prompt))
+            (should (equal (plist-get batch key) (plist-get first key)))))))))
+
 (ert-deftest agent-shell--adapt-notification-test ()
   "Test `agent-shell--adapt-notification'."
   (let ((state (agent-shell--make-state
@@ -14894,15 +14965,17 @@ prompt, would then send as a steer."
         (should (equal (agent-shell-viewport--compose-disposition-label nil)
                        (nth 2 case)))))))
 
-(cl-defun agent-shell-tests--stream-message-chunks (&key message-id (chunks '("I" " found" " it")))
+(cl-defun agent-shell-tests--stream-message-chunks (&key message-id (chunks '("I" " found" " it"))
+                                                        updates)
   "Stream CHUNKS as agent message chunks into a real shell buffer.
 
 MESSAGE-ID is the ACP `messageId' carried by every chunk, or nil for an
-agent that omits it.  Renders through `agent-shell--update-fragment' for
+agent that omits it.  UPDATES are further `session/update' payloads sent
+after the chunks.  Renders through `agent-shell--update-fragment' for
 real, over output comint has already marked read-only.
 
-Returns the number of transcript headers written and the `:last-entry-type'
-left behind."
+Returns the number of transcript headers written, the `:last-entry-type'
+left behind and the shell's text."
   (let* ((buffer (generate-new-buffer " *agent-shell-chunk-stream-test*"))
          (process (start-process "fake-agent" buffer "cat"))
          (file (make-temp-file "agent-shell-transcript" nil ".md")))
@@ -14922,6 +14995,9 @@ left behind."
                             (cons :last-agent-message-ids nil)
                             (cons :chunked-group-count 0)
                             (cons :activity-group-count 0)
+                            (cons :activity-group-latest-id nil)
+                            (cons :activity-thoughts nil)
+                            (cons :expanded-activity-group nil)
                             (cons :request-count 0)
                             (cons :active-requests t)
                             (cons :pending-restore nil)
@@ -14942,11 +15018,17 @@ left behind."
                `((method . "session/update")
                  (params (update (sessionUpdate . "agent_message_chunk")
                                  ,@(when message-id `((messageId . ,message-id)))
-                                 (content (type . "text") (text . ,chunk))))))))
+                                 (content (type . "text") (text . ,chunk)))))))
+            (dolist (update updates)
+              (agent-shell--on-notification
+               :state agent-shell--state
+               :acp-notification `((method . "session/update")
+                                   (params (update ,@update))))))
           (list (cons :headers (with-temp-buffer
                                  (insert-file-contents file)
                                  (count-matches "^## Agent" (point-min) (point-max))))
-                (cons :last-entry-type (map-elt agent-shell--state :last-entry-type))))
+                (cons :last-entry-type (map-elt agent-shell--state :last-entry-type))
+                (cons :text (buffer-substring-no-properties (point-min) (point-max)))))
       (when (process-live-p process)
         (delete-process process))
       (kill-buffer buffer)
@@ -14970,6 +15052,58 @@ token in the transcript, one rendered message per token in the shell."
   (let ((streamed (agent-shell-tests--stream-message-chunks :message-id nil)))
     (should (equal (map-elt streamed :headers) 1))
     (should (equal (map-elt streamed :last-entry-type) "agent_message_chunk"))))
+
+(ert-deftest agent-shell-message-ending-in-list-item-renders-when-superseded-test ()
+  "A message's last list item renders once the agent moves on mid-turn.
+
+Streaming holds back a list item on the last line until its newline
+arrives.  A message ending in one never gets that newline, and the turn
+may run on well past it (thinking, tool calls, further messages), so
+waiting for the turn's end leaves the item raw meanwhile.  Holds
+whether chunks render as they arrive or in batches."
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (dolist (interval '(nil 60))
+      (dolist (next `(((sessionUpdate . "agent_thought_chunk")
+                       (content (type . "text") (text . "Hmm")))
+                      ((sessionUpdate . "agent_message_chunk")
+                       (messageId . "msg-2")
+                       (content (type . "text") (text . "Next")))))
+        (let* ((agent-shell--stream-render-interval interval)
+               (text (map-elt (agent-shell-tests--stream-message-chunks
+                               :message-id "msg-1"
+                               :chunks '("Two things:\n\n- One\n- Tw" "o")
+                               :updates (list next))
+                              :text)))
+          (should (string-match-p "^ *• Two$" text))
+          (should-not (string-match-p "^- Two" text)))))))
+
+(ert-deftest agent-shell-message-ending-in-list-item-renders-in-viewport-when-superseded-test ()
+  "The viewport's copy of a superseded message renders its last list item too.
+
+Streaming mirrors the message into the viewport, which holds back the
+same trailing item as the shell."
+  (let ((agent-shell-markdown-list-bullets '("•"))
+        (agent-shell--stream-render-interval nil)
+        (viewport-buffer (generate-new-buffer " *agent-shell-test-viewport*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--showing-latest-p)
+                   (lambda (&rest _) t))
+                  ((symbol-function 'agent-shell--latest-page-namespace-p)
+                   (lambda (&rest _) t)))
+          (with-current-buffer viewport-buffer
+            (agent-shell-viewport-view-mode))
+          (agent-shell-tests--stream-message-chunks
+           :message-id "msg-1"
+           :chunks '("Two things:\n\n- One\n- Two")
+           :updates '(((sessionUpdate . "agent_thought_chunk")
+                       (content (type . "text") (text . "Hmm")))))
+          (let ((text (with-current-buffer viewport-buffer
+                        (buffer-substring-no-properties (point-min) (point-max)))))
+            (should (string-match-p "^ *• Two$" text))
+            (should-not (string-match-p "^- Two" text))))
+      (kill-buffer viewport-buffer))))
 
 (ert-deftest agent-shell-next-item-walks-into-and-out-of-a-table ()
   "Next item enters a table at its first cell, walks it, then moves on."

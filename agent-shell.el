@@ -425,44 +425,122 @@ bullet, while a body of prose is untouched."
         (save-restriction
           (narrow-to-region (prop-match-beginning match)
                             (prop-match-end match))
-          (when (or (save-excursion
-                      (goto-char (point-min))
-                      (re-search-forward regexp nil t))
-                    ;; A list item whose newline never arrived.
-                    (save-excursion
-                      (goto-char (point-max))
-                      (beginning-of-line)
-                      (and (looking-at-p
-                            agent-shell-markdown--list-item-last-line-regexp)
-                           (not (get-text-property
-                                 (point) 'agent-shell-markdown-list-rendered))))
-                    ;; A blockquote line or header whose newline never
-                    ;; arrived.  A rendered header has lost its `#'s.
-                    (save-excursion
-                      (goto-char (point-max))
-                      (beginning-of-line)
-                      (or (and (looking-at-p
-                                agent-shell-markdown--blockquote-last-line-regexp)
-                               (not (get-text-property
-                                     (point) 'agent-shell-markdown-frozen)))
-                          (looking-at-p
-                           agent-shell-markdown--header-last-line-regexp)))
-                    ;; A table row whose newline never arrived, either
-                    ;; a whole raw row or the rest of a rendered one.
-                    (save-excursion
-                      (goto-char (point-max))
-                      (beginning-of-line)
-                      (or (looking-at-p agent-shell-markdown--table-line-regexp)
-                          (and (get-text-property
-                                (point) 'agent-shell-markdown-table-source)
-                               (not (get-text-property
-                                     (1- (point-max))
-                                     'agent-shell-markdown-table-source))))))
-            (agent-shell--render-markdown-body :complete t))))))
+          (agent-shell--render-held-back-markup regexp)))))
   ;; Rendering can resize text above the prompt, shifting any unsubmitted
   ;; input away from the undo entries recorded for it.
   (when (agent-shell--live-input-prompt-p comint-last-prompt)
     (agent-shell--reset-undo-history)))
+
+(defun agent-shell--render-held-back-markup (&optional image-regexp)
+  "Render the narrowed fragment body as complete if it holds back markup.
+
+A body is re-rendered when it holds raw image markup or ends in a raw
+list item, table row, blockquote line or header (see
+`agent-shell--render-deferred-markup').  Other bodies are left
+untouched.  IMAGE-REGEXP, when given, is the image markup regexp, so a
+buffer-wide pass builds it once rather than per body."
+  (let ((regexp (or image-regexp
+                    (agent-shell-markdown--link-markup-regexp :as-image? t))))
+    (when (or (save-excursion
+                (goto-char (point-min))
+                (re-search-forward regexp nil t))
+              ;; A list item whose newline never arrived.
+              (save-excursion
+                (goto-char (point-max))
+                (beginning-of-line)
+                (and (looking-at-p
+                      agent-shell-markdown--list-item-last-line-regexp)
+                     (not (get-text-property
+                           (point) 'agent-shell-markdown-list-rendered))))
+              ;; A blockquote line or header whose newline never
+              ;; arrived.  A rendered header has lost its `#'s.
+              (save-excursion
+                (goto-char (point-max))
+                (beginning-of-line)
+                (or (and (looking-at-p
+                          agent-shell-markdown--blockquote-last-line-regexp)
+                         (not (get-text-property
+                               (point) 'agent-shell-markdown-frozen)))
+                    (looking-at-p
+                     agent-shell-markdown--header-last-line-regexp)))
+              ;; A table row whose newline never arrived, either
+              ;; a whole raw row or the rest of a rendered one.
+              (save-excursion
+                (goto-char (point-max))
+                (beginning-of-line)
+                (or (looking-at-p agent-shell-markdown--table-line-regexp)
+                    (and (get-text-property
+                          (point) 'agent-shell-markdown-table-source)
+                         (not (get-text-property
+                               (1- (point-max))
+                               'agent-shell-markdown-table-source))))))
+      (agent-shell--render-markdown-body :complete t))))
+
+(defun agent-shell--settle-open-message (state &optional block-id)
+  "Render the markup STATE's open message held back, unless it is BLOCK-ID.
+
+The open message is the dispatching session's last streamed agent
+message.  Streaming holds back markup ending it (a list item on the
+last line, say) until more of it arrives.  Once the session moves on
+to a thought, a tool call, a plan or another message, none will, yet
+the turn may run on long after: render that markup now rather than at
+the turn's end (see `agent-shell--render-deferred-markup').
+
+Renders where the message did: a native subagent's own buffer, or
+the shell and its viewport."
+  (when-let* ((open (map-elt (agent-shell--activity-group-session-state state)
+                             :open-message))
+              ((not (equal (map-elt open :block-id) block-id)))
+              (qualified-id (format "%s-%s"
+                                    (map-elt open :namespace-id)
+                                    (map-elt open :block-id))))
+    (agent-shell--activity-group-set-session-fields state (cons :open-message nil))
+    ;; Its last chunks may still be batched.  Flush only those: a batch
+    ;; for whatever superseded it waits for its own turn.
+    (when (equal (map-elt (map-elt state :stream-render-pending) :block-id)
+                 (map-elt open :block-id))
+      (agent-shell--flush-stream-render state))
+    (dolist (buffer (if-let* ((session-key (agent-shell--activity-group-session-key))
+                              ((not (eq session-key :root))))
+                        (list (agent-shell-subagents--buffer
+                               :state state :session-id session-key))
+                      (list (map-elt state :buffer)
+                            (when-let* ((shell-buffer (map-elt state :buffer))
+                                        ((buffer-live-p shell-buffer))
+                                        (viewport-buffer (agent-shell-viewport--buffer
+                                                          :shell-buffer shell-buffer
+                                                          :existing-only t))
+                                        ((with-current-buffer viewport-buffer
+                                           (derived-mode-p 'agent-shell-viewport-view-mode))))
+                              viewport-buffer))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (save-excursion
+            (goto-char (point-max))
+            (when-let* ((block
+                         ;; The message was just streamed into, so its
+                         ;; block is normally cached; a search walks every
+                         ;; interval its chunks left (issue #757).
+                         (if-let* ((cached (agent-shell-ui--cached-block qualified-id)))
+                             (cons (marker-position (map-elt cached :start))
+                                   (marker-position (map-elt cached :end)))
+                           (when-let* ((match (text-property-search-backward
+                                               'agent-shell-ui-state qualified-id
+                                               (lambda (id ui-state)
+                                                 (equal (map-elt ui-state :qualified-id)
+                                                        id)))))
+                             (cons (prop-match-beginning match)
+                                   (prop-match-end match)))))
+                        (body (agent-shell-ui--body-range (car block) (cdr block))))
+              (save-restriction
+                (narrow-to-region (map-elt body :start) (map-elt body :end))
+                (let ((inhibit-read-only t)
+                      (buffer-undo-list t))
+                  (agent-shell--render-held-back-markup)))
+              ;; Rendering can resize text above the prompt, shifting any
+              ;; unsubmitted input away from the undo entries recorded for it.
+              (when (agent-shell--live-input-prompt-p comint-last-prompt)
+                (agent-shell--reset-undo-history)))))))))
 
 (cl-defun agent-shell--render-markdown-body (&key (render-images t) complete)
   "Render the narrowed body region as markdown, keeping its tail hidden.
@@ -2928,6 +3006,10 @@ Flow:
                (not (eq agent-shell-session-strategy 'new-deferred))
                (not (map-nested-elt (agent-shell--state) '(:session :id))))
       (user-error "Starting agent, please wait"))
+    ;; A new turn starts here.  Streamed text still batched belongs to the
+    ;; turn before it: render it before the request count moves on and
+    ;; before the prompt, out-of-turn text included, renders anything else.
+    (agent-shell--flush-stream-render (agent-shell--state))
     (map-put! (agent-shell--state) :request-count
               ;; TODO: Make public in shell-maker.
               (shell-maker--current-request-id))
@@ -3290,6 +3372,9 @@ render that markup now, in the shell and its viewport."
     (when-let* ((shell-buffer (map-elt state :buffer))
                 ((buffer-live-p shell-buffer)))
       (with-current-buffer shell-buffer
+        ;; The burst's last chunks may still be batched; render them so
+        ;; the pass below sees them.
+        (agent-shell--flush-stream-render state)
         (agent-shell--render-deferred-markup))
       (when-let* ((viewport-buffer (agent-shell-viewport--buffer
                                     :shell-buffer shell-buffer
@@ -3467,7 +3552,12 @@ an empty or whitespace-only message for streamed message continuation."
     (map-put! state :last-entry-type entry-type)
     (agent-shell--activity-group-set-session-fields
      state (cons :last-entry-type entry-type)
-     (cons :activity-entry-type activity-entry-type))))
+     (cons :activity-entry-type activity-entry-type))
+    ;; The session moved on from its message.  Entries that may interleave
+    ;; with a message still streaming (a subagent's update, a late tool call
+    ;; update) don't count.
+    (when (member entry-type '("agent_thought_chunk" "tool_call" "plan"))
+      (agent-shell--settle-open-message state))))
 
 (defun agent-shell--activity-group-current-id (state)
   "Return the current activity group id for STATE, advancing on a new run.
@@ -4145,22 +4235,34 @@ around this call to reflect whether the update arrived out of turn."
               :event 'agent-message-chunk
               :data (list (cons :text-chunk (map-nested-elt acp-notification '(params update content text)))
                           (cons :meta (map-nested-elt acp-notification '(params update _meta)))))
-             (agent-shell--update-streamed-fragment
-              :state state
-              ;; Out of turn, key under a dedicated namespace so the
-              ;; message forms its own fragment rather than coalescing
-              ;; into the previous turn's final message.  A subagent's
-              ;; message resolves to its row's namespace instead, and keeps
-              ;; it across the turn boundary its message may well straddle.
-              :namespace-id (agent-shell--fragment-namespace-id state)
-              ;; Key on `messageId' when present so distinct messages stay
-              ;; distinct; otherwise fall back to the per-run group count.
-              :block-id (format "%s-agent_message_chunk"
-                                (or message-block-id
-                                    (map-elt state :chunked-group-count)))
-              :body content
-              :create-new new-message
-              :message-id message-id)
+             (let (;; Out of turn, key under a dedicated namespace so the
+                   ;; message forms its own fragment rather than coalescing
+                   ;; into the previous turn's final message.  A subagent's
+                   ;; message resolves to its row's namespace instead, and
+                   ;; keeps it across the turn boundary its message may well
+                   ;; straddle.
+                   (namespace-id (agent-shell--fragment-namespace-id state))
+                   ;; Key on `messageId' when present so distinct messages
+                   ;; stay distinct; otherwise fall back to the per-run
+                   ;; group count.
+                   (block-id (format "%s-agent_message_chunk"
+                                     (or message-block-id
+                                         (map-elt state :chunked-group-count)))))
+               (agent-shell--update-streamed-fragment
+                :state state
+                :namespace-id namespace-id
+                :block-id block-id
+                :body content
+                :create-new new-message
+                :message-id message-id)
+               ;; A new message ends the previous one.
+               (when new-message
+                 (agent-shell--settle-open-message state block-id)
+                 (agent-shell--activity-group-set-session-fields
+                  state (cons :open-message
+                              (list (cons :namespace-id
+                                          (or namespace-id (map-elt state :request-count)))
+                                    (cons :block-id block-id))))))
              (when-let* ((row (agent-shell--subagent-row state))
                          ((agent-shell--note-subagent-activity
                            state `((:kind . message)
@@ -4257,42 +4359,64 @@ around this call to reflect whether the update arrived out of turn."
              (agent-shell--append-transcript
               :text (agent-shell--indent-markdown-headers content)
               :file-path agent-shell--transcript-file)
-             (agent-shell--update-fragment
-              :state state
-              ;; Thoughts share their activity group's namespace with tools.
-              ;; A turn boundary starts a new run, not a second namespace for
-              ;; the same group.  Subagents keep their pinned row namespace.
-              :namespace-id (map-elt row :namespace-id)
-              ;; The activity group is globally unique and remains stable
-              ;; across a thought's streamed chunks, including when another
-              ;; session starts a thought between them.
-              :block-id (if (or row (> thought-index 0))
-                            (format "%s-agent_thought_chunk-%s" group-id thought-index)
-                          (format "%s-agent_thought_chunk" group-id))
-              :label-left  (concat
-                            (when-let* ((icon (agent-shell--thought-process-icon)))
-                              (concat icon " "))
-                            (propertize "Thinking" 'font-lock-face 'agent-shell-section-heading))
-              ;; Base face for the body.  The markdown styling rendered on
-              ;; top layers its own faces ahead of it, so bold, links and
-              ;; code spans in a thought keep their faces.  Set on both
-              ;; properties for the reason
-              ;; `agent-shell-markdown--mirror-face-to-font-lock-face'
-              ;; gives: fontification clears a plain `face' (it covers a
-              ;; collapsed body long before the renderer, and its mirror,
-              ;; ever sees it), while `font-lock-face' only renders while
-              ;; `font-lock-mode' is on.
-              :body (agent-shell--add-text-properties
-                     content
-                     'face 'agent-shell-thought-body
-                     'font-lock-face 'agent-shell-thought-body)
-              :append (not new-thought-p)
-              :expanded agent-shell-thought-process-expand-by-default
-              :group-id (unless row group-id)
-              :group-label agent-shell--activity-group-label
-              :group-expanded (agent-shell--activity-group-initial-expanded-p)
-              :render-body-images t
-              :above-last-prompt (not (agent-shell--active-requests-p state)))
+             (let* ((namespace-id (map-elt row :namespace-id))
+                    (block-id (if (or row (> thought-index 0))
+                                  (format "%s-agent_thought_chunk-%s" group-id thought-index)
+                                (format "%s-agent_thought_chunk" group-id)))
+                    ;; Base face for the body.  The markdown styling rendered
+                    ;; on top layers its own faces ahead of it, so bold, links
+                    ;; and code spans in a thought keep their faces.  Set on
+                    ;; both properties for the reason
+                    ;; `agent-shell-markdown--mirror-face-to-font-lock-face'
+                    ;; gives: fontification clears a plain `face' (it covers a
+                    ;; collapsed body long before the renderer, and its
+                    ;; mirror, ever sees it), while `font-lock-face' only
+                    ;; renders while `font-lock-mode' is on.
+                    (body (agent-shell--add-text-properties
+                           content
+                           'face 'agent-shell-thought-body
+                           'font-lock-face 'agent-shell-thought-body))
+                    (above-last-prompt (not (agent-shell--active-requests-p state)))
+                    (fragment-args
+                     (list
+                      :label-left (concat
+                                   (when-let* ((icon (agent-shell--thought-process-icon)))
+                                     (concat icon " "))
+                                   (propertize "Thinking" 'font-lock-face 'agent-shell-section-heading))
+                      :expanded agent-shell-thought-process-expand-by-default
+                      :group-id (unless row group-id)
+                      :group-label agent-shell--activity-group-label
+                      :group-expanded (agent-shell--activity-group-initial-expanded-p)
+                      :navigation nil)))
+               (if new-thought-p
+                   ;; Open the thought, and with it its group, at once: the
+                   ;; header refresh and fold sync below find it in the buffer.
+                   (apply #'agent-shell--update-fragment
+                          :state state
+                          ;; Thoughts share their activity group's namespace
+                          ;; with tools.  A turn boundary starts a new run, not
+                          ;; a second namespace for the same group.  Subagents
+                          ;; keep their pinned row namespace.
+                          :namespace-id namespace-id
+                          ;; The activity group is globally unique and remains
+                          ;; stable across a thought's streamed chunks,
+                          ;; including when another session starts a thought
+                          ;; between them.
+                          :block-id block-id
+                          :body body
+                          :render-body-images t
+                          :above-last-prompt above-last-prompt
+                          fragment-args)
+                 ;; Continuations batch like message chunks: each render
+                 ;; reflows the thought's body, so one per chunk costs a
+                 ;; long thought dearly.
+                 (agent-shell--update-streamed-fragment
+                  :state state
+                  :namespace-id namespace-id
+                  :block-id block-id
+                  :body body
+                  :above-last-prompt above-last-prompt
+                  :fragment-args fragment-args)))
              ;; Count this thought and relabel the header so a thought-only
              ;; group reads "Thinking"/"Thought" instead of the neutral
              ;; placeholder, and a mixed group can mention it.  Both run once
@@ -5660,6 +5784,10 @@ For example, shut down ACP client."
               ((timerp timer)))
     (cancel-timer timer)
     (map-put! (agent-shell--state) :out-of-turn-timer nil))
+  ;; Batched text is dropped with its timer: the shell is going away.
+  (when (map-elt (agent-shell--state) :stream-render-timer)
+    (agent-shell--cancel-stream-render-timer (agent-shell--state))
+    (map-put! (agent-shell--state) :stream-render-pending nil))
   (agent-shell-heartbeat-stop
    :heartbeat (map-elt (agent-shell--state) :heartbeat)))
 
@@ -6457,6 +6585,8 @@ later non-terminal state makes it running once more.
         ;; Nothing more streams into its buffer, so markup held back for
         ;; a following chunk (a trailing image or list item) can render
         ;; now.  The root's turn ending only does this for its own buffer.
+        ;; Its last chunks may still be batched; render them first.
+        (agent-shell--flush-stream-render state)
         (when-let* ((buffer (agent-shell-subagents--buffer
                              :state state :session-id subagent-session-id)))
           (with-current-buffer buffer
@@ -7900,7 +8030,11 @@ MESSAGE-ID and RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
         (goto-char (point-max))))))
 
 (defun agent-shell--arm-stream-render-timer (state)
-  "Schedule STATE's pending batch without postponing an existing timer."
+  "Schedule STATE's pending batch without postponing an existing timer.
+
+The timer renders nothing once STATE's buffer is gone or holds another
+state (the shell was started over), so a batch never outlives its
+session."
   (agent-shell--ensure-state-key state :stream-render-timer)
   (unless (map-elt state :stream-render-timer)
     (map-put! state :stream-render-timer
@@ -7908,7 +8042,9 @@ MESSAGE-ID and RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
                            (lambda ()
                              (map-put! state :stream-render-timer nil)
                              (when-let* ((buffer (map-elt state :buffer))
-                                         ((buffer-live-p buffer)))
+                                         ((buffer-live-p buffer))
+                                         ((eq (buffer-local-value 'agent-shell--state buffer)
+                                              state)))
                                (with-current-buffer buffer
                                  (agent-shell--flush-stream-render state))))))))
 
@@ -7930,15 +8066,23 @@ CHUNK is an alist like:
    (:above-last-prompt . nil)
    (:message-id . \"msg_1\")
    (:subagent-group . nil)
-   (:render-above-prompt . nil))
+   (:render-above-prompt . nil)
+   (:fragment-args . nil))
 
 Renders under the session the chunk arrived for: a native subagent's
 text goes to its own buffer and an out-of-turn message above the
 prompt, whichever session is dispatching when the render runs (the
-timer, or another session's update landing in between)."
+timer, or another session's update landing in between).
+
+`:fragment-args' holds further `agent-shell--update-fragment' arguments,
+which take precedence over the defaults below."
   (let ((agent-shell--subagent-group (map-elt chunk :subagent-group))
         (agent-shell--render-above-prompt (map-elt chunk :render-above-prompt)))
-    (agent-shell--update-fragment
+    (apply
+     #'agent-shell--update-fragment
+     (append
+      (map-elt chunk :fragment-args)
+      (list
      :state state
      :namespace-id (map-elt chunk :namespace-id)
      :block-id (map-elt chunk :block-id)
@@ -7948,7 +8092,7 @@ timer, or another session's update landing in between)."
      :navigation 'never
      :render-body-images t
      :above-last-prompt (map-elt chunk :above-last-prompt)
-     :message-id (map-elt chunk :message-id))))
+     :message-id (map-elt chunk :message-id))))))
 
 (defun agent-shell--flush-stream-render (state)
   "Render STATE's pending streamed text, if any."
@@ -7959,11 +8103,14 @@ timer, or another session's update landing in between)."
     (agent-shell--render-streamed-chunk state pending)))
 
 (cl-defun agent-shell--update-streamed-fragment (&key state namespace-id block-id body
-                                                      create-new above-last-prompt message-id)
+                                                      create-new above-last-prompt message-id
+                                                      fragment-args)
   "Append BODY to streamed fragment BLOCK-ID in STATE.
 
 NAMESPACE-ID, CREATE-NEW, ABOVE-LAST-PROMPT and MESSAGE-ID follow
-`agent-shell--update-fragment'.  Chunks for the same fragment are
+`agent-shell--update-fragment'.  FRAGMENT-ARGS is a plist of further
+arguments to it, such as a thought's labels and group; only chunks
+with equal FRAGMENT-ARGS batch together.  Chunks for the same fragment are
 batched while `agent-shell--stream-render-interval' is non-nil.  A
 different fragment or CREATE-NEW flushes the previous batch first.
 
@@ -7982,7 +8129,8 @@ chunks never merge with the root's (see
                      (cons :message-id message-id)
                      (cons :session-key (agent-shell--activity-group-session-key))
                      (cons :subagent-group agent-shell--subagent-group)
-                     (cons :render-above-prompt agent-shell--render-above-prompt)))
+                     (cons :render-above-prompt agent-shell--render-above-prompt)
+                     (cons :fragment-args fragment-args)))
         (pending (map-elt state :stream-render-pending)))
     (cond
      ((not agent-shell--stream-render-interval)
@@ -7991,7 +8139,8 @@ chunks never merge with the root's (see
            (not create-new)
            (equal (map-elt pending :session-key) (map-elt chunk :session-key))
            (equal (map-elt pending :namespace-id) namespace-id)
-           (equal (map-elt pending :block-id) block-id))
+           (equal (map-elt pending :block-id) block-id)
+           (equal (map-elt pending :fragment-args) fragment-args))
       (map-put! pending :body (concat (map-elt pending :body) body)))
      (t
       (agent-shell--flush-stream-render state)
