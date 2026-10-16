@@ -923,19 +923,26 @@ buffer."
        :prompt (seq-elt ring next-index)))))
 
 (defun agent-shell-viewport-search-history ()
-  "Search prompt history, select, and insert into compose buffer."
-  (declare (modes agent-shell-viewport-edit-mode))
+  "Search prompt history, select, and insert into compose buffer.
+
+From a history page, switch to the compose page first, restoring any
+parked draft, and insert at the draft's point.  The prompt is read
+before leaving the page, so quitting the search stays on it."
+  (declare (modes agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
   (interactive)
-  (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
-    (user-error "Not in a shell viewport buffer"))
-  (insert (with-current-buffer (agent-shell-viewport--shell-buffer)
-            (completing-read
-             "History: "
-             (delete-dups
-              (seq-filter
-               (lambda (item)
-                 (not (string-empty-p item)))
-               (ring-elements comint-input-ring))) nil t))))
+  (agent-shell-viewport--ensure-buffer)
+  (let ((prompt (with-current-buffer (agent-shell-viewport--shell-buffer)
+                  (completing-read
+                   "History: "
+                   (delete-dups
+                    (seq-filter
+                     (lambda (item)
+                       (not (string-empty-p item)))
+                     (ring-elements comint-input-ring))) nil t))))
+    (when (derived-mode-p 'agent-shell-viewport-view-mode)
+      (agent-shell-viewport--enter-compose-page))
+    (insert prompt)))
 
 (defun agent-shell-viewport--leave-compose-page (&optional n)
   "Snapshot the draft and return to the page last read from compose.
@@ -1754,6 +1761,7 @@ alone fires a prompt at a working agent."
     (define-key map (kbd "b") #'agent-shell-viewport-previous-page)
     (define-key map (kbd "r") #'agent-shell-viewport-reply)
     (define-key map (kbd "R") #'agent-shell-viewport-quote-reply)
+    (define-key map (kbd "M-r") #'agent-shell-viewport-search-history)
     (define-key map (kbd "y") #'agent-shell-viewport-reply-yes)
     (define-key map (kbd "1") #'agent-shell-viewport-reply-1)
     (define-key map (kbd "2") #'agent-shell-viewport-reply-2)
@@ -1817,6 +1825,8 @@ alone fires a prompt at a working agent."
                          (:description . ,(agent-shell-viewport--reply-description)))
                         ((:function . agent-shell-viewport-quote-reply)
                          (:description . "Quote reply…"))
+                        ((:function . agent-shell-viewport-search-history)
+                         (:description . "Reply from history…"))
                         ((:function . agent-shell-viewport-reply-yes)
                          (:description . "Reply \"yes\"")
                          (:if-not . agent-shell-viewport--busy-p))
