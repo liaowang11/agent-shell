@@ -1099,6 +1099,7 @@ where LABEL is the displayed string and TOKEN identifies the choice:
   `:downloads-shell': Start a new shell in ~/Downloads.
   `:temp-shell': Start a new shell in a temporary directory.
   `:other-shell': Switch to an existing shell buffer.
+  `:delete-session': Choose a session to delete, then choose again.
 
 Resumable session candidates use their session alist as TOKEN.
 
@@ -1357,6 +1358,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-session-load nil)
         (cons :supports-session-resume nil)
         (cons :supports-session-fork nil)
+        (cons :supports-session-delete nil)
         (cons :supports-fork-point nil)
         (cons :supports-session-index nil)
         (cons :supports-steering nil)
@@ -5711,6 +5713,21 @@ For example:
             (string-trim (replace-regexp-in-string "[/:]+" "-" directory) "-+" "-+")
             (substring (md5 directory) 0 8))))
 
+(cl-defun agent-shell--dot-subdir-path (subdir &key local)
+  "Return path to SUBDIR for `agent-shell' data, without creating it.
+See `agent-shell--dot-subdir' for SUBDIR and LOCAL."
+  (unless (functionp agent-shell-dot-subdir-function)
+    (error "Set agent-shell-dot-subdir-function to a function"))
+  (let ((dir (funcall agent-shell-dot-subdir-function subdir)))
+    (unless (and (stringp dir) (not (string-empty-p (string-trim dir))))
+      (error "Failed to resolve agent-shell data directory (subdir: %s).  Resulting directory is not a non-empty string (dir: %s)" subdir dir))
+    (if (and local (file-remote-p dir))
+        (agent-shell-cache-dir
+         "remote"
+         (agent-shell--remote-data-key (agent-shell-cwd))
+         subdir)
+      dir)))
+
 (cl-defun agent-shell--dot-subdir (subdir &key local)
   "Return path to SUBDIR for `agent-shell' data, creating it if needed.
 Calls `agent-shell-dot-subdir-function' to resolve the path.
@@ -5726,16 +5743,7 @@ once per streamed chunk and read by Emacs, so writing them next to a
 remote project would cost a round trip per chunk for data that host
 never reads.  Set `agent-shell-transcript-file-path-function' to choose
 the location yourself."
-  (unless (functionp agent-shell-dot-subdir-function)
-    (error "Set agent-shell-dot-subdir-function to a function"))
-  (let ((dir (funcall agent-shell-dot-subdir-function subdir)))
-    (unless (and (stringp dir) (not (string-empty-p (string-trim dir))))
-      (error "Failed to resolve agent-shell data directory (subdir: %s).  Resulting directory is not a non-empty string (dir: %s)" subdir dir))
-    (when (and local (file-remote-p dir))
-      (setq dir (agent-shell-cache-dir
-                 "remote"
-                 (agent-shell--remote-data-key (agent-shell-cwd))
-                 subdir)))
+  (let ((dir (agent-shell--dot-subdir-path subdir :local local)))
     (unless (file-directory-p dir)
       (make-directory dir t)
       (when (agent-shell--dot-subdir-in-repo-p dir)
@@ -7197,6 +7205,120 @@ load the session again, so it offers `agent-shell-reload' to resume it."
      :on-failure (lambda (acp-error _raw-message)
                    (message "Failed to unarchive session: %s"
                             (agent-shell--acp-error-text acp-error))))))
+
+(defun agent-shell--delete-session-prompt (title session-id)
+  "Return the prompt confirming the deletion of SESSION-ID titled TITLE."
+  (format "Delete session \"%s\" and its transcripts?  This cannot be undone. "
+          (or (agent-shell--transcript-title-line title) session-id)))
+
+(cl-defun agent-shell--delete-session (&key state session-id on-deleted on-failed)
+  "Delete SESSION-ID through STATE's agent, then its transcripts here.
+
+Sends ACP's `session/delete'.  Only once the agent has deleted the
+session are the transcripts of it deleted, found where STATE's shell
+keeps transcripts (see `agent-shell--transcript-search-directories' and
+`agent-shell--session-transcript-files'), and then
+ON-DELETED is called with no arguments.  On failure, nothing is deleted
+and ON-FAILED is called with the agent's error text."
+  (let ((directories (agent-shell--transcript-search-directories
+                      (map-elt state :buffer))))
+    (agent-shell--send-request
+     :state state
+     :client (map-elt state :client)
+     :request (acp-make-session-delete-request :session-id session-id)
+     :buffer (map-elt state :buffer)
+     :on-success
+     (lambda (_acp-response)
+       (condition-case err
+           (let ((files (agent-shell--session-transcript-files directories session-id)))
+             (agent-shell--delete-transcripts files directories)
+             (message "Session deleted, with %d transcript%s"
+                      (length files) (if (length= files 1) "" "s")))
+         (error
+          (message "Session deleted, but not all its transcripts: %s"
+                   (error-message-string err))))
+       (when on-deleted
+         (funcall on-deleted)))
+     :on-failure
+     (lambda (acp-error _raw-message)
+       (let ((text (agent-shell--acp-error-text acp-error)))
+         (message "Failed to delete session: %s" text)
+         (when on-failed
+           (funcall on-failed text)))))))
+
+(defun agent-shell-delete-session ()
+  "Delete the current shell's session for good, then kill the shell.
+
+Needs an agent that advertises ACP's session delete capability.  After
+the agent deletes the session, its transcripts in this shell's
+transcript directory go too: every transcript whose header names the
+session, with its subagents' transcripts.  When the agent fails, nothing
+is deleted.
+
+To delete a session that isn't open, choose \"Delete a session\" when
+starting a shell (see `agent-shell-session-strategy')."
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-mode)
+    (user-error "Not in an agent-shell buffer"))
+  (unless (map-elt (agent-shell--state) :supports-session-delete)
+    (user-error "Agent does not support deleting sessions"))
+  (let* ((state (agent-shell--state))
+         (buffer (current-buffer))
+         (session-id (or (map-nested-elt state '(:session :id))
+                         (user-error "No active session"))))
+    (when (yes-or-no-p (agent-shell--delete-session-prompt
+                        (map-nested-elt state '(:session :title))
+                        session-id))
+      (agent-shell--delete-session
+       :state state
+       :session-id session-id
+       :on-deleted (lambda ()
+                     (when (buffer-live-p buffer)
+                       (with-current-buffer buffer
+                         ;; Nothing may write a transcript back now.
+                         (setq-local agent-shell--transcript-file nil)
+                         ;; Queued prompts have no session to go to, so
+                         ;; don't ask about them.
+                         (let ((kill-buffer-query-functions nil))
+                           (kill-buffer buffer)))))))))
+
+(cl-defun agent-shell--delete-session-from-picker (&key acp-sessions on-done)
+  "Ask which of ACP-SESSIONS to delete and delete it, then call ON-DONE.
+
+For the session picker, in the bootstrapping shell, whose agent deletes
+the session (see `agent-shell--delete-session').  Refuses a session
+another shell has open, since that shell's agent would keep writing it.
+ON-DONE is called with no arguments whether or not a session was
+deleted, so the picker can list sessions again."
+  (let* ((acp-session (agent-shell--read-session "Delete session: " acp-sessions))
+         (session-id (map-elt acp-session 'sessionId))
+         (open-in (seq-find (lambda (buffer)
+                              (equal (map-nested-elt
+                                      (buffer-local-value 'agent-shell--state buffer)
+                                      '(:session :id))
+                                     session-id))
+                            (agent-shell-buffers)))
+         (notify (lambda (text)
+                   (agent-shell--update-bootstrapping-fragment
+                    :state (agent-shell--state)
+                    :block-id "delete_session"
+                    :body (agent-shell--make-boxed-message :text text)))))
+    (cond
+     (open-in
+      (funcall notify (format "Session is open in %s; delete it from there"
+                              (buffer-name open-in)))
+      (funcall on-done))
+     ((not (yes-or-no-p (agent-shell--delete-session-prompt
+                         (map-elt acp-session 'title) session-id)))
+      (funcall on-done))
+     (t
+      (agent-shell--delete-session
+       :state (agent-shell--state)
+       :session-id session-id
+       :on-deleted on-done
+       :on-failed (lambda (text)
+                    (funcall notify (format "Failed to delete session: %s" text))
+                    (funcall on-done)))))))
 
 (defun agent-shell--format-async-task-body (description summary last-tool-name usage)
   "Format an async task fragment body from DESCRIPTION, SUMMARY,
@@ -9711,6 +9833,22 @@ through to `acp-send-request'."
        (funcall remove-request)
        (signal (car err) (cdr err))))))
 
+(defun agent-shell--session-capability-advertised-p (acp-response capability)
+  "Return t if ACP-RESPONSE to `initialize' advertises session CAPABILITY.
+
+CAPABILITY is a key of `sessionCapabilities', such as `list' or
+`delete'.  Agents put `sessionCapabilities' at the top of the response
+or under `agentCapabilities'.
+
+  (agent-shell--session-capability-advertised-p
+   \='((agentCapabilities (sessionCapabilities (delete)))) \='delete)
+  ;; => t"
+  (let ((acp-session-capabilities (or (map-elt acp-response 'sessionCapabilities)
+                                      (map-nested-elt acp-response '(agentCapabilities sessionCapabilities)))))
+    (and (listp acp-session-capabilities)
+         (assq capability acp-session-capabilities)
+         t)))
+
 (cl-defun agent-shell--initiate-handshake (&key shell-buffer on-initiated)
   "Initiate ACP handshake with SHELL-BUFFER.
 
@@ -9758,20 +9896,14 @@ Must provide ON-INITIATED (lambda ())."
                                            `((_meta . ,air-meta)))))
    :on-success (lambda (acp-response)
                  (with-current-buffer shell-buffer
-                   (let ((acp-session-capabilities (or (map-elt acp-response 'sessionCapabilities)
-                                                       (map-nested-elt acp-response '(agentCapabilities sessionCapabilities)))))
-                     (map-put! agent-shell--state :supports-session-list
-                               (and (listp acp-session-capabilities)
-                                    (assq 'list acp-session-capabilities)
-                                    t))
-                     (map-put! agent-shell--state :supports-session-resume
-                               (and (listp acp-session-capabilities)
-                                    (assq 'resume acp-session-capabilities)
-                                    t))
-                     (map-put! agent-shell--state :supports-session-fork
-                               (and (listp acp-session-capabilities)
-                                    (assq 'fork acp-session-capabilities)
-                                    t)))
+                   (map-put! agent-shell--state :supports-session-list
+                             (agent-shell--session-capability-advertised-p acp-response 'list))
+                   (map-put! agent-shell--state :supports-session-resume
+                             (agent-shell--session-capability-advertised-p acp-response 'resume))
+                   (map-put! agent-shell--state :supports-session-fork
+                             (agent-shell--session-capability-advertised-p acp-response 'fork))
+                   (map-put! agent-shell--state :supports-session-delete
+                             (agent-shell--session-capability-advertised-p acp-response 'delete))
                    ;; Save prompt capabilities from agent, converting to internal symbols
                    (when-let* ((prompt-capabilities
                                 (map-nested-elt acp-response '(agentCapabilities promptCapabilities))))
@@ -10499,14 +10631,48 @@ COLUMNS defaults to `agent-shell--session-selection-columns'."
         (push (if face (propertize padded 'face face) padded) parts)))
     (apply #'concat (nreverse parts))))
 
+(defun agent-shell--session-label-choices (acp-sessions)
+  "Return ACP-SESSIONS as completion choices, each (LABEL . ACP-SESSION).
+Labels are column-aligned (see `agent-shell--session-choice-label')."
+  (let* ((columns (agent-shell--session-selection-columns acp-sessions))
+         (max-widths (when acp-sessions
+                       (mapcar (lambda (col)
+                                 (cons col (apply #'max
+                                                  (mapcar (lambda (s)
+                                                            (length (agent-shell--session-column-value col s)))
+                                                          acp-sessions))))
+                               columns))))
+    (mapcar (lambda (acp-session)
+              (cons (agent-shell--session-choice-label
+                     :acp-session acp-session
+                     :max-widths max-widths
+                     :columns columns)
+                    acp-session))
+            acp-sessions)))
+
+(defun agent-shell--read-session (prompt acp-sessions)
+  "Read one of ACP-SESSIONS with PROMPT and return it, in their order."
+  (let* ((choices (agent-shell--session-label-choices acp-sessions))
+         ;; See `agent-shell--prompt-select-session' on binding this.
+         (this-command 'agent-shell))
+    (map-elt choices
+             (completing-read
+              prompt
+              (lambda (string pred action)
+                (if (eq action 'metadata)
+                    '(metadata (display-sort-function . identity))
+                  (complete-with-action action choices string pred)))
+              nil t))))
+
 (defun agent-shell--prompt-select-session (acp-sessions &optional offer-archived)
   "Prompt to choose one from ACP-SESSIONS.
 
 Return selected session alist, nil to start a new session,
 `:other-shell' when the user chose an existing shell (already
-displayed and bootstrapping shell killed), or `:show-archived' when
+displayed and bootstrapping shell killed), `:show-archived' when
 OFFER-ARCHIVED is non-nil and the user asked to list archived sessions
-too.
+too, or `:delete-session' when the user asked to delete one of
+ACP-SESSIONS, which is only offered when the agent can.
 Falls back to latest session in batch mode (e.g. tests)."
   (when (or acp-sessions (agent-shell-buffers))
     (if noninteractive
@@ -10514,14 +10680,6 @@ Falls back to latest session in batch mode (e.g. tests)."
       (let* ((other-shells (seq-remove (lambda (b) (eq b (current-buffer)))
                                        (agent-shell-buffers)))
              (new-session-choice "New shell")
-             (columns (agent-shell--session-selection-columns acp-sessions))
-             (max-widths (when acp-sessions
-                           (mapcar (lambda (col)
-                                     (cons col (apply #'max
-                                                      (mapcar (lambda (s)
-                                                                (length (agent-shell--session-column-value col s)))
-                                                              acp-sessions))))
-                                   columns)))
              ;; TODO: Consolidate choices with `agent-shell--shell-buffer'.
              (session-choices (agent-shell--apply-session-choices
                                (append (list (cons new-session-choice :new-shell)
@@ -10531,13 +10689,11 @@ Falls back to latest session in batch mode (e.g. tests)."
                                          (list (cons "Switch to shell buffer" :other-shell)))
                                        (when offer-archived
                                          (list (cons "Show archived sessions" :show-archived)))
-                                       (mapcar (lambda (acp-session)
-                                                 (cons (agent-shell--session-choice-label
-                                                        :acp-session acp-session
-                                                        :max-widths max-widths
-                                                        :columns columns)
-                                                       acp-session))
-                                               acp-sessions))))
+                                       (when (and acp-sessions
+                                                  (map-elt agent-shell--state
+                                                           :supports-session-delete))
+                                         (list (cons "Delete a session" :delete-session)))
+                                       (agent-shell--session-label-choices acp-sessions))))
              ;; Some completion frameworks yielded appended (nil) to each line
              ;; unless this-command was bound.
              ;;
@@ -10571,6 +10727,7 @@ Falls back to latest session in batch mode (e.g. tests)."
           (pcase (map-elt session-choices selection)
             (:new-shell nil)
             (:show-archived :show-archived)
+            (:delete-session :delete-session)
             (:other-shell
              (let ((other-shell (agent-shell--read-shell-buffer
                                  :prompt "Switch to shell buffer: "
@@ -11357,7 +11514,15 @@ again with ARCHIVED \"all\"."
                             :shell-buffer shell-buffer
                             :on-session-init on-session-init
                             :archived "all"))
-                         (unless (memq acp-session '(:other-shell :show-archived))
+                         (when (eq acp-session :delete-session)
+                           (agent-shell--delete-session-from-picker
+                            :acp-sessions acp-sessions
+                            :on-done (lambda ()
+                                       (agent-shell--initiate-session-list-and-load
+                                        :shell-buffer shell-buffer
+                                        :on-session-init on-session-init
+                                        :archived archived))))
+                         (unless (memq acp-session '(:other-shell :show-archived :delete-session))
                            (let ((acp-session-id (and acp-session
                                                       (map-elt acp-session 'sessionId))))
                              (agent-shell--emit-event
@@ -14889,6 +15054,134 @@ re-encode the file."
                 (write-region nil nil filepath nil 'no-message)))))
       (error
        (message "Failed to write transcript title: %S" err)))))
+
+;; A transcript's header is at its top, and well under this size.
+(defconst agent-shell--transcript-header-bytes 4096
+  "Bytes read from a transcript's start to find its header.")
+
+(defun agent-shell--transcript-header-session-id (text)
+  "Return the session id in the transcript header TEXT starts with, or nil.
+
+Reads the `session_id' key of a YAML frontmatter header (see
+`agent-shell--make-transcript-frontmatter') or the `**Session ID:**'
+field of an older Markdown header, which ends at the `---' separator.
+Only the header is searched, since the body quotes transcript headers
+verbatim whenever an agent echoes another transcript.
+
+  (agent-shell--transcript-header-session-id
+   \"---\\nagent: \\\"Claude\\\"\\nsession_id: \\\"s1\\\"\\n---\\n\")
+  ;; => \"s1\""
+  (with-temp-buffer
+    (insert text)
+    (goto-char (point-min))
+    (if (looking-at "---[ \t]*$")
+        (let ((end (progn
+                     (forward-line 1)
+                     (save-excursion
+                       (and (re-search-forward "^---[ \t]*$" nil t)
+                            (match-beginning 0))))))
+          (when (and end
+                     (re-search-forward "^session_id:[ \t]*\\(\".*\"\\)[ \t]*$" end t))
+            (ignore-errors (json-read-from-string (match-string 1)))))
+      (let ((end (save-excursion
+                   (cond
+                    ((re-search-forward "^---[ \t]*$" nil t)
+                     (match-beginning 0))
+                    ((re-search-forward "^## " nil t)
+                     (match-beginning 0))
+                    (t (point-max))))))
+        (when (re-search-forward "^\\*\\*Session ID:\\*\\*[ \t]*\\(.*[^ \t\n]\\)[ \t]*$" end t)
+          (match-string 1))))))
+
+(defun agent-shell--transcript-search-directories (buffer)
+  "Return the directories holding transcripts of BUFFER's shell's sessions.
+
+These are the transcripts root that `agent-shell-dot-subdir-function'
+names (see `agent-shell--dot-subdir-path'), which a custom
+`agent-shell-transcript-file-path-function' may nest transcripts under,
+and the directory of the shell's own transcript, unless that is inside
+the root.  Missing directories are left out, and nothing is created."
+  (with-current-buffer buffer
+    (let* ((root (condition-case nil
+                     (agent-shell--dot-subdir-path "transcripts" :local t)
+                   (error nil)))
+           (root (when (and root (file-directory-p root))
+                   (file-name-as-directory root)))
+           (own (when-let* ((file agent-shell--transcript-file)
+                            (dir (file-name-directory file))
+                            ((file-directory-p dir)))
+                  (file-name-as-directory dir))))
+      (delq nil (list root
+                      (unless (and root own (file-in-directory-p own root))
+                        own))))))
+
+(defun agent-shell--session-transcript-files (directories session-id)
+  "Return the transcripts under DIRECTORIES whose header names SESSION-ID.
+
+A session gets a transcript per shell that ran it, each named by when
+it started (see `agent-shell--default-transcript-file-path'), so only
+the header ties a file to a session; see
+`agent-shell--transcript-header-session-id'.  Each directory is searched
+recursively, since a custom `agent-shell-transcript-file-path-function'
+may nest transcripts, say by date.  `subagents' directories are skipped:
+subagent transcripts go with the transcript that spawned them (see
+`agent-shell--delete-transcripts').  Missing directories are skipped,
+and a directory inside another is searched once."
+  (let ((directories (seq-filter #'file-directory-p (delq nil directories))))
+    (seq-filter
+     (lambda (file)
+       (and (file-regular-p file)
+            (with-temp-buffer
+              (insert-file-contents file nil 0 agent-shell--transcript-header-bytes)
+              ;; Most files don't name the session at all; skip them unparsed.
+              (and (search-forward session-id nil t)
+                   (progn
+                     (goto-char (point-min))
+                     ;; A long title can push the frontmatter's end past
+                     ;; the bytes read, so read on.
+                     (when (and (looking-at "---[ \t]*$")
+                                (not (save-excursion
+                                       (forward-line 1)
+                                       (re-search-forward "^---[ \t]*$" nil t))))
+                       (erase-buffer)
+                       (insert-file-contents file))
+                     (equal session-id
+                            (agent-shell--transcript-header-session-id
+                             (buffer-string))))))))
+     (seq-uniq
+      (mapcan (lambda (directory)
+                (directory-files-recursively
+                 directory "\\.md\\'" nil
+                 (lambda (dir)
+                   (not (equal (file-name-nondirectory dir) "subagents")))))
+              directories)))))
+
+(defun agent-shell--delete-transcripts (files roots)
+  "Delete transcript FILES and their subagents' transcripts, within ROOTS.
+
+A transcript's subagents write to a directory named after it (see
+`agent-shell-subagents--transcript-directory'), which goes too, along
+with its parent when that is left empty.  So does the transcript's own
+directory when left empty, as long as it is inside one of ROOTS, the
+directories FILES were found under, and not one of them.  Directories
+still holding anything, such as screenshots, stay."
+  (let ((roots (mapcar #'file-name-as-directory roots)))
+    (dolist (file files)
+      (delete-file file)
+      (let ((subagents (agent-shell-subagents--transcript-directory file nil))
+            (parent (file-name-sans-extension file))
+            (own (file-name-directory file)))
+        (when (file-directory-p subagents)
+          (delete-directory subagents t))
+        (when (and (file-directory-p parent)
+                   (directory-empty-p parent))
+          (delete-directory parent))
+        (when (and (seq-some (lambda (root)
+                               (and (file-in-directory-p own root)
+                                    (not (file-equal-p own root))))
+                             roots)
+                   (directory-empty-p own))
+          (delete-directory own))))))
 
 (defun agent-shell--indent-markdown-headers (text)
   "Indent markdown headers in TEXT by 2 levels for transcript hierarchy.
