@@ -2542,6 +2542,70 @@ first, or the next `agent-shell-viewport-reply' restores them."
               (should-not agent-shell-viewport--compose-snapshot)))
         (kill-buffer viewport-buffer)))))
 
+(ert-deftest agent-shell-viewport-search-history-from-view-mode-test ()
+  "Test `agent-shell-viewport-search-history' composes from a history page.
+
+The chosen prompt goes into the compose page, at the parked draft's point
+when there is one.  Quitting the search leaves the history page and the
+parked draft as they were."
+  (dolist (case '((:snapshot ((:content . "my draft") (:location . 4))
+                   :choice "old prompt"
+                   :expected "my old promptdraft")
+                  (:snapshot nil :choice "old prompt" :expected "old prompt")
+                  (:snapshot ((:content . "my draft") (:location . 4))
+                   :choice quit)))
+    (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+          (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+          (choice (plist-get case :choice))
+          (candidates nil))
+      (unwind-protect
+          (progn
+            (with-current-buffer shell-buffer
+              (setq-local comint-input-ring (make-ring 5))
+              (ring-insert comint-input-ring "old prompt")
+              (ring-insert comint-input-ring ""))
+            (with-current-buffer viewport-buffer
+              (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'agent-shell-viewport--shell-buffer)
+                         (lambda (&rest _) shell-buffer))
+                        ((symbol-function 'agent-shell-viewport--position)
+                         (lambda (&rest _) '((:current . 1) (:total . 1))))
+                        ((symbol-function 'agent-shell-viewport--recenter)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'agent-shell-viewport--initialize)
+                         (lambda (&rest _)
+                           (let ((inhibit-read-only t))
+                             (erase-buffer))))
+                        ((symbol-function 'completing-read)
+                         (lambda (_prompt collection &rest _)
+                           (setq candidates collection)
+                           (if (eq choice 'quit)
+                               (signal 'quit nil)
+                             choice))))
+                (agent-shell-viewport-view-mode)
+                (let ((inhibit-read-only t))
+                  (insert "page text"))
+                (setq agent-shell-viewport--compose-snapshot
+                      (plist-get case :snapshot))
+                (if (eq choice 'quit)
+                    (progn
+                      (should (eq (condition-case nil
+                                      (agent-shell-viewport-search-history)
+                                    (quit 'quit))
+                                  'quit))
+                      (should (derived-mode-p 'agent-shell-viewport-view-mode))
+                      (should (equal (buffer-string) "page text"))
+                      (should (equal agent-shell-viewport--compose-snapshot
+                                     (plist-get case :snapshot))))
+                  (agent-shell-viewport-search-history)
+                  (should (equal candidates '("old prompt")))
+                  (should (derived-mode-p 'agent-shell-viewport-edit-mode))
+                  (should (equal (buffer-string) (plist-get case :expected)))
+                  (should-not agent-shell-viewport--compose-snapshot)))))
+        (kill-buffer viewport-buffer)
+        (kill-buffer shell-buffer)))))
+
 (ert-deftest agent-shell-viewport-compose-send-and-dismiss-test ()
   "Composed prompts are sent, cleared, and dismissed or kept.
 
