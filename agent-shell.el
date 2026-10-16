@@ -79,6 +79,7 @@
 (require 'agent-shell-experimental)
 (require 'agent-shell-droid)
 (require 'agent-shell-github)
+(require 'agent-shell-goal)
 (require 'agent-shell-google)
 (require 'agent-shell-goose)
 (require 'agent-shell-heartbeat)
@@ -1382,6 +1383,8 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :unknown-sessions nil)
         (cons :async-tasks nil)
         (cons :session-archived nil)
+        (cons :goal nil)
+        (cons :goal-capability nil)
         (cons :plan-signals nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
@@ -4687,7 +4690,11 @@ around this call to reflect whether the update arrived out of turn."
                                       '(params update _meta jetbrains air))))
              (when (and (listp air) (assq 'archived air))
                (agent-shell--set-session-archived
-                state (eq (map-elt air 'archived) t))))
+                state (eq (map-elt air 'archived) t)))
+             ;; AIR goal: a snapshot, or null once cleared.  Updates
+             ;; that only carry a title have no `goal' key.
+             (when (and (listp air) (assq 'goal air))
+               (agent-shell--set-goal state (map-elt air 'goal))))
            ;; Note: No need to set :last-entry-type as no text was inserted.
            nil)
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "config_option_update")
@@ -8713,6 +8720,7 @@ defaulting to the frame width."
     (:background-mode . ,(frame-parameter nil 'background-mode))
     (:context-indicator . ,(agent-shell--context-usage-indicator))
     (:cost-indicator . ,(agent-shell--cost-indicator))
+    (:goal-indicator . ,(agent-shell--goal-indicator (map-elt state :goal)))
     (:subagents-indicator . ,(agent-shell-subagents--header-indicator state))
     (:busy-indicator-frame . ,(agent-shell--busy-indicator-frame))
     (:position . ,position)
@@ -8862,6 +8870,9 @@ effort and context usage ride along with the model name, since all three
 describe how the agent is thinking.  The busy indicator trails
 everything, as it animates and must not shift the segments before it.
 
+The session goal follows the model group, early enough to survive the
+cut.
+
   (agent-shell--text-header
    \\='((:position . \"1/3\") (:status . \"Edit\")
      (:buffer-name . \"Claude Code\") (:model-name . \"Sonnet 5\")
@@ -8894,6 +8905,7 @@ everything, as it animates and must not shift the segments before it.
                       (agent-shell--mode-line-thought-level-menu)))
                    (map-elt header-model :context-indicator))
              " · ")
+            (map-elt header-model :goal-indicator)
             (when (map-elt header-model :mode-name)
               (agent-shell--header-menu-chunk
                (map-elt header-model :mode-name)
@@ -9019,6 +9031,25 @@ everything, as it animates and must not shift the segments before it.
                                                                               'default)))
                                                                 (dx . "8"))
                                                               (format-mode-line (map-elt header-model :context-indicator)))))
+                                ;; Session goal (optional)
+                                (when (map-elt header-model :goal-indicator)
+                                  (dom-append-child text-node
+                                                    (dom-node 'tspan
+                                                              `((fill . ,(agent-shell--svg-fill-color 'default))
+                                                                (dx . "8"))
+                                                              "➤"))
+                                  (dom-append-child text-node
+                                                    (dom-node 'tspan
+                                                              `((fill . ,(agent-shell--svg-fill-color
+                                                                          (or (get-text-property 0 'face (map-elt header-model :goal-indicator))
+                                                                              'default)))
+                                                                (dx . "8"))
+                                                              ;; Only `%%' needs undoing, and unlike
+                                                              ;; `format-mode-line' this works without a
+                                                              ;; frame (it returns "" in batch).
+                                                              (string-replace "%%" "%"
+                                                                              (substring-no-properties
+                                                                               (map-elt header-model :goal-indicator))))))
                                 ;; Cost (optional)
                                 (when (map-elt header-model :cost-indicator)
                                   (dom-append-child text-node
@@ -9499,6 +9530,12 @@ Session events:
     reported), :status, :utilization (0 to 1) and :resets-at (epoch
     seconds).  Emitted once per limit until it is allowed again.  Only
     agents that report it: Claude Code.
+  `goal-changed'          - The session goal was set, cleared or changed
+    status (for example to \"complete\" or \"blocked\")
+    :data contains :goal and :previous-goal, each nil or an alist with
+    :objective and :status, and maybe :iterations, :last-reason and
+    :created-at (epoch milliseconds).  Not emitted for progress alone.
+    Only agents that report it: Claude Code.
   `session-restored'      - Reloaded session fully replayed and settled
   `input-submitted'       - User submitted input to the agent
     :data contains :prompt (the text sent to the agent, with any
@@ -9942,6 +9979,9 @@ Must provide ON-INITIATED (lambda ())."
                    (map-put! agent-shell--state :supports-session-index
                              (agent-shell--air-capability-advertised-p
                               acp-response "sessionIndex"))
+                   ;; Advertised to any client that sent AIR `_meta'.
+                   (map-put! agent-shell--state :goal-capability
+                             (agent-shell--goal-capability acp-response))
                    (when-let* ((agent-capabilities (map-elt acp-response 'agentCapabilities)))
                      (map-put! agent-shell--state :supports-session-load
                                (eq (map-elt agent-capabilities 'loadSession) t))
@@ -14547,6 +14587,9 @@ Shows \" ⧉\" when a command prefix is used."
             (when-let* ((indicator (agent-shell--rate-limit-indicator
                                     (map-elt (agent-shell--state) :usage))))
               (concat " ➤ " indicator))
+            (when-let* ((indicator (agent-shell--goal-indicator
+                                    (map-elt (agent-shell--state) :goal))))
+              (concat " ➤ " indicator))
             (agent-shell--busy-indicator-frame))))
 
 (defun agent-shell--setup-modeline ()
@@ -14841,7 +14884,9 @@ with ON-SUCCESS function."
     ("v" "Set model" agent-shell-set-session-model :transient t)
     ("t" "Set thought level" agent-shell-set-session-thought-level :transient t)
     ("o" "Set option" agent-shell-set-session-config-option :transient t)
-    ("C" "Interrupt" agent-shell-interrupt :transient t)]
+    ("C" "Interrupt" agent-shell-interrupt :transient t)
+    ("g" "Set goal" agent-shell-set-goal :if agent-shell--goal-supported-p)
+    ("G" "Clear goal" agent-shell-clear-goal :if agent-shell--goal-supported-p)]
    ["Shell"
     ("b" "Toggle" agent-shell-toggle :transient t)
     ("N" "New shell" agent-shell-new-shell)]])

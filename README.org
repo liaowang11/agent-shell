@@ -1374,6 +1374,7 @@ always go to Evil modes if you need to with ~C-z~).
 | C-M-u                                                 | agent-shell-backward-up-item                            | Go to the start of the item point navigated into.                             |
 |                                                       | agent-shell-chat-mode                                   | Toggle chat-style `Me'/agent labels in the current `agent-shell' buffer.      |
 |                                                       | agent-shell-clear-buffer                                | Clear the current shell buffer.                                               |
+|                                                       | agent-shell-clear-goal                                  | Clear the current session's goal.                                             |
 |                                                       | agent-shell-cline-start-agent                           | Start an interactive Cline agent shell.                                       |
 |                                                       | agent-shell-codebuddy-start-agent                       | Start an interactive CodeBuddy agent shell.                                   |
 |                                                       | agent-shell-completion-mode                             | Toggle popping completion as @ or / are typed.                                |
@@ -1477,6 +1478,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-send-region-to                              | Like `agent-shell-send-region' but prompt for which shell to use.             |
 |                                                       | agent-shell-send-screenshot                             | Capture a screenshot and insert it into `agent-shell'.                        |
 |                                                       | agent-shell-send-screenshot-to                          | Like `agent-shell-send-screenshot' but prompt for which shell to use.         |
+|                                                       | agent-shell-set-goal                                    | Set the current session's goal to OBJECTIVE.                                  |
 | C-c C-s                                               | agent-shell-set-session-config-option                   | Set a session config option.                                                  |
 | C-c RET                                               | agent-shell-set-session-mode                            | Set session mode (if any available).                                          |
 | C-c C-v                                               | agent-shell-set-session-model                           | Set session model.                                                            |
