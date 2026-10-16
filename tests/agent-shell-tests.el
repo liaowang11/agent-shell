@@ -12679,6 +12679,126 @@ Deny as the leftmost (and thus default) button."
                              (name . "Always Allow")
                              (optionId . "allow-always"))))))))
 
+(ert-deftest agent-shell--make-permission-actions-decline-first ()
+  "Offer rejecting first when the agent asks to default to no.
+The first button is where point lands, so a stray RET must not approve."
+  (should (equal '("reject_once" "allow_once" "allow_always")
+                 (mapcar (lambda (action) (map-elt action :kind))
+                         (agent-shell--make-permission-actions
+                          '(((kind . "allow_once")
+                             (name . "Allow Once")
+                             (optionId . "allow"))
+                            ((kind . "allow_always")
+                             (name . "Always Allow")
+                             (optionId . "allow-always"))
+                            ((kind . "reject_once")
+                             (name . "Deny")
+                             (optionId . "reject")))
+                          t)))))
+
+(ert-deftest agent-shell--permission-default-to-no-has-no-approve-keys-test ()
+  "A `defaultToNo' dialog has no one-key approve; deny keeps its key.
+Approving takes RET or a click on an allow button."
+  (let* ((acp-options '(((kind . "allow_once")
+                         (name . "Allow")
+                         (optionId . "allow"))
+                        ((kind . "allow_always")
+                         (name . "Always Allow")
+                         (optionId . "allow-always"))
+                        ((kind . "reject_once")
+                         (name . "Deny")
+                         (optionId . "reject"))))
+         (actions (agent-shell--make-permission-actions acp-options t))
+         (deny (seq-find (lambda (action)
+                           (equal (map-elt action :kind) "reject_once"))
+                         actions))
+         (text (agent-shell--make-tool-call-permission-text
+                :tool-call (list (cons :title "Delete artifact")
+                                 (cons :permission-default-to-no t)
+                                 (cons :permission-actions actions))
+                :tool-call-id "tc-1"
+                :state (list (cons :buffer (current-buffer)))))
+         (keymaps (delq nil (mapcar (lambda (pos) (get-text-property pos 'keymap text))
+                                    (number-sequence 0 (1- (length text)))))))
+    (should keymaps)
+    (dolist (action actions)
+      (when (string-prefix-p "allow_" (map-elt action :kind))
+        (should-not (map-elt action :char))
+        (should (equal (map-elt action :option) (map-elt action :label)))))
+    (should (map-elt deny :char))
+    (dolist (map keymaps)
+      (should-not (lookup-key map "y"))
+      (should-not (lookup-key map "!")))
+    (should (seq-some (lambda (map)
+                        (functionp (lookup-key map (kbd (map-elt deny :char)))))
+                      keymaps))
+    ;; Without the flag the approve keys stay.
+    (should (equal "y" (map-elt (car (agent-shell--make-permission-actions acp-options))
+                                :char)))))
+
+(ert-deftest agent-shell--on-request-permission-default-to-no-test ()
+  "An AIR `defaultToNo' permission request offers rejecting first.
+It also keeps the request's reason for the dialog to show."
+  (let ((agent-shell--state (list (cons :buffer (current-buffer))
+                                  (cons :event-subscriptions nil)
+                                  (cons :tool-calls nil)
+                                  (cons :last-entry-type nil)
+                                  (cons :idle-timer nil))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _))))
+      (agent-shell--on-request
+       :state agent-shell--state
+       :acp-request `((id . "req-1")
+                      (method . "session/request_permission")
+                      (params . ((toolCall . ((toolCallId . "tc-1")
+                                              (title . "Delete artifact")
+                                              (status . "pending")
+                                              (kind . "other")))
+                                 (options . [((kind . "reject_once")
+                                              (name . "Deny")
+                                              (optionId . "reject"))
+                                             ((kind . "allow_once")
+                                              (name . "Allow")
+                                              (optionId . "allow"))])
+                                 (_meta . ((jetbrains
+                                            . ((air
+                                                . ((version . 1)
+                                                   (permission
+                                                    . ((version . 1)
+                                                       (title . "Delete artifact")
+                                                       (description . "Reason: This cannot be undone.")
+                                                       (defaultToNo . t)))))))))))))
+      (let ((tool-call (map-nested-elt agent-shell--state '(:tool-calls "tc-1"))))
+        (should (equal '("reject_once" "allow_once")
+                       (mapcar (lambda (action) (map-elt action :kind))
+                               (map-elt tool-call :permission-actions))))
+        (should (map-elt tool-call :permission-default-to-no))
+        (should (equal "Reason: This cannot be undone."
+                       (map-elt tool-call :permission-description)))))))
+
+(ert-deftest agent-shell--make-tool-call-permission-text-shows-default-to-no-reason-test ()
+  "Show the reason of a `defaultToNo' request, and only of such a request."
+  (let ((state (list (cons :buffer (current-buffer))))
+        (tool-call (list (cons :title "Delete artifact")
+                         (cons :permission-description "Reason: This cannot be undone.")
+                         (cons :permission-actions
+                               (agent-shell--make-permission-actions
+                                '(((kind . "reject_once")
+                                   (name . "Deny")
+                                   (optionId . "reject")))
+                                t)))))
+    (should-not (string-match-p
+                 "This cannot be undone"
+                 (agent-shell--make-tool-call-permission-text
+                  :tool-call tool-call :tool-call-id "tc-1" :state state)))
+    (should (string-match-p
+             "Reason: This cannot be undone\\."
+             (agent-shell--make-tool-call-permission-text
+              :tool-call (cons (cons :permission-default-to-no t) tool-call)
+              :tool-call-id "tc-1" :state state)))))
+
 (ert-deftest agent-shell--make-permission-actions-keeps-same-kind-order ()
   "Keep the agent's order among options sharing a kind.
 Only the first of a kind gets a keybinding, so re-ordering them would
