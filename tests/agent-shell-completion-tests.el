@@ -78,6 +78,47 @@ exit function runs, so these start from that state."
                          '("help" "compact"))))
       (kill-buffer shell))))
 
+(ert-deftest agent-shell-completion-command-with-colon-test ()
+  "Namespaced command names like mcp:server:prompt keep completing past `:'."
+  (let ((shell (generate-new-buffer " *agent-shell-completion-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell
+            (setq-local agent-shell--state
+                        '((:available-commands . (((name . "mcp:docs:search")
+                                                   (description . "Search docs")))))))
+          (with-temp-buffer
+            (setq-local agent-shell-completion--shell-buffer shell)
+            (insert "/mcp:do")
+            (let ((capf (agent-shell--command-completion-at-point)))
+              (should capf)
+              (should (equal (buffer-substring (nth 0 capf) (nth 1 capf))
+                             "mcp:do")))))
+      (kill-buffer shell))))
+
+(ert-deftest agent-shell-completion-command-annotation-hint-test ()
+  "A command's input hint shows in its annotation, ahead of its description."
+  (let ((shell (generate-new-buffer " *agent-shell-completion-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell
+            (setq-local agent-shell--state
+                        '((:available-commands . (((name . "mcp")
+                                                   (description . "Manage MCP servers")
+                                                   (input . ((hint . "[enable|disable]"))))
+                                                  ((name . "help")
+                                                   (description . "Show help")))))))
+          (with-temp-buffer
+            (setq-local agent-shell-completion--shell-buffer shell)
+            (insert "/")
+            (let ((annotate (plist-get (nthcdr 3 (agent-shell--command-completion-at-point))
+                                       :annotation-function)))
+              (should (equal (substring-no-properties (funcall annotate "mcp"))
+                             "  [enable|disable]  Manage MCP servers"))
+              (should (equal (substring-no-properties (funcall annotate "help"))
+                             "  Show help")))))
+      (kill-buffer shell))))
+
 (ert-deftest agent-shell-completion-company-prefix-length-test ()
   "A bare @ or / is enough for Company to pop, despite its minimum prefix."
   (let ((shell (agent-shell-completion-tests--make-shell)))

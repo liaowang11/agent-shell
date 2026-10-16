@@ -176,7 +176,8 @@ buffer.  Returns nil if the override is set but its buffer is dead."
 
 (defun agent-shell--command-completion-at-point ()
   "Complete available commands after /."
-  (when-let* ((bounds (agent-shell--completion-bounds "[:alnum:]_-" ?/))
+  ;; `:' joins namespaced names, as in mcp:server:prompt or plugin:skill.
+  (when-let* ((bounds (agent-shell--completion-bounds "[:alnum:]_:-" ?/))
               ;; Bounds start after /, so the / itself sits one char back.
               ((agent-shell-completion--command-start-p (1- (map-elt bounds :start))))
               (source (or (and (buffer-live-p agent-shell-completion--shell-buffer)
@@ -186,7 +187,11 @@ buffer.  Returns nil if the override is set but its buffer is dead."
                                  :available-commands))
               (descriptions (mapcar (lambda (c)
                                       (cons (map-elt c 'name)
-                                            (map-elt c 'description)))
+                                            (string-join
+                                             (delq nil
+                                                   (list (map-nested-elt c '(input hint))
+                                                         (map-elt c 'description)))
+                                             "  ")))
                                     commands)))
     (list (map-elt bounds :start) (map-elt bounds :end)
           (mapcar #'car descriptions)
@@ -195,7 +200,8 @@ buffer.  Returns nil if the override is set but its buffer is dead."
           :company-prefix-length t
           :annotation-function
           (lambda (name)
-            (when-let* ((desc (map-elt descriptions name)))
+            (when-let* ((desc (map-elt descriptions name))
+                        ((not (string-empty-p desc))))
               (concat "  " desc)))
           :company-kind (lambda (_) 'function)
           :exit-function #'agent-shell--capf-exit-with-space)))
