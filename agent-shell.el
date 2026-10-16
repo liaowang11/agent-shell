@@ -4810,6 +4810,15 @@ notifications do."
             state (map-nested-elt acp-request '(params sessionId))))))
     (agent-shell--dispatch-request :state state :acp-request acp-request)))
 
+(defun agent-shell--permission-default-to-no-p (acp-request)
+  "Return non-nil if permission ACP-REQUEST must not default to approving.
+
+claude-agent-acp sets `_meta.jetbrains.air.permission.defaultToNo' when
+Claude Code asks that a stray keystroke not approve the request."
+  (eq (map-nested-elt acp-request
+                      '(params _meta jetbrains air permission defaultToNo))
+      t))
+
 (cl-defun agent-shell--dispatch-request (&key state acp-request)
   "Handle ACP-REQUEST using STATE, as `agent-shell--on-request' bound it."
   (cond ((equal (map-elt acp-request 'method) "session/request_permission")
@@ -4820,7 +4829,19 @@ notifications do."
                         (cons :kind (map-nested-elt acp-request '(params toolCall kind)))
                         (cons :permission-request-id (map-elt acp-request 'id))
                         (cons :permission-actions (agent-shell--make-permission-actions
-                                                   (map-nested-elt acp-request '(params options)))))
+                                                   (map-nested-elt acp-request '(params options))
+                                                   (agent-shell--permission-default-to-no-p acp-request))))
+                  ;; claude-agent-acp marks a request that a stray keystroke
+                  ;; must not approve, and gives its reason, in the AIR
+                  ;; permission record.
+                  (when (agent-shell--permission-default-to-no-p acp-request)
+                    (list (cons :permission-default-to-no t)))
+                  (when-let* ((description (map-nested-elt
+                                            acp-request
+                                            '(params _meta jetbrains air permission description)))
+                              ((stringp description))
+                              ((not (string-empty-p description))))
+                    (list (cons :permission-description description)))
                   (when-let* ((raw-input (map-nested-elt acp-request '(params toolCall rawInput))))
                     (list (cons :raw-input raw-input)))
                   (when-let* ((content (map-nested-elt acp-request '(params toolCall content))))
@@ -4836,7 +4857,8 @@ notifications do."
                       (funcall agent-shell-permission-responder-function
                                (list (cons :tool-call (map-nested-elt state (list :tool-calls tool-call-id)))
                                      (cons :options (agent-shell--make-permission-actions
-                                                     (map-nested-elt acp-request '(params options))))
+                                                     (map-nested-elt acp-request '(params options))
+                                                     (agent-shell--permission-default-to-no-p acp-request)))
                                      (cons :respond (lambda (option-id)
                                                       (agent-shell--send-permission-response
                                                        :client (map-elt state :client)
@@ -13040,6 +13062,10 @@ For example:
                                    (agent-shell-interrupt t))))
                    map))
          (title (agent-shell--permission-title :tool-call tool-call))
+         ;; Only a request that defaults to no shows its reason: the agent
+         ;; sends one with many ordinary requests too.
+         (reason (when (map-elt tool-call :permission-default-to-no)
+                   (map-elt tool-call :permission-description)))
          (diff-button (when (map-elt tool-call :diffs)
                         (agent-shell--make-permission-button
                          :text "View (v)"
@@ -13057,7 +13083,7 @@ For example:
                          :option "view diff"))))
     (format "╭─
 
-    %s %s %s%s
+    %s %s %s%s%s
 
 
     %s%s
@@ -13073,6 +13099,11 @@ For example:
                 (propertize
                  (format "\n\n\n    %s" title)
                  'font-lock-face 'agent-shell-input)
+              "")
+            (if reason
+                (propertize
+                 (concat "\n\n    " (string-replace "\n" "\n    " reason))
+                 'font-lock-face 'agent-shell-warning)
               "")
             (if diff-button
                 (concat diff-button " ")
@@ -13306,35 +13337,51 @@ CHAR and OPTION are used for cursor sensor messages."
   "Display order for permission options, by ACP kind.
 
 Agents send options in whichever order they like (some list rejection
-first), but the dialog always offers allowing before rejecting.")
+first), but the dialog offers allowing before rejecting, unless the
+agent marks the request `defaultToNo'.  See
+`agent-shell--permission-decline-first-kind-order'.")
 
-(defun agent-shell--permission-action-rank (action)
+(defconst agent-shell--permission-decline-first-kind-order
+  '("reject_once" "reject_always" "allow_once" "allow_always")
+  "Display order for permission options the agent asks to default to no.
+
+Point lands on the first button, so a stray RET must not approve.")
+
+(defun agent-shell--permission-action-rank (action &optional decline-first)
   "Return the sort rank of ACTION, derived from its ACP kind.
 
-Unknown kinds sort last.  See `agent-shell--permission-kind-order'."
-  (or (seq-position agent-shell--permission-kind-order (map-elt action :kind))
-      (length agent-shell--permission-kind-order)))
+Unknown kinds sort last.  See `agent-shell--permission-kind-order', or
+`agent-shell--permission-decline-first-kind-order' when DECLINE-FIRST."
+  (let ((order (if decline-first
+                   agent-shell--permission-decline-first-kind-order
+                 agent-shell--permission-kind-order)))
+    (or (seq-position order (map-elt action :kind))
+        (length order))))
 
-(defun agent-shell--make-permission-actions (acp-options)
+(defun agent-shell--make-permission-actions (acp-options &optional decline-first)
   "Make actions from ACP-OPTIONS for shell rendering.
 
 Actions are sorted by `agent-shell--permission-kind-order', ignoring the
-order the agent sent them in.
+order the agent sent them in.  When DECLINE-FIRST, as for a request the
+agent marks `defaultToNo', they are sorted by
+`agent-shell--permission-decline-first-kind-order' instead, and allow
+actions get no key, so only RET or a click on one approves.
 
 See `agent-shell--make-permission-action' for ACP-OPTION and return schema."
   (let (acp-seen-kinds)
     (seq-sort (lambda (a b)
-                (< (agent-shell--permission-action-rank a)
-                   (agent-shell--permission-action-rank b)))
+                (< (agent-shell--permission-action-rank a decline-first)
+                   (agent-shell--permission-action-rank b decline-first)))
               (delq nil (mapcar (lambda (acp-option)
                                   (let ((action (agent-shell--make-permission-action
                                                  :acp-option acp-option
-                                                 :acp-seen-kinds acp-seen-kinds)))
+                                                 :acp-seen-kinds acp-seen-kinds
+                                                 :no-allow-keys decline-first)))
                                     (push (map-elt acp-option 'kind) acp-seen-kinds)
                                     action))
                                 acp-options)))))
 
-(cl-defun agent-shell--make-permission-action (&key acp-option acp-seen-kinds)
+(cl-defun agent-shell--make-permission-action (&key acp-option acp-seen-kinds no-allow-keys)
   "Convert a single ACP-OPTION to an action alist.
 
 ACP-OPTION should be a PermissionOption per ACP spec:
@@ -13348,7 +13395,8 @@ ACP-OPTION should be a PermissionOption per ACP spec:
    (\\='optionId . \"allow\"))
 
 ACP-SEEN-KINDS is a list of kinds already processed.  If kind is in
-ACP-SEEN-KINDS, omit the keybinding to avoid duplicates.
+ACP-SEEN-KINDS, omit the keybinding to avoid duplicates.  When
+NO-ALLOW-KEYS, omit the keybinding of allow kinds as well.
 
 Returns an alist of the form:
 
@@ -13366,7 +13414,9 @@ Returns nil if the ACP-OPTION kind is not recognized."
                                                                                  agent-shell-mode-map t)))
                                            "n"))))
          (kind (map-elt acp-option 'kind))
-         (char (unless (member kind acp-seen-kinds)
+         (char (unless (or (member kind acp-seen-kinds)
+                           (and no-allow-keys
+                                (member kind '("allow_once" "allow_always"))))
                  (map-elt char-map kind)))
          (name (map-elt acp-option 'name)))
     (when (map-elt char-map kind)
