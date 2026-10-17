@@ -29,6 +29,7 @@
   (require 'cl-lib))
 (require 'shell-maker)
 (require 'acp)
+(require 'agent-shell-prompt-suggestion)
 
 (declare-function agent-shell--air-client-capabilities-meta "agent-shell")
 (declare-function agent-shell--indent-string "agent-shell")
@@ -161,11 +162,15 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    ;; The subagents RFD: `subagent_update' on the parent and
    ;; `session_message' to each child.
    :client-capabilities '((subagents . ()))
-   :session-meta '((claudeCode
+   :session-meta `((claudeCode
                     . ((options
                         . ((thinking
                             . ((type . "adaptive")
-                               (display . "summarized")))))
+                               (display . "summarized")))
+                           ;; claude-agent-acp asks Claude Code to predict
+                           ;; the next prompt unless told not to.
+                           ,@(unless agent-shell-prompt-suggestions
+                               '((promptSuggestions . :false)))))
                        ;; Forward the CLI's git change messages as
                        ;; `_claude/sdkMessage' (see `vcs-state-changed'
                        ;; in `agent-shell-subscribe-to').
