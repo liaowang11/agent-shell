@@ -102,6 +102,10 @@
 (declare-function agent-shell--render-markdown-body "agent-shell")
 (declare-function agent-shell-completion--setup "agent-shell-completion")
 (declare-function agent-shell-yank-dwim "agent-shell")
+(declare-function agent-shell--prompt-suggestion-text "agent-shell-prompt-suggestion")
+(declare-function agent-shell--prompt-suggestion-refresh "agent-shell-prompt-suggestion")
+(declare-function agent-shell--prompt-suggestion-remove "agent-shell-prompt-suggestion")
+(declare-function agent-shell--prompt-suggestion-after-change "agent-shell-prompt-suggestion")
 
 (defvar-local agent-shell-viewport--clean-up t)
 
@@ -136,6 +140,12 @@ which changes out from under a stale comparison.")
   "Current index into `comint-input-ring' for history navigation.")
 ;; Survives mode switches (edit <-> view) which clear buffer-local vars.
 (put 'agent-shell-viewport--ring-index 'permanent-local t)
+
+(defvar-local agent-shell-viewport--at-suggestion nil
+  "Non-nil while the compose buffer holds the suggestion M-n inserted.
+`agent-shell-viewport--compose-snapshot' then holds the draft it replaced.")
+;; Survives mode switches (edit <-> view) which clear buffer-local vars.
+(put 'agent-shell-viewport--at-suggestion 'permanent-local t)
 
 (defvar-local agent-shell-viewport--edit-pending-index nil
   "Index of the pending prompt this compose buffer is editing, or nil.
@@ -279,6 +289,7 @@ that reset only some of them would carry a stale peek or ring index into
 the next draft."
   (setq agent-shell-viewport--compose-snapshot nil)
   (setq agent-shell-viewport--ring-index nil)
+  (setq agent-shell-viewport--at-suggestion nil)
   (setq agent-shell-viewport--page-cursor nil))
 
 (defun agent-shell-viewport--recenter ()
@@ -687,6 +698,9 @@ Optionally set its PROMPT and RESPONSE."
     ;; the next compose.
     (setq agent-shell-viewport--edit-pending-index nil
           agent-shell-viewport--edit-pending-prompt nil)
+    ;; Likewise the suggestion: `agent-shell-viewport-next-history' marks
+    ;; it after inserting it through here.
+    (setq agent-shell-viewport--at-suggestion nil)
     (when prompt
       (insert
        (if (derived-mode-p 'agent-shell-viewport-view-mode)
@@ -715,6 +729,9 @@ Optionally set its PROMPT and RESPONSE."
     ;; Keep the compose spacer tied to the actual buffer contents, even
     ;; when tests or callers stub header rendering.
     (agent-shell-viewport--sync-layout-spacer)
+    ;; An empty compose buffer shows the suggested prompt in gray.
+    ;; `erase-buffer' on an already empty buffer runs no change hook.
+    (agent-shell--prompt-suggestion-refresh)
     ;; TODO: Render prompt markdown?
     ))
 
@@ -836,6 +853,24 @@ buffer."
   (interactive)
   (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
     (user-error "Not in a shell viewport buffer"))
+  (if agent-shell-viewport--at-suggestion
+      ;; Back from the suggestion to the draft it replaced, edits to the
+      ;; suggestion included.
+      (agent-shell-viewport--restore-compose-snapshot)
+    (agent-shell-viewport--previous-history)))
+
+(defun agent-shell-viewport--restore-compose-snapshot ()
+  "Put back the draft saved in `agent-shell-viewport--compose-snapshot'."
+  (let ((snapshot agent-shell-viewport--compose-snapshot))
+    (setq agent-shell-viewport--ring-index nil)
+    (agent-shell-viewport--initialize)
+    (when snapshot
+      (insert (map-elt snapshot :content))
+      (goto-char (map-elt snapshot :location))
+      (setq agent-shell-viewport--compose-snapshot nil))))
+
+(defun agent-shell-viewport--previous-history ()
+  "Insert the previous prompt from history into the compose buffer."
   (let* ((ring (with-current-buffer (agent-shell-viewport--shell-buffer)
                  (seq-filter
                   (lambda (item)
@@ -865,32 +900,45 @@ buffer."
        :prompt (seq-elt ring agent-shell-viewport--ring-index)))))
 
 (defun agent-shell-viewport-next-history ()
-  "Insert next prompt from history into compose buffer."
+  "Insert next prompt from history into compose buffer.
+
+Past the newest entry, inserts the prompt the agent predicts you will
+send next, saving the draft it replaces for
+\\[agent-shell-viewport-previous-history] to restore.  See
+`agent-shell-prompt-suggestions'."
   (declare (modes agent-shell-viewport-edit-mode))
   (interactive)
   (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
     (user-error "Not in a shell viewport buffer"))
-  (unless agent-shell-viewport--ring-index
-    (user-error "No more history"))
-  (let* ((ring (with-current-buffer (agent-shell-viewport--shell-buffer)
-                 (seq-filter
-                  (lambda (item)
-                    (not (string-empty-p item)))
-                  (ring-elements comint-input-ring))))
-         (next-index (1- agent-shell-viewport--ring-index)))
-    (if (< next-index 0)
-        ;; Past newest entry, restore in-progress compose text.
-        (let ((snapshot agent-shell-viewport--compose-snapshot))
-          (setq agent-shell-viewport--ring-index nil)
-          (agent-shell-viewport--initialize)
-          (when snapshot
-            (insert (map-elt snapshot :content))
-            (goto-char (map-elt snapshot :location))
-            (setq agent-shell-viewport--compose-snapshot nil)))
-      ;; Show older entry.
-      (setq agent-shell-viewport--ring-index next-index)
-      (agent-shell-viewport--initialize
-       :prompt (seq-elt ring next-index)))))
+  (cond
+   (agent-shell-viewport--at-suggestion
+    (user-error "End of future history"))
+   (agent-shell-viewport--ring-index
+    (let* ((ring (with-current-buffer (agent-shell-viewport--shell-buffer)
+                   (seq-filter
+                    (lambda (item)
+                      (not (string-empty-p item)))
+                    (ring-elements comint-input-ring))))
+           (next-index (1- agent-shell-viewport--ring-index)))
+      (if (< next-index 0)
+          ;; Past newest entry, restore in-progress compose text.
+          (agent-shell-viewport--restore-compose-snapshot)
+        ;; Show older entry.
+        (setq agent-shell-viewport--ring-index next-index)
+        (agent-shell-viewport--initialize
+         :prompt (seq-elt ring next-index)))))
+   ((agent-shell--prompt-suggestion-text)
+    ;; Past the draft, into future history.  Saved the way
+    ;; `agent-shell-viewport-previous-history' saves it, so a draft
+    ;; already parked by paging is kept.
+    (unless agent-shell-viewport--compose-snapshot
+      (setq agent-shell-viewport--compose-snapshot
+            `((:content . ,(buffer-string))
+              (:location . ,(point)))))
+    (agent-shell-viewport--initialize :prompt (agent-shell--prompt-suggestion-text))
+    (setq agent-shell-viewport--at-suggestion t))
+   (t
+    (user-error "No more history"))))
 
 (defun agent-shell-viewport-search-history ()
   "Search prompt history, select, and insert into compose buffer.
@@ -2218,6 +2266,10 @@ For example, offer to kill associated shell session."
   (agent-shell-viewport--update-header)
   (let ((inhibit-read-only t))
     (erase-buffer))
+  (add-hook 'after-change-functions #'agent-shell--prompt-suggestion-after-change nil t)
+  ;; The gray text belongs to the compose page; view mode shows none.
+  (add-hook 'change-major-mode-hook #'agent-shell--prompt-suggestion-remove nil t)
+  (agent-shell--prompt-suggestion-refresh)
   (add-hook 'kill-buffer-hook #'agent-shell-viewport--clean-up nil t))
 
 (define-derived-mode agent-shell-viewport-view-mode text-mode "Agent Shell Viewport (View)"

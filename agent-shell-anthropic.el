@@ -37,6 +37,7 @@
 (declare-function agent-shell-make-agent-config "agent-shell")
 (autoload 'agent-shell-make-agent-config "agent-shell")
 (declare-function agent-shell--dwim "agent-shell")
+(defvar agent-shell-prompt-suggestions)
 
 (cl-defun agent-shell-anthropic-make-authentication (&key api-key login oauth)
   "Create anthropic authentication configuration.
@@ -161,11 +162,15 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    ;; The subagents RFD: `subagent_update' on the parent and
    ;; `session_message' to each child.
    :client-capabilities '((subagents . ()))
-   :session-meta '((claudeCode
+   :session-meta `((claudeCode
                     . ((options
                         . ((thinking
                             . ((type . "adaptive")
-                               (display . "summarized")))))
+                               (display . "summarized")))
+                           ;; claude-agent-acp asks Claude Code to predict
+                           ;; the next prompt unless told not to.
+                           ,@(unless agent-shell-prompt-suggestions
+                               '((promptSuggestions . :false)))))
                        ;; Forward the CLI's git change messages as
                        ;; `_claude/sdkMessage' (see `vcs-state-changed'
                        ;; in `agent-shell-subscribe-to').

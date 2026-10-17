@@ -1285,6 +1285,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-prefer-viewport-interaction       | Non-nil makes ‘agent-shell’ prefer viewport interaction over shell interaction. |
 | agent-shell-preferred-agent-config            | Default agent to use for all new shells.                                        |
 | agent-shell-prompt-busy-frames                | Frames animating the live prompt’s marker while the agent works.                |
+| agent-shell-prompt-suggestions                | How to offer the prompt the agent predicts you will send next.                  |
 | agent-shell-qoder-acp-command                 | Command and parameters for the Qoder CLI ACP server.                            |
 | agent-shell-qoder-environment                 | Environment variables for the Qoder CLI ACP server.                             |
 | agent-shell-qwen-acp-command                  | Command and parameters for the Qwen Code client.                                |
@@ -1431,7 +1432,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-new-temp-shell                              | Start a new agent shell in a temporary directory.                             |
 |                                                       | agent-shell-new-worktree-shell                          | Create a new git worktree and start an agent shell in it.                     |
 | S-<return>                                            | agent-shell-newline                                     | Insert a newline, and move to left margin of the new line.                    |
-| C-<down> or M-n                                       | agent-shell-next-input                                  | Cycle forwards through input history.                                         |
+| C-<down> or M-n                                       | agent-shell-next-input                                  | Cycle forwards through input history, then to the suggested prompt.           |
 | n or TAB                                              | agent-shell-next-item                                   | Go to next item.                                                              |
 |                                                       | agent-shell-next-permission-button                      | Jump to the next button.                                                      |
 |                                                       | agent-shell-omp-start                                   | Start an interactive Oh My Pi (omp) agent shell.                              |
