@@ -2270,6 +2270,9 @@ For example, offer to kill associated shell session."
   ;; The gray text belongs to the compose page; view mode shows none.
   (add-hook 'change-major-mode-hook #'agent-shell--prompt-suggestion-remove nil t)
   (agent-shell--prompt-suggestion-refresh)
+  ;; A major-mode change keeps `buffer-undo-list', so without this undo
+  ;; in compose brings back the pages view mode erased and inserted.
+  (setq buffer-undo-list nil)
   (add-hook 'kill-buffer-hook #'agent-shell-viewport--clean-up nil t))
 
 (define-derived-mode agent-shell-viewport-view-mode text-mode "Agent Shell Viewport (View)"
