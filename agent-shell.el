@@ -5,7 +5,7 @@
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
 ;; Version: 0.87.10
-;; Package-Requires: ((emacs "29.1") (shell-maker "0.97.5") (acp "0.17.1"))
+;; Package-Requires: ((emacs "29.1") (shell-maker "0.97.7") (acp "0.17.1"))
 
 (defconst agent-shell--version "0.87.10")
 
@@ -14,7 +14,7 @@
 ;; header on install; those that only resolve dependency names (straight.el,
 ;; for one) leave `agent-shell--start' as the sole check, so keep these two
 ;; in sync with it.
-(defconst agent-shell--shell-maker-minimum-version "0.97.5")
+(defconst agent-shell--shell-maker-minimum-version "0.97.7")
 
 (defconst agent-shell--acp-minimum-version "0.17.1")
 
