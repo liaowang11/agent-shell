@@ -929,6 +929,29 @@ carry it, or the text lands in the input area after the prompt."
     (should (string-search "Claude> " text late))
     (should (string-match-p "Claude> \\'" text))))
 
+(ert-deftest agent-shell-out-of-turn-compaction-renders-above-prompt-test ()
+  "A compaction with no request in flight renders above the prompt.
+
+claude-agent-acp compacts an idle session on its own shortly before its
+prompt cache expires, so its `compaction_update's arrive after the turn
+ended, like a background subagent's output.  Without above-prompt
+placement the card lands in the input area after the prompt."
+  (let* ((rendered
+          (agent-shell-tests--subagent-shell
+           (lambda (send end-turn _prompt)
+             (funcall end-turn)
+             (funcall send "root" '(sessionUpdate . "compaction_update")
+                      '(compactionId . "c1") '(status . "in_progress"))
+             (funcall send "root" '(sessionUpdate . "compaction_update")
+                      '(compactionId . "c1") '(status . "completed")
+                      '(summary . [((type . "text") (text . "Summary of the work"))])))))
+         (text (map-elt rendered :text))
+         (card (string-search "Compact conversation" text)))
+    (should card)
+    ;; The live prompt still follows the card.
+    (should (string-search "Claude> " text card))
+    (should (string-match-p "Claude> \\'" text))))
+
 (ert-deftest agent-shell-subagent-row-name-opens-its-buffer-test ()
   "RET on the name in a subagent's row opens its buffer.
 

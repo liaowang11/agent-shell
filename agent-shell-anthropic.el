@@ -160,8 +160,12 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    ;; the client naming them here (see async-tasks.ts, session-index/).
    :initialize-meta (agent-shell--air-client-capabilities-meta)
    ;; The subagents RFD: `subagent_update' on the parent and
-   ;; `session_message' to each child.
-   :client-capabilities '((subagents . ()))
+   ;; `session_message' to each child.  `session.compaction' asks for
+   ;; `compaction_update' instead of the synthetic "Compact conversation"
+   ;; tool call; without it a restored session replays the compaction
+   ;; summary as its first user prompt.
+   :client-capabilities '((subagents . ())
+                          (session . ((compaction . ()))))
    :session-meta `((claudeCode
                     . ((options
                         . ((thinking
