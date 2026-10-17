@@ -1368,6 +1368,7 @@ nonblank content also folds the current group.
 | agent-shell-preferred-agent-config             | Default agent to use for all new shells.                                        |
 | agent-shell-prompt-busy-frames                 | Frames animating the live prompt’s marker while the agent works.                |
 | agent-shell-prompt-queue-merge                 | Whether queued prompts are sent together as a single prompt.                    |
+| agent-shell-prompt-suggestions                 | How to offer the prompt the agent predicts you will send next.                  |
 | agent-shell-qoder-acp-command                  | Command and parameters for the Qoder CLI ACP server.                            |
 | agent-shell-qoder-environment                  | Environment variables for the Qoder CLI ACP server.                             |
 | agent-shell-qwen-acp-command                   | Command and parameters for the Qwen Code client.                                |
