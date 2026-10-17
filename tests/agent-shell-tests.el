@@ -9631,6 +9631,129 @@ agent activity; consecutive user chunks stay in the same turn."
       (agent-shell--append-restore-notification state notif))
     (should (= 1 (length (agent-shell-tests--pending-restore-prompt-turns state))))))
 
+(defun agent-shell-tests--make-compaction-update (kind &rest fields)
+  "Build a `session/update' notification of KIND carrying FIELDS.
+FIELDS is an alist of the update's other keys, such as `compactionId'."
+  `((method . "session/update")
+    (params . ((update . ((sessionUpdate . ,kind) ,@(car fields)))))))
+
+(defun agent-shell-tests--compaction-content-text (notification)
+  "Return the text of NOTIFICATION's first tool-call content block."
+  (map-nested-elt (aref (map-nested-elt notification '(params update content)) 0)
+                  '(content text)))
+
+(ert-deftest agent-shell--compaction-as-tool-call-opens-a-tool-call-test ()
+  "The first update for a compaction opens the tool call the legacy path drew."
+  (let* ((state (list (cons :tool-calls nil) (cons :compaction-summaries nil)))
+         (notification (agent-shell--compaction-as-tool-call
+                        state
+                        '((sessionUpdate . "compaction_update")
+                          (compactionId . "c1")
+                          (status . "in_progress")))))
+    (should (equal (map-nested-elt notification '(params update sessionUpdate)) "tool_call"))
+    (should (equal (map-nested-elt notification '(params update toolCallId)) "c1"))
+    (should (equal (map-nested-elt notification '(params update title)) "Compact conversation"))
+    (should (equal (map-nested-elt notification '(params update kind)) "think"))
+    (should (equal (map-nested-elt notification '(params update status)) "in_progress"))))
+
+(ert-deftest agent-shell--compaction-as-tool-call-updates-a-known-one-test ()
+  "A later update for the same compaction updates its tool call with the summary."
+  (let* ((state (list (cons :tool-calls '(("c1" . ((:title . "Compact conversation")))))
+                      (cons :compaction-summaries nil)))
+         (notification (agent-shell--compaction-as-tool-call
+                        state
+                        '((sessionUpdate . "compaction_update")
+                          (compactionId . "c1")
+                          (status . "completed")
+                          (summary . [((type . "text") (text . "We fixed restore."))])))))
+    (should (equal (map-nested-elt notification '(params update sessionUpdate))
+                   "tool_call_update"))
+    (should (equal (map-nested-elt notification '(params update status)) "completed"))
+    (should (equal (agent-shell-tests--compaction-content-text notification)
+                   "We fixed restore."))))
+
+(ert-deftest agent-shell--compaction-as-tool-call-accumulates-summary-chunks-test ()
+  "Streamed summary chunks build up the tool call's content."
+  (let ((state (list (cons :tool-calls '(("c1" . ((:title . "Compact conversation")))))
+                     (cons :compaction-summaries nil))))
+    (agent-shell--compaction-as-tool-call
+     state '((sessionUpdate . "compaction_summary_chunk")
+             (compactionId . "c1")
+             (content . ((type . "text") (text . "We fixed ")))))
+    (let ((notification (agent-shell--compaction-as-tool-call
+                         state '((sessionUpdate . "compaction_summary_chunk")
+                                 (compactionId . "c1")
+                                 (content . ((type . "text") (text . "restore.")))))))
+      (should (equal (map-nested-elt notification '(params update status)) "in_progress"))
+      (should (equal (agent-shell-tests--compaction-content-text notification)
+                     "We fixed restore.")))
+    ;; A terminal update without its own summary keeps the streamed one.
+    (let ((notification (agent-shell--compaction-as-tool-call
+                         state '((sessionUpdate . "compaction_update")
+                                 (compactionId . "c1")
+                                 (status . "completed")))))
+      (should (equal (agent-shell-tests--compaction-content-text notification)
+                     "We fixed restore.")))))
+
+(ert-deftest agent-shell--compaction-as-tool-call-reports-failure-test ()
+  "A failed compaction shows its error; a cancelled one reads as interrupted."
+  (let* ((state (list (cons :tool-calls nil) (cons :compaction-summaries nil)))
+         (failed (agent-shell--compaction-as-tool-call
+                  state '((sessionUpdate . "compaction_update")
+                          (compactionId . "c1")
+                          (status . "failed")
+                          (error . "context too small"))))
+         (cancelled (agent-shell--compaction-as-tool-call
+                     state '((sessionUpdate . "compaction_update")
+                             (compactionId . "c2")
+                             (status . "cancelled")))))
+    (should (equal (map-nested-elt failed '(params update status)) "failed"))
+    (should (equal (agent-shell-tests--compaction-content-text failed)
+                   "Compaction failed: context too small"))
+    (should (equal (map-nested-elt cancelled '(params update status)) "interrupted"))))
+
+(ert-deftest agent-shell--dispatch-notification-renders-compaction-as-tool-call-test ()
+  "`compaction_update' renders through the tool-call path, not as unhandled."
+  (let ((state (list (cons :buffer (current-buffer))
+                     (cons :tool-calls nil)
+                     (cons :compaction-summaries nil)
+                     (cons :last-entry-type nil)))
+        rendered)
+    (cl-letf (((symbol-function 'agent-shell--render-tool-call-fragment)
+               (lambda (&rest args) (push (plist-get args :tool-call-id) rendered)))
+              ((symbol-function 'agent-shell--emit-event) #'ignore)
+              ((symbol-function 'agent-shell--cancel-idle-timer) #'ignore)
+              ((symbol-function 'agent-shell--activity-group-note-entry-type) #'ignore))
+      (agent-shell--dispatch-notification
+       :state state
+       :acp-notification (agent-shell-tests--make-compaction-update
+                          "compaction_update"
+                          '((compactionId . "c1") (status . "completed")
+                            (summary . [((type . "text") (text . "Summary."))])))))
+    (should (equal rendered '("c1")))
+    (should (equal (map-nested-elt state '(:tool-calls "c1" :title))
+                   "Compact conversation"))
+    (should (equal (map-nested-elt state '(:tool-calls "c1" :status)) "completed"))))
+
+(ert-deftest agent-shell--pending-restore-keeps-compaction-with-the-first-prompt-test ()
+  "A replayed compaction opens the first turn instead of becoming a prompt.
+`first-last' then shows the compaction followed by the first real prompt."
+  (let ((state (list (cons :pending-restore (agent-shell--make-pending-restore)))))
+    (dolist (notif (list
+                    (agent-shell-tests--make-compaction-update
+                     "compaction_update" '((compactionId . "c1") (status . "completed")))
+                    (agent-shell-tests--make-session-update "user_message_chunk" "first")
+                    (agent-shell-tests--make-session-update "agent_message_chunk" "answer")
+                    (agent-shell-tests--make-session-update "user_message_chunk" "second")
+                    (agent-shell-tests--make-session-update "agent_message_chunk" "done")))
+      (agent-shell--append-restore-notification state notif))
+    (let ((prompt-turns (agent-shell-tests--pending-restore-prompt-turns state)))
+      (should (= 2 (length prompt-turns)))
+      (should (equal (mapcar (lambda (notif)
+                               (map-nested-elt notif '(params update sessionUpdate)))
+                             (nth 0 prompt-turns))
+                     '("compaction_update" "user_message_chunk" "agent_message_chunk"))))))
+
 (cl-defun agent-shell-tests--render-pending-restore
     (&key last-entry-type typed-input undo kill-input transcript-file)
   "Restore a single replayed turn ending in LAST-ENTRY-TYPE.
