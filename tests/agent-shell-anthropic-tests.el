@@ -164,5 +164,14 @@ claude-agent-acp forwards only the raw SDK messages a session's
                                    '(:params _meta))
                    meta))))
 
+(ert-deftest agent-shell-anthropic-claude-code-advertises-compaction-test ()
+  "Claude Code is told this client renders `compaction_update'.
+Without it, claude-agent-acp replays a compacted session's summary as
+the first user prompt."
+  (let ((config (agent-shell-anthropic-make-claude-code-config)))
+    (should (assq 'compaction
+                  (map-elt (map-elt config :client-capabilities) 'session)))
+    (should (assq 'subagents (map-elt config :client-capabilities)))))
+
 (provide 'agent-shell-anthropic-tests)
 ;;; agent-shell-anthropic-tests.el ends here
