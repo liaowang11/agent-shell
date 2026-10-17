@@ -8780,6 +8780,52 @@ syntax."
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
 
+(ert-deftest agent-shell-viewport-refresh-relays-out-tables-for-its-window-test ()
+  "A page copied from the shell re-lays out its tables for the viewport window.
+Regression: the shell lays a table out for its own window, or with
+`string-width' when it is off-screen, which is the usual case while the
+viewport replaces it.  Paging copies that layout in, and replacing the
+viewport's content fires no window-change hook, so the table kept the
+wrong width until a buffer switch triggered the realign."
+  (let* ((table (with-temp-buffer
+                  (insert "| A | B |\n|---|---|\n| 1 | 2 |\n")
+                  (agent-shell-markdown-replace-markup)
+                  (buffer-string)))
+         (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+         (shell-buffer (generate-new-buffer " *agent-shell shell*"))
+         (window (selected-window))
+         (previous-buffer (window-buffer window)))
+    ;; Laid out off-screen: no window width to remember.
+    (should-not (get-text-property 0 'agent-shell-markdown-table-width table))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-view-mode))
+          (set-window-buffer window viewport-buffer)
+          (cl-letf (((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell-interaction-at-point)
+                     (lambda () `((:prompt . "Prompt\n\n")
+                                  (:response . ,table))))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-refresh)
+            (let ((start (text-property-any (point-min) (point-max)
+                                            'agent-shell-markdown-table-source
+                                            (get-text-property
+                                             0 'agent-shell-markdown-table-source
+                                             table))))
+              (should start)
+              (should (equal (get-text-property
+                              start 'agent-shell-markdown-table-width)
+                             (window-body-width window t))))))
+      (set-window-buffer window previous-buffer)
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell-viewport-showing-latest-reads-history-position-alist-test ()
   "Test `agent-shell-viewport--showing-latest-p' reads history position alists."
   (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
