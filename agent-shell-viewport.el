@@ -761,7 +761,14 @@ Optionally set its PROMPT and RESPONSE."
                        'font-lock-face 'agent-shell-viewport-prompt)
          prompt)))
     (when response
-      (insert response))
+      (insert response)
+      ;; RESPONSE is the shell's rendered text, with tables and images
+      ;; laid out for the shell's window, or for none while the
+      ;; viewport replaces it.  Replacing content fires no window-change
+      ;; hook (see `agent-shell--realign-on-change'), so re-lay them out
+      ;; for this buffer's window now.  A no-op when it isn't shown.
+      (agent-shell-markdown-rerender-tables)
+      (agent-shell-markdown-rerender-images))
     ;; Re-render the header from the freshly-cached position.  Without
     ;; this, callers that set content via this function (e.g.
     ;; `agent-shell-viewport-refresh' on switch) leave the header showing
