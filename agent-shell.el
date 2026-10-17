@@ -1449,6 +1449,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :request-count 0)
         (cons :last-activity-time nil)
         (cons :tool-calls nil)
+        (cons :compaction-summaries nil)
         (cons :elicitations nil)
         (cons :available-commands nil)
         (cons :available-modes nil)
@@ -4208,6 +4209,12 @@ around this call to reflect whether the update arrived out of turn."
           ;; replayed through the normal dispatch path.
           ((map-elt state :pending-restore)
            (agent-shell--append-restore-notification state acp-notification))
+          ((member (map-nested-elt acp-notification '(params update sessionUpdate))
+                   '("compaction_update" "compaction_summary_chunk"))
+           (agent-shell--dispatch-notification
+            :state state
+            :acp-notification (agent-shell--compaction-as-tool-call
+                               state (map-nested-elt acp-notification '(params update)))))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "agent_message_chunk")
            ;; Decide message boundaries by ACP's `messageId' when present:
            ;; distinct messages must never coalesce, even if an interleaved
@@ -5725,6 +5732,56 @@ DIFFS is a list of diff infos as returned by
                    (agent-shell--live-input-prompt-p comint-last-prompt))
         (agent-shell--finish-output :config shell-maker--config
                                    :success t)))))
+
+(defun agent-shell--compaction-as-tool-call (state update)
+  "Return the tool-call notification that renders compaction UPDATE in STATE.
+
+UPDATE is a `compaction_update' or `compaction_summary_chunk' from the
+ACP session-compaction contract.  It is drawn as the \"Compact
+conversation\" tool call agents send to clients without that
+capability, so live and replayed compactions look the same as before;
+the difference is that the summary arrives as the tool call's content
+rather than as a user prompt.  Summary chunks accumulate in STATE's
+`:compaction-summaries'; a terminal update with its own summary
+replaces them.  A cancelled compaction reads as interrupted, the
+closest tool-call status."
+  (let* ((compaction-id (map-elt update 'compactionId))
+         (kind (map-elt update 'sessionUpdate))
+         (summaries (map-elt state :compaction-summaries))
+         (summary (cond
+                   ((equal kind "compaction_summary_chunk")
+                    (concat (or (map-elt summaries compaction-id) "")
+                            (or (map-nested-elt update '(content text)) "")))
+                   ((map-elt update 'summary)
+                    (mapconcat (lambda (block) (or (map-elt block 'text) ""))
+                               (map-elt update 'summary) ""))
+                   (t (map-elt summaries compaction-id))))
+         (status (pcase (map-elt update 'status)
+                   ('nil "in_progress")
+                   ("cancelled" "interrupted")
+                   (other other)))
+         (text (if (and (equal status "failed") (map-elt update 'error))
+                   (format "Compaction failed: %s" (map-elt update 'error))
+                 summary)))
+    ;; A state built before this key existed (a session alive across a
+    ;; package reload) has no slot to accumulate into; it still renders.
+    (when (and summary (assq :compaction-summaries state))
+      (setf (map-elt summaries compaction-id nil #'equal) summary)
+      (map-put! state :compaction-summaries summaries))
+    `((method . "session/update")
+      (params
+       . ((update
+           . ((sessionUpdate . ,(if (map-nested-elt state `(:tool-calls ,compaction-id))
+                                    "tool_call_update"
+                                  "tool_call"))
+              (toolCallId . ,compaction-id)
+              (title . "Compact conversation")
+              (kind . "think")
+              (status . ,status)
+              ,@(when (and text (not (string-empty-p text)))
+                  `((content . [((type . "content")
+                                 (content . ((type . "text")
+                                             (text . ,text))))]))))))))))
 
 (defun agent-shell--save-tool-call (state tool-call-id tool-call)
   "Store TOOL-CALL with TOOL-CALL-ID in STATE's :tool-calls alist.
@@ -11470,7 +11527,28 @@ out.  Returns nil when nothing was buffered."
     (map-put! state :pending-restore nil)))
 
 (defun agent-shell--replay-turn (state turn)
-  "Dispatch each notification in TURN through STATE's notification handler."
+  "Dispatch each notification in TURN through STATE's notification handler.
+
+A turn whose agent activity precedes any user prompt opens on an empty
+prompt.  A compacted session replays from its compaction, and the
+agent's continuation after it has no prompt of its own; without one the
+turn gets no end-of-prompt marker, so it is no page the viewport can
+show (see `agent-shell--turns')."
+  (when (eq (seq-some (lambda (notification)
+                        (pcase (map-nested-elt notification '(params update sessionUpdate))
+                          ("user_message_chunk" 'prompt)
+                          ((or "agent_message_chunk" "agent_thought_chunk"
+                               "tool_call" "tool_call_update" "plan"
+                               "compaction_update" "compaction_summary_chunk")
+                           'activity)))
+                      turn)
+            'activity)
+    (agent-shell--on-notification
+     :state state
+     :acp-notification '((method . "session/update")
+                         (params . ((update . ((sessionUpdate . "user_message_chunk")
+                                               (content . ((type . "text")
+                                                           (text . ""))))))))))
   (dolist (notification turn)
     (agent-shell--on-notification :state state :acp-notification notification)))
 
