@@ -9807,6 +9807,10 @@ Returns the resulting buffer string, with the live prompt trailing."
                          (let ((inhibit-read-only t))
                            (goto-char (point-max))
                            (insert "Claude> replayed"))
+                         ;; The real dispatch writes each replayed entry
+                         ;; to the transcript as it renders it.
+                         (agent-shell--append-transcript
+                          :text "replayed" :file-path agent-shell--transcript-file)
                          (map-put! state :last-entry-type last-entry-type))))
               ;; A live prompt awaiting input, emitted the way shell-maker
               ;; emits it before the load completes, so `comint-last-prompt'
@@ -9894,25 +9898,22 @@ message."
                   :kill-input t)
                  "Claude> replayedClaude> ")))
 
-(ert-deftest agent-shell--render-pending-restore-closes-trailing-user-prompt-transcript-test ()
-  "Test closing a trailing user prompt separates it in the transcript too.
-A replayed prompt is written raw, without a trailing newline, and the
-notification dispatch appends the separator only when a following
-notification closes the prompt.  A replay ending on a user message has no
-following notification, so this close path must append the separator
-itself; otherwise the next section header glues onto the restored prompt:
-
-    restored prompt## User (2026-08-05 10:00:00)"
-  (let ((file (make-temp-file "agent-shell-transcript")))
+(ert-deftest agent-shell--render-pending-restore-leaves-transcript-alone-test ()
+  "Test a restore writes nothing to the transcript.
+A restored shell starts a new transcript file, and the turns it replays
+are already in the file of the shell that ran them.  Writing them again
+gave every restore a copy of the replayed turns, stamped with the time
+of the restore."
+  (let ((file (make-temp-file "agent-shell-transcript"))
+        (before "## User (2026-08-05 10:00:00)\n\nearlier prompt\n\n"))
     (unwind-protect
         (progn
-          (write-region "## User (2026-08-05 10:00:00)\n\nrestored prompt"
-                        nil file)
+          (write-region before nil file)
           (agent-shell-tests--render-pending-restore
            :last-entry-type "user_message_chunk" :transcript-file file)
           (with-temp-buffer
             (insert-file-contents file)
-            (should (string-suffix-p "restored prompt\n\n" (buffer-string)))))
+            (should (equal (buffer-string) before))))
       (delete-file file))))
 
 (ert-deftest agent-shell--use-session-load-p-modes ()

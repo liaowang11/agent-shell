@@ -11199,7 +11199,12 @@ pending-restore state once replay completes."
             (unwind-protect
                 ;; A replay renders history the user never typed, so keep all of
                 ;; it out of undo history (see `agent-shell--reset-undo-history').
+                ;; It is also history the transcript already holds: the shell
+                ;; that ran those turns wrote them to its own file, and this
+                ;; shell's file starts at the restore.  Writing them here gave
+                ;; every restore a second copy stamped with the restore time.
                 (let ((buffer-undo-list t)
+                      (agent-shell--transcript-file nil)
                       (prompt-start (and comint-last-prompt
                                          (marker-position (car comint-last-prompt))
                                          (agent-shell--live-input-prompt-p comint-last-prompt)
