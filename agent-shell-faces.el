@@ -134,6 +134,12 @@ Shared muted style for supporting text such as activity-group summaries,
 listing descriptions and usage readouts."
   :group 'agent-shell-faces)
 
+(defface agent-shell-prompt-suggestion
+  '((t :inherit shadow))
+  "Face for the prompt the agent predicts you will send next.
+Shown in an empty prompt; see `agent-shell-prompt-suggestions'."
+  :group 'agent-shell-faces)
+
 
 ;;; Status (semantic states)
 
