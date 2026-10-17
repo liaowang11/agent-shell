@@ -98,6 +98,7 @@
 (require 'agent-shell-project)
 (require 'agent-shell-prompt)
 (require 'agent-shell-prompt-queue)
+(require 'agent-shell-prompt-suggestion)
 (require 'agent-shell-qoder)
 (require 'agent-shell-qwen)
 (require 'agent-shell-styles)
@@ -1399,6 +1400,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :session-archived nil)
         (cons :goal nil)
         (cons :goal-capability nil)
+        (cons :prompt-suggestion nil)
         (cons :plan-signals nil)
         (cons :usage (list (cons :total-tokens 0)
                            (cons :input-tokens 0)
@@ -1513,7 +1515,11 @@ per-start aliasing is disabled (see the `:alias-commands nil' call in
       (shell-maker-submit)
     (when-let* ((prompt (agent-shell--prompt-input)))
       (agent-shell--busy-submit :prompt prompt :override arg)
-      (agent-shell--clear-prompt-input))))
+      (agent-shell--clear-prompt-input)
+      ;; Leave history as `comint-send-input' does on an idle submit, so
+      ;; the next M-p starts from the newest entry and M-n reaches the
+      ;; suggested prompt.
+      (setq comint-input-ring-index nil))))
 
 (defun agent-shell-submit-override ()
   "Submit the current input through the override route.
@@ -2897,6 +2903,8 @@ mouse selection or a kill where mark > point) is normalized."
   "C-c C-s" #'agent-shell-set-session-config-option
   "<remap> <yank>" #'agent-shell-yank-dwim
   "<remap> <comint-send-input>" #'agent-shell-submit
+  "<remap> <comint-previous-input>" #'agent-shell-previous-input
+  "<remap> <comint-next-input>" #'agent-shell-next-input
   ;; No equivalent in comint, bind explicitly.
   "M-RET" #'agent-shell-submit-override
   "M-<return>" #'agent-shell-submit-override)
@@ -4747,6 +4755,14 @@ around this call to reflect whether the update arrived out of turn."
              ;; that only carry a title have no `goal' key.
              (when (and (listp air) (assq 'goal air))
                (agent-shell--set-goal state (map-elt air 'goal))))
+           ;; The prompt the agent predicts comes next, outside the AIR
+           ;; namespace.  An empty list clears it; updates that only carry
+           ;; a title have no `promptSuggestions' key.
+           (let ((meta (map-nested-elt acp-notification '(params update _meta))))
+             (when (and (listp meta) (assq 'promptSuggestions meta))
+               (agent-shell--set-prompt-suggestion
+                state (agent-shell--prompt-suggestion-from-acp
+                       (map-elt meta 'promptSuggestions)))))
            ;; Note: No need to set :last-entry-type as no text was inserted.
            nil)
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "config_option_update")
@@ -7753,8 +7769,6 @@ variable (see makunbound)"))
       ;; See `shell-maker-start-v2' above with :alias-commands nil
       ;; Manually alias as needed.
       (defalias 'agent-shell-clear-buffer #'shell-maker-clear-buffer)
-      (defalias 'agent-shell-previous-input #'comint-previous-input)
-      (defalias 'agent-shell-next-input #'comint-next-input)
       (defalias 'agent-shell-search-history #'shell-maker-search-history)
       (defalias 'agent-shell-newline #'newline)
       (defalias 'agent-shell-rename-buffer #'shell-maker-rename-buffer)
@@ -12376,6 +12390,7 @@ reads the buffer's prompt capabilities."
       (map-put! agent-shell--state :out-of-turn-timer nil))
 
     (agent-shell--cancel-idle-timer)
+    (agent-shell--prompt-suggestion-spend agent-shell--state)
     (agent-shell--emit-event :event 'input-submitted
                              :data (list (cons :prompt (substring-no-properties expanded-prompt))))
 
