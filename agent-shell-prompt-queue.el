@@ -51,6 +51,7 @@
 (declare-function agent-shell-completion--setup-minibuffer "agent-shell-completion")
 (declare-function agent-shell--display-buffer "agent-shell")
 (declare-function agent-shell-viewport--prefill-edit "agent-shell-viewport")
+(declare-function agent-shell-viewport--recenter "agent-shell-viewport")
 (declare-function shell-maker-busy "shell-maker")
 
 (defvar agent-shell--state)
@@ -917,9 +918,12 @@ commands when the agent has reported them."
     (agent-shell--prompt-queue-migrate)
     (let ((current (nth index (map-elt agent-shell--state :pending-prompts))))
       (if agent-shell-prefer-viewport-interaction
-          (agent-shell--display-buffer
-           (agent-shell-viewport--prefill-edit
-            :shell-buffer (current-buffer) :index index :text current))
+          (let ((viewport-buffer (agent-shell-viewport--prefill-edit
+                                  :shell-buffer (current-buffer)
+                                  :index index :text current)))
+            (agent-shell--display-buffer viewport-buffer)
+            (with-current-buffer viewport-buffer
+              (agent-shell-viewport--recenter)))
         (agent-shell--prompt-queue-replace
          :index index
          :expected current

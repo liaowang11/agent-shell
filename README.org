@@ -848,7 +848,22 @@ Use one of these entry points to create and initialize the viewport buffer:
 
 In edit mode, =C-c C-c= sends the prompt and switches to view mode when viewport interaction is preferred.  Use =C-u C-c C-c= to send while keeping the compose buffer open, =C-c C-q= to wait behind a running turn or submit when idle, and =C-c C-i= to steer the running turn instead (see [[*Steering a running turn]]).  Use =C-c C-p= to return to the page you were reading without losing the draft (=r= resumes it), =C-c C-k= to cancel, and =C-c C-h= for help.
 
-In view mode, use =r= to compose a reply, =R= to quote the response in a reply, =b= / =f= to move between interactions, =p= / =n= to move between items, =?= for help, and =q= to bury the viewport.
+In view mode, use =r= to compose a reply, =R= to quote the response in a reply, =b= / =f= to move between interactions, =p= / =n= to move between items, =?= for help, and =q= to bury the viewport.  With a region selected, =r= quotes the selection and leaves the cursor after it.
+
+When a viewport command places or restores the cursor, the window shows the text above it if it is at the end of the buffer, with the cursor on the bottom line.  Otherwise the window centers on the cursor, stopping at the beginning of the buffer when necessary.  This applies to composing, restoring drafts, recalling prompt history, switching from the shell, and navigating pages or items; it does not recenter on every keystroke or streamed update.
+
+| Action                                      | Cursor destination                                           |
+|---------------------------------------------+--------------------------------------------------------------|
+| =r= without a selection                      | Saved draft position, or the end of a new empty draft         |
+| =r= with a selection, or =R=                  | End of the draft, after the appended quote and blank line     |
+| Append text, replace a draft, edit a queued prompt | End of the inserted text                                |
+| Add context to a new draft                   | Before the context, ready to type the prompt above it        |
+| Reopen an existing draft without adding text | Existing or saved draft position                             |
+| Recall prompt history or a suggested prompt  | End of that prompt; returning to the draft restores its point |
+| Search prompt history                       | After the chosen prompt, inserted at the draft's point       |
+| Return from composing to a page              | Saved reading position, or the page start if none was saved  |
+| Navigate pages or items                      | The destination item, page start, or page end                 |
+| Switch from a shell interaction              | Matching prompt/response offset, unless a draft is kept       |
 
 #+begin_quote
 [!NOTE]
