@@ -2178,7 +2178,8 @@ viewport's compose buffer instead (carrying an unsent draft, or empty)."
                                                   (agent-shell-viewport--response-start)
                                                 (agent-shell-viewport--prompt-start))))
                              (min (+ start (map-elt location :offset)) (point-max)))
-                           (point-min)))))
+                           (point-min))))
+          (agent-shell-viewport--recenter))
       (agent-shell-prompt-compose)))
    (t
     (user-error "Not in an agent-shell buffer"))))
