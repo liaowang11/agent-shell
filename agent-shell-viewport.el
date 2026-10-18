@@ -228,43 +228,41 @@ Returns an alist with insertion details or nil otherwise:
     (let ((frame (selected-frame))
           (insert-start nil)
           (insert-end nil)
-          (location nil)
-          (recenter nil))
+          (location nil))
       (with-current-buffer viewport-buffer
-	(when (and override
-                   (with-current-buffer viewport-buffer
-                     ;; Only guard an in-progress compose draft.
-                     (and (derived-mode-p 'agent-shell-viewport-edit-mode)
-                          (not (= (buffer-size) 0)))))
+        (when (and override
+                   ;; Only guard an in-progress compose draft.
+                   (derived-mode-p 'agent-shell-viewport-edit-mode)
+                   (not (= (buffer-size) 0)))
           (agent-shell--display-buffer viewport-buffer)
           (unless (y-or-n-p "Compose buffer is not empty.  Override?")
             ;; User does not want to override.
             ;; Treat as regular text (typically appended).
             (setq text (concat text
                                (unless (string-empty-p text)
-				 "\n\n")
+                                 "\n\n")
                                override))
             (setq override nil)))
-	;; TODO: Do we need to get prompt and partial response,
-	;; in case viewport compose buffer is created for the
-	;; first time on an ongoing/busy shell session?
-	(cond
-	 ;; Busy with no text/override to drop in -> stay in view mode.
-	 ;; When text/override is present, or EDIT is requested, fall through
-	 ;; to edit mode so the user can compose; `compose-send-*' will queue
-	 ;; on submit.
-	 ((and (not edit)
+        ;; TODO: Do we need to get prompt and partial response,
+        ;; in case viewport compose buffer is created for the
+        ;; first time on an ongoing/busy shell session?
+        (cond
+         ;; Busy with no text/override to drop in -> stay in view mode.
+         ;; When text/override is present, or EDIT is requested, fall through
+         ;; to edit mode so the user can compose; `compose-send-*' will queue
+         ;; on submit.
+         ((and (not edit)
                (agent-shell-viewport--busy-p)
                (string-empty-p (string-trim text))
                (or (not override) (string-empty-p (string-trim override))))
           (agent-shell-viewport-view-mode))
-	 (override
+         (override
           (agent-shell-viewport-edit-mode)
           (agent-shell-viewport--initialize)
           (setq insert-start (point))
           (insert override)
           (setq insert-end (point)))
-	 ((derived-mode-p 'agent-shell-viewport-edit-mode)
+         ((derived-mode-p 'agent-shell-viewport-edit-mode)
           ;; Leave point after the appended text, ready to type about it.
           ;; Context on an empty draft, as a new session's freshly created
           ;; compose buffer has, leaves point at the front instead.
@@ -278,7 +276,7 @@ Returns an alist with insertion details or nil otherwise:
                      (insert "\n\n"))
                     (fresh
                      (goto-char (point-min)))))))
-	 (t
+         (t
           (agent-shell-viewport-edit-mode)
           ;; Transitioned to edit mode. Wipe content.
           (agent-shell-viewport--initialize)
@@ -287,14 +285,12 @@ Returns an alist with insertion details or nil otherwise:
             (when snapshot
               (insert (map-elt snapshot :content))
               (goto-char (map-elt snapshot :location))
-              (setq agent-shell-viewport--compose-snapshot nil)
-              (when (string-empty-p text)
-		(setq recenter t)))
+              (setq agent-shell-viewport--compose-snapshot nil))
             ;; Inserted text wins over the restored point: leave point
             ;; after it.  Context on a fresh draft leaves point at the
             ;; front instead, to type the prompt above it.
             (if (string-empty-p text)
-		(setq insert-start (point-max)
+                (setq insert-start (point-max)
                       insert-end (point-max))
               (agent-shell-viewport--goto-separator)
               (setq insert-start (point))
@@ -304,16 +300,14 @@ Returns an alist with insertion details or nil otherwise:
                      (insert "\n\n"))
                     ((not snapshot)
                      (goto-char (point-min))))))))
-	;; After the mode switches above, which is where a compose buffer
-	;; comes into being.
-	(with-current-buffer viewport-buffer
-          (setq agent-shell-viewport--compose-disposition disposition))
+        ;; After the mode switches above, which is where a compose buffer
+        ;; comes into being.
+        (setq agent-shell-viewport--compose-disposition disposition)
         (setq location (point)))
       (agent-shell--display-buffer viewport-buffer)
       (when location
         (goto-char location))
-      (when recenter
-        (agent-shell-viewport--recenter))
+      (agent-shell-viewport--recenter)
       (unless (eq frame (selected-frame))
         (agent-shell-viewport--update-header))
       `((:buffer . ,viewport-buffer)
@@ -334,16 +328,16 @@ the next draft."
   (setq agent-shell-viewport--page-cursor nil))
 
 (defun agent-shell-viewport--recenter ()
-  "Recenter the window showing the current buffer on point.
+  "Position the window showing the current buffer without moving point.
 
-Restoring a point after a re-render leaves it on the window's last line,
-since the window starts back at the top.  Does nothing when no window
-shows the buffer."
+At the end of the buffer, put point on the window's last line so the
+preceding text stays visible.  Otherwise center point in the window.
+Does nothing when no window shows the buffer."
   (when-let* ((window (get-buffer-window (current-buffer)))
               (pos (point)))
     (with-selected-window window
       (goto-char pos)
-      (recenter))))
+      (recenter (when (= pos (point-max)) -1)))))
 
 (defun agent-shell-viewport-compose-send (&optional keep-composing)
   "Send the viewport composed prompt to the agent shell.
@@ -695,6 +689,7 @@ resolving to its shell on the next invocation."
         (when (string-equal prompt "clear")
           (agent-shell-viewport-edit-mode)
           (agent-shell-viewport--initialize))
+        (agent-shell-viewport--recenter)
         (agent-shell--insert-to-shell-buffer
          :shell-buffer (agent-shell-viewport--shell-buffer)
          :text prompt
@@ -919,7 +914,8 @@ buffer."
     (when snapshot
       (insert (map-elt snapshot :content))
       (goto-char (map-elt snapshot :location))
-      (setq agent-shell-viewport--compose-snapshot nil))))
+      (setq agent-shell-viewport--compose-snapshot nil))
+    (agent-shell-viewport--recenter)))
 
 (defun agent-shell-viewport--previous-history ()
   "Insert the previous prompt from history into the compose buffer."
@@ -949,7 +945,8 @@ buffer."
       (setq agent-shell-viewport--ring-index next-index)))
     (when agent-shell-viewport--ring-index
       (agent-shell-viewport--initialize
-       :prompt (seq-elt ring agent-shell-viewport--ring-index)))))
+       :prompt (seq-elt ring agent-shell-viewport--ring-index))
+      (agent-shell-viewport--recenter))))
 
 (defun agent-shell-viewport-next-history ()
   "Insert next prompt from history into compose buffer.
@@ -978,7 +975,8 @@ send next, saving the draft it replaces for
         ;; Show older entry.
         (setq agent-shell-viewport--ring-index next-index)
         (agent-shell-viewport--initialize
-         :prompt (seq-elt ring next-index)))))
+         :prompt (seq-elt ring next-index))
+        (agent-shell-viewport--recenter))))
    ((agent-shell--prompt-suggestion-text)
     ;; Past the draft, into future history.  Saved the way
     ;; `agent-shell-viewport-previous-history' saves it, so a draft
@@ -988,7 +986,8 @@ send next, saving the draft it replaces for
             `((:content . ,(buffer-string))
               (:location . ,(point)))))
     (agent-shell-viewport--initialize :prompt (agent-shell--prompt-suggestion-text))
-    (setq agent-shell-viewport--at-suggestion t))
+    (setq agent-shell-viewport--at-suggestion t)
+    (agent-shell-viewport--recenter))
    (t
     (user-error "No more history"))))
 
@@ -1012,7 +1011,8 @@ before leaving the page, so quitting the search stays on it."
                      (ring-elements comint-input-ring))) nil t))))
     (when (derived-mode-p 'agent-shell-viewport-view-mode)
       (agent-shell-viewport--enter-compose-page))
-    (insert prompt)))
+    (insert prompt)
+    (agent-shell-viewport--recenter)))
 
 (defun agent-shell-viewport--leave-compose-page (&optional n)
   "Snapshot the draft and return to the page last read from compose.
@@ -1073,6 +1073,7 @@ page."
      :prompt (map-elt current :prompt)
      :response (map-elt current :response))
     (goto-char (point-min))
+    (agent-shell-viewport--recenter)
     current))
 
 (defun agent-shell-viewport-refresh ()
@@ -1087,6 +1088,7 @@ page."
      :prompt (map-elt current :prompt)
      :response (map-elt current :response))
     (goto-char (point-min))
+    (agent-shell-viewport--recenter)
     current))
 
 (cl-defun agent-shell-viewport--showing-latest-p (&key viewport-buffer)
@@ -1158,7 +1160,8 @@ in, landing on the item after it rather than on its next cell."
     (if next-pos
         (progn
           (deactivate-mark)
-          (goto-char next-pos))
+          (goto-char next-pos)
+          (agent-shell-viewport--recenter))
       ;; At point-max with no more items, try next interaction
       (condition-case nil
           (agent-shell-viewport-next-page)
@@ -1226,7 +1229,8 @@ in, as `agent-shell-viewport-next-item' does from its end."
     (if next-pos
         (progn
           (deactivate-mark)
-          (goto-char next-pos))
+          (goto-char next-pos)
+          (agent-shell-viewport--recenter))
       ;; No more items before current position, try previous interaction
       (condition-case nil
           ;; Switch to previous page and stop at point-max (call next-interaction directly)
@@ -1234,7 +1238,8 @@ in, as `agent-shell-viewport-next-item' does from its end."
         (error
          ;; At the beginning of all interactions, stay at first item
          (when prompt-start
-           (goto-char prompt-start)))))))
+           (goto-char prompt-start)
+           (agent-shell-viewport--recenter)))))))
 
 (defconst agent-shell-viewport--suffix " [viewport]"
   "Suffix appended to shell buffer name to create viewport buffer name.")
@@ -1292,11 +1297,10 @@ can return to it."
           (goto-char (point-max))
           (insert (if snapshot "\n\n" "")
                   (agent-shell--block-quote quoted-text) "\n\n"))
-      (if snapshot
-          (progn
-            (goto-char (map-elt snapshot :location))
-            (agent-shell-viewport--recenter))
-        (goto-char (point-max))))))
+      (goto-char (if snapshot
+                     (map-elt snapshot :location)
+                   (point-max))))
+    (agent-shell-viewport--recenter)))
 
 (defun agent-shell-viewport-reply ()
   "Reply as a follow-up and compose another prompt/query."
@@ -1304,14 +1308,9 @@ can return to it."
   (interactive)
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)
     (user-error "Not in a shell viewport buffer"))
-  (let* ((region (map-elt (agent-shell--get-region :deactivate t) :content))
-         (resuming (and agent-shell-viewport--compose-snapshot (not region))))
+  (let ((region (map-elt (agent-shell--get-region :deactivate t) :content)))
     (agent-shell-viewport--enter-compose-page
-     :quoted-text (when region (string-trim region)))
-    ;; Setting point isn't enough at times. Force scrolling, unless a
-    ;; resumed draft's point was just recentered.
-    (unless resuming
-      (set-window-start (selected-window) (point-min)))))
+     :quoted-text (when region (string-trim region)))))
 
 (defun agent-shell-viewport-quote-reply ()
   "Reply with the entire response block-quoted."
@@ -1545,6 +1544,7 @@ INDEX as the page cursor and returns the shown (PROMPT . RESPONSE)."
     (agent-shell-viewport--initialize
      :prompt (car next) :response (cdr next))
     (goto-char (if at-end (point-max) (point-min)))
+    (agent-shell-viewport--recenter)
     (setq agent-shell-viewport--page-cursor
           `((:index . ,index)
             (:point . ,(point))))
