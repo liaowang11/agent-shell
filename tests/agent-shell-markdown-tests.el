@@ -899,6 +899,23 @@ it is still picked up by the bare-URL linkifier."
         ;; Only the stale image (stored 1000), at 0.5 * 2000 = 1000 px.
         (should (equal calls '((1 1000 2000))))))))
 
+(ert-deftest agent-shell-markdown-resize-image-on-non-graphic-selected-frame ()
+  ;; The resize runs from an idle timer, so the selected frame can be a
+  ;; tty frame (or batch's initial frame) while the image shows on a GUI
+  ;; frame.  Flushing must not insist on the selected frame being graphic.
+  (let ((image-file (make-temp-file "agent-shell-test" nil ".pbm" "P1\n1 1\n0\n")))
+    (unwind-protect
+        (with-temp-buffer
+          (insert "A")
+          (put-text-property 1 2 'display (create-image image-file nil nil
+                                                        :max-width 100))
+          (agent-shell-markdown--resize-image 1 2 200 400)
+          (should (= 200 (image-property (get-text-property 1 'display)
+                                         :max-width)))
+          (should (= 400 (get-text-property
+                          1 'agent-shell-markdown-image-window-width))))
+      (delete-file image-file))))
+
 (ert-deftest agent-shell-markdown-rerender-images-default-reads-live-max-width ()
   ;; A `default'-sized image (from `agent-shell-markdown-image-max-width')
   ;; re-reads that variable live on resize, so a changed setting applies
