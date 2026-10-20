@@ -4167,15 +4167,16 @@ lays out that one table over [1, 34)."
           (modified (buffer-modified-p)))
       ;; Preserve point (`agent-shell-markdown--render-table' moves point
       ;; and can be triggered at arbitrary times).
-      (save-excursion
-        (dolist (table tables)
-          (agent-shell-markdown--render-table
-           (list (cons :source (map-elt table :source))
-                 (cons :start (marker-position (map-elt table :start)))
-                 (cons :end (marker-position (map-elt table :end)))))
-          (set-marker (map-elt table :start) nil)
-          (set-marker (map-elt table :end) nil)))
-      (restore-buffer-modified-p modified))))
+      (unwind-protect
+          (save-excursion
+            (dolist (table tables)
+              (agent-shell-markdown--render-table
+               (list (cons :source (map-elt table :source))
+                     (cons :start (marker-position (map-elt table :start)))
+                     (cons :end (marker-position (map-elt table :end)))))
+              (set-marker (map-elt table :start) nil)
+              (set-marker (map-elt table :end) nil)))
+        (restore-buffer-modified-p modified)))))
 
 (cl-defun agent-shell-markdown-rerender-table (&key position source)
   "Lay out the table at POSITION again, and return its markdown source.
@@ -4300,24 +4301,25 @@ the current width, so it is safe to call on display and on resize."
     (let ((inhibit-read-only t)
           (buffer-undo-list t)
           (modified (buffer-modified-p)))
-      (save-excursion
-        (goto-char (point-min))
-        (let (match)
-          (while (setq match (text-property-search-forward
-                              'agent-shell-markdown-image-width-ratio))
-            (let* ((beg (prop-match-beginning match))
-                   (ratio (get-text-property
-                           beg 'agent-shell-markdown-image-width-ratio)))
-              (when (or force
-                        (not (eql width (get-text-property
-                                         beg 'agent-shell-markdown-image-window-width))))
-                (agent-shell-markdown--resize-image
-                 beg (prop-match-end match)
-                 (if (numberp ratio)
-                     (round (* ratio width))
-                   (agent-shell-markdown--image-max-width))
-                 width))))))
-      (restore-buffer-modified-p modified))))
+      (unwind-protect
+          (save-excursion
+            (goto-char (point-min))
+            (let (match)
+              (while (setq match (text-property-search-forward
+                                  'agent-shell-markdown-image-width-ratio))
+                (let* ((beg (prop-match-beginning match))
+                       (ratio (get-text-property
+                               beg 'agent-shell-markdown-image-width-ratio)))
+                  (when (or force
+                            (not (eql width (get-text-property
+                                             beg 'agent-shell-markdown-image-window-width))))
+                    (agent-shell-markdown--resize-image
+                     beg (prop-match-end match)
+                     (if (numberp ratio)
+                         (round (* ratio width))
+                       (agent-shell-markdown--image-max-width))
+                     width))))))
+        (restore-buffer-modified-p modified)))))
 
 (defun agent-shell-markdown-image-scale-increase ()
   "Widen the image at point, or every image in the buffer, by one step.
