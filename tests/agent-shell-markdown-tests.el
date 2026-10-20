@@ -898,6 +898,22 @@ it is still picked up by the bare-URL linkifier."
                           1 'agent-shell-markdown-image-window-width))))
       (delete-file image-file))))
 
+(ert-deftest agent-shell-markdown-rerender-images-restores-modified-on-error ()
+  ;; A re-size that errors partway must still leave the buffer's
+  ;; modified flag as it found it.
+  (with-temp-buffer
+    (insert "A")
+    (put-text-property 1 2 'agent-shell-markdown-image-width-ratio 0.5)
+    (set-buffer-modified-p nil)
+    (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) 'window))
+              ((symbol-function 'window-body-width) (lambda (&rest _) 2000))
+              ((symbol-function 'agent-shell-markdown--resize-image)
+               (lambda (start end &rest _)
+                 (put-text-property start end 'display "x")
+                 (error "Boom"))))
+      (should-error (agent-shell-markdown-rerender-images))
+      (should-not (buffer-modified-p)))))
+
 (ert-deftest agent-shell-markdown-rerender-images-default-reads-live-max-width ()
   ;; A `default'-sized image (from `agent-shell-markdown-image-max-width')
   ;; re-reads that variable live on resize, so a changed setting applies
@@ -3150,6 +3166,23 @@ after" nil)))))
         (setq calls 0)
         (agent-shell-markdown-rerender-tables)
         (should (= calls 0))))))
+
+(ert-deftest agent-shell-markdown-rerender-tables-restores-modified-on-error ()
+  ;; A re-layout that errors partway must still leave the buffer's
+  ;; modified flag as it found it.
+  (with-temp-buffer
+    (insert "| A | B |\n|---|---|\n| 1 | 2 |\n")
+    (agent-shell-markdown-replace-markup)
+    (set-buffer-modified-p nil)
+    (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) 'w))
+              ((symbol-function 'window-body-width) (lambda (&rest _) 500))
+              ((symbol-function 'agent-shell-markdown--render-table)
+               (lambda (_table)
+                 (goto-char (point-max))
+                 (insert "x")
+                 (error "Boom"))))
+      (should-error (agent-shell-markdown-rerender-tables))
+      (should-not (buffer-modified-p)))))
 
 (ert-deftest agent-shell-markdown-carry-properties-drops-font-lock-face ()
   ;; `font-lock-face' is our own styling (mirrored from `face'), not a
