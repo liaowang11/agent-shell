@@ -175,11 +175,13 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
                            ;; the next prompt unless told not to.
                            ,@(unless agent-shell-prompt-suggestions
                                '((promptSuggestions . :false)))))
-                       ;; Forward the CLI's git change messages as
-                       ;; `_claude/sdkMessage' (see `vcs-state-changed'
-                       ;; in `agent-shell-subscribe-to').
+                       ;; Forward the CLI's git change and run state
+                       ;; messages as `_claude/sdkMessage' (see
+                       ;; `vcs-state-changed' and `state-changed' in
+                       ;; `agent-shell-subscribe-to').
                        (emitRawSDKMessages
-                        . [((type . "system") (subtype . "vcs_state_changed"))]))))
+                        . [((type . "system") (subtype . "vcs_state_changed"))
+                           ((type . "system") (subtype . "session_state_changed"))]))))
    :install-instructions "See https://github.com/agentclientprotocol/claude-agent-acp for installation."))
 
 (defun agent-shell-anthropic-start-claude-code ()
