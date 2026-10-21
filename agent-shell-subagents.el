@@ -49,6 +49,7 @@
 (defvar comint-prompt-regexp)
 (declare-function agent-shell--filter-buffer-substring "agent-shell")
 (declare-function agent-shell--native-subagent "agent-shell")
+(declare-function agent-shell--sync-child-states "agent-shell")
 (declare-function agent-shell--render-markdown-body "agent-shell")
 (declare-function agent-shell--subagent-row-at "agent-shell")
 (declare-function agent-shell--subagent-row-label "agent-shell")
@@ -200,14 +201,16 @@ the subagent's transcript file keeps everything."
 (defun agent-shell-subagents--changed (state)
   "Refresh what summarizes STATE's subagents after one of them changed.
 That is each subagent buffer's header line, which reads its row, the
-shell's header count, and the subagents list."
+shell's header count, and the subagents list.  Subscribers hear of a
+child whose run state changed."
   (dolist (entry (map-elt state :native-subagents))
     (when-let* ((buffer (map-elt (cdr entry) :buffer))
                 ((buffer-live-p buffer)))
       (with-current-buffer buffer
         (force-mode-line-update))))
   (agent-shell-subagents--refresh-header state)
-  (agent-shell-subagents--schedule-list-refresh state))
+  (agent-shell-subagents--schedule-list-refresh state)
+  (agent-shell--sync-child-states state))
 
 (defun agent-shell-subagents--kill-buffers (state)
   "Kill every subagent buffer STATE's shell made, and its subagents list."
