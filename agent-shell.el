@@ -1390,6 +1390,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :stream-render-timer nil)
         (cons :sleep-token nil)
         (cons :out-of-turn-timer nil)
+        (cons :agent-state nil)
         (cons :active-requests nil)
         (cons :prompt-queue-paused nil)
         (cons :steers-in-flight 0)
@@ -4058,6 +4059,31 @@ root's, or the spawning subagent's for a nested one."
     (agent-shell--session-subagent-group
      state (map-nested-elt acp-notification '(params sessionId)))))
 
+(defconst agent-shell--agent-states '("running" "requires_action" "idle")
+  "Run states an agent can declare, as ACP v2's `state_update' names them.")
+
+(defun agent-shell--note-agent-state (state acp-notification agent-state
+                                            &optional stop-reason)
+  "Record AGENT-STATE, declared by ACP-NOTIFICATION, as STATE's run state.
+
+The state is the agent's word for whether it is working, which a client
+otherwise has to guess from output arriving with no request in flight.
+Emit `state-changed' when it changes, with STOP-REASON for an idle
+state.  Only the root session's state counts, and only a state in
+`agent-shell--agent-states': ACP reserves the rest for extensions."
+  (when (and (member agent-state agent-shell--agent-states)
+             (not agent-shell--subagent-group)
+             (let ((session-id (map-nested-elt acp-notification '(params sessionId))))
+               (or (null session-id)
+                   (equal session-id (map-nested-elt state '(:session :id)))))
+             (not (equal agent-state (map-elt state :agent-state))))
+    (agent-shell--ensure-state-key state :agent-state)
+    (map-put! state :agent-state agent-state)
+    (agent-shell--emit-event
+     :event 'state-changed
+     :data (list (cons :state agent-state)
+                 (cons :stop-reason stop-reason)))))
+
 (defun agent-shell--note-unknown-session (state acp-notification)
   "Warn once that ACP-NOTIFICATION comes from a session STATE does not know.
 
@@ -4747,6 +4773,13 @@ around this call to reflect whether the update arrived out of turn."
                        (agent-shell--get-available-modes state)))
              ;; Note: No need to set :last-entry-type as no text was inserted.
              (agent-shell--update-header-and-mode-line)))
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "state_update")
+           ;; ACP v2's run state, which omp also sends over v1 when the
+           ;; client asks (`stateUpdate' in `clientCapabilities._meta').
+           (agent-shell--note-agent-state
+            state acp-notification
+            (map-nested-elt acp-notification '(params update state))
+            (map-nested-elt acp-notification '(params update stopReason))))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "session_info_update")
            (with-current-buffer (map-elt state :buffer)
              (agent-shell--set-session-title
@@ -4826,6 +4859,15 @@ around this call to reflect whether the update arrived out of turn."
             :data (list (cons :kind (map-elt message 'kind))
                         (cons :branch (map-elt message 'branch))
                         (cons :cwd (map-elt message 'cwd))))))
+        ((and (equal (map-elt acp-notification 'method) "_claude/sdkMessage")
+              (equal (map-nested-elt acp-notification '(params message subtype))
+                     "session_state_changed"))
+         ;; The CLI's own run state, in ACP v2's `state_update' vocabulary.
+         ;; It also covers the turns the CLI starts on its own, such as the
+         ;; follow-up to a finished background task.
+         (agent-shell--note-agent-state
+          state acp-notification
+          (map-nested-elt acp-notification '(params message state))))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
@@ -9738,6 +9780,12 @@ Session events:
     :data contains :stop-reason and :usage
   `session-title-changed' - Session title updated
     :data contains :title
+  `state-changed'         - The agent declared a new run state
+    :data contains :state (\"running\", \"requires_action\" or \"idle\",
+    as ACP v2's `state_update' names them) and :stop-reason (for
+    example \"end_turn\", nil when not reported).  It covers turns the
+    agent starts on its own too.  Only agents that report it: Claude
+    Code and omp.
   `vcs-state-changed'     - The agent's shell command changed git state
     :data contains :kind (\"commit\", \"push\", \"merge\", \"rebase\"
     or a newer kind), :branch (may be nil) and :cwd (the directory the

@@ -927,6 +927,90 @@ while traffic logging is on."
       (should-not events)
       (should rendered))))
 
+(defun agent-shell-tests--state-notifications (state notifications)
+  "Dispatch NOTIFICATIONS with STATE and return the events they emit.
+Fail if any of them renders."
+  (let (events)
+    (cl-letf (((symbol-function 'agent-shell--emit-event)
+               (lambda (&rest args) (push args events)))
+              ((symbol-function 'shell-maker-busy) #'ignore)
+              ((symbol-function 'agent-shell--activity-group-note-entry-type) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest _) (ert-fail "State update rendered"))))
+      (let ((acp-logging-enabled t))
+        (dolist (notification notifications)
+          (agent-shell--on-notification :state state
+                                        :acp-notification notification))))
+    (nreverse events)))
+
+(defun agent-shell-tests--claude-session-state (state &optional session-id)
+  "Return the `session_state_changed' SDK message for STATE.
+SESSION-ID defaults to \"s1\"."
+  `((jsonrpc . "2.0")
+    (method . "_claude/sdkMessage")
+    (params
+     (sessionId . ,(or session-id "s1"))
+     (message (type . "system")
+              (subtype . "session_state_changed")
+              (state . ,state)))))
+
+(defun agent-shell-tests--state-update (state &optional stop-reason session-id)
+  "Return a v2-shaped `state_update' for STATE with STOP-REASON.
+SESSION-ID defaults to \"s1\"."
+  `((jsonrpc . "2.0")
+    (method . "session/update")
+    (params
+     (sessionId . ,(or session-id "s1"))
+     (update (sessionUpdate . "state_update")
+             (state . ,state)
+             ,@(when stop-reason `((stopReason . ,stop-reason)))))))
+
+(ert-deftest agent-shell--on-notification-claude-session-state-test ()
+  "Claude's `session_state_changed' emits `state-changed' on each change."
+  (let ((state (list (cons :last-activity-time nil)
+                     (cons :session (list (cons :id "s1")))
+                     (cons :active-requests nil))))
+    (should (equal (agent-shell-tests--state-notifications
+                    state
+                    (list (agent-shell-tests--claude-session-state "running")
+                          ;; A repeat is no change.
+                          (agent-shell-tests--claude-session-state "running")
+                          (agent-shell-tests--claude-session-state "requires_action")
+                          (agent-shell-tests--claude-session-state "idle")))
+                   '((:event state-changed
+                      :data ((:state . "running") (:stop-reason)))
+                     (:event state-changed
+                      :data ((:state . "requires_action") (:stop-reason)))
+                     (:event state-changed
+                      :data ((:state . "idle") (:stop-reason))))))
+    (should (equal (map-elt state :agent-state) "idle"))))
+
+(ert-deftest agent-shell--on-notification-state-update-test ()
+  "ACP v2's `state_update' emits `state-changed' with its stop reason."
+  (let ((state (list (cons :last-activity-time nil)
+                     (cons :session (list (cons :id "s1")))
+                     (cons :active-requests nil))))
+    (should (equal (agent-shell-tests--state-notifications
+                    state
+                    (list (agent-shell-tests--state-update "running")
+                          (agent-shell-tests--state-update "idle" "end_turn")))
+                   '((:event state-changed
+                      :data ((:state . "running") (:stop-reason)))
+                     (:event state-changed
+                      :data ((:state . "idle") (:stop-reason . "end_turn"))))))))
+
+(ert-deftest agent-shell--on-notification-state-ignores-other-sessions-test ()
+  "Only the root session's state is the shell's, and only known states count."
+  (let ((state (list (cons :last-activity-time nil)
+                     (cons :session (list (cons :id "s1")))
+                     (cons :active-requests nil))))
+    (should-not (agent-shell-tests--state-notifications
+                 state
+                 (list (agent-shell-tests--state-update "running" nil "child")
+                       (agent-shell-tests--claude-session-state "running" "child")
+                       (agent-shell-tests--state-update "_custom"))))
+    (should-not (map-elt state :agent-state))))
+
 (ert-deftest agent-shell--stream-render-coalesces-chunks-test ()
   "Render consecutive chunks once, without postponing the batch timer."
   (with-temp-buffer

@@ -57,6 +57,10 @@ wire extras."
   ;; Claude and omp implement it.
   (should (map-elt (agent-shell-anthropic-make-claude-code-config) :initialize-meta))
   (should (map-elt (agent-shell-omp-make-agent-config) :initialize-meta))
+  ;; omp reports its run state as a `state_update' only when asked.
+  (should (eq (map-elt (map-elt (agent-shell-omp-make-agent-config) :initialize-meta)
+                       'stateUpdate)
+              t))
   ;; A config that never opted in advertises nothing.
   (should-not (map-elt (agent-shell-make-agent-config :identifier 'nobody)
                        :initialize-meta)))
