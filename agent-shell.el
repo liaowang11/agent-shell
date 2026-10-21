@@ -1501,6 +1501,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :stream-render-timer nil)
         (cons :sleep-token nil)
         (cons :out-of-turn-timer nil)
+        (cons :agent-state nil)
         (cons :active-requests nil)
         (cons :prompt-queue-paused nil)
         (cons :steers-in-flight 0)
@@ -4179,6 +4180,85 @@ root's, or the spawning subagent's for a nested one."
     (agent-shell--session-subagent-group
      state (map-nested-elt acp-notification '(params sessionId)))))
 
+(defconst agent-shell--agent-states '("running" "requires_action" "idle")
+  "Run states an agent can declare, as ACP v2's `state_update' names them.")
+
+(defun agent-shell--note-agent-state (state acp-notification agent-state
+                                            &optional stop-reason)
+  "Record AGENT-STATE, declared by ACP-NOTIFICATION, as STATE's run state.
+
+The state is the agent's word for whether it is working, which a client
+otherwise has to guess from output arriving with no request in flight.
+Emit `state-changed' when it changes, with STOP-REASON for an idle
+state.  Only the root session's state counts, and only a state in
+`agent-shell--agent-states': ACP reserves the rest for extensions."
+  (when (and (member agent-state agent-shell--agent-states)
+             (not agent-shell--subagent-group)
+             (let ((session-id (map-nested-elt acp-notification '(params sessionId))))
+               (or (null session-id)
+                   (equal session-id (map-nested-elt state '(:session :id)))))
+             (not (equal agent-state (map-elt state :agent-state))))
+    (agent-shell--ensure-state-key state :agent-state)
+    (map-put! state :agent-state agent-state)
+    (agent-shell--emit-event
+     :event 'state-changed
+     :data (list (cons :id nil)
+                 (cons :state agent-state)
+                 (cons :stop-reason stop-reason)))))
+
+(defun agent-shell--child-states (state)
+  "Return the run state of each of STATE's subagents and async tasks.
+
+Each element is (ID RUN-STATE STOP-REASON), in the terms of
+`agent-shell--note-agent-state'.  ID is \"subagent/\" or \"task/\" and
+the child's own id: a path under the root, as the Program Status
+Protocol (OSC 7501) names records.  A subagent runs until its record
+gains `:ended-at', waiting while its last update said
+\"requires_action\"; an async task until its `:state' is terminal."
+  (append
+   (mapcar (lambda (entry)
+             (let ((subagent (cdr entry)))
+               (cons (concat "subagent/" (car entry))
+                     (if (map-elt subagent :ended-at)
+                         (list "idle" (pcase (map-elt subagent :state)
+                                        ("completed" "end_turn")
+                                        ("failed" "error")
+                                        ("cancelled" "cancelled")))
+                       (list (if (equal (map-elt subagent :work-state)
+                                        "requires_action")
+                                 "requires_action"
+                               "running")
+                             nil)))))
+           (map-elt state :native-subagents))
+   (mapcar (lambda (entry)
+             (cons (concat "task/" (car entry))
+                   (pcase (plist-get (cdr entry) :state)
+                     ("completed" (list "idle" "end_turn"))
+                     ("failed" (list "idle" "error"))
+                     ("stopped" (list "idle" "cancelled"))
+                     (_ (list "running" nil)))))
+           (map-elt state :async-tasks))))
+
+(defun agent-shell--sync-child-states (state)
+  "Emit `state-changed' for each of STATE's children whose run state changed.
+Compares `agent-shell--child-states' with what was last reported, so
+every subagent and async task change can call it.  Each event carries
+the child's `:id'."
+  (when-let* ((buffer (map-elt state :buffer))
+              ((buffer-live-p buffer)))
+    (let ((reported (map-elt state :child-states))
+          (current (agent-shell--child-states state)))
+      (agent-shell--ensure-state-key state :child-states)
+      (map-put! state :child-states current)
+      (with-current-buffer buffer
+        (dolist (child current)
+          (unless (equal (cdr child) (cdr (assoc (car child) reported)))
+            (agent-shell--emit-event
+             :event 'state-changed
+             :data (list (cons :id (car child))
+                         (cons :state (nth 1 child))
+                         (cons :stop-reason (nth 2 child))))))))))
+
 (defun agent-shell--note-unknown-session (state acp-notification)
   "Warn once that ACP-NOTIFICATION comes from a session STATE does not know.
 
@@ -4888,6 +4968,13 @@ around this call to reflect whether the update arrived out of turn."
                        (agent-shell--get-available-modes state)))
              ;; Note: No need to set :last-entry-type as no text was inserted.
              (agent-shell--update-header-and-mode-line)))
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "state_update")
+           ;; ACP v2's run state, which omp also sends over v1 when the
+           ;; client asks (`stateUpdate' in `clientCapabilities._meta').
+           (agent-shell--note-agent-state
+            state acp-notification
+            (map-nested-elt acp-notification '(params update state))
+            (map-nested-elt acp-notification '(params update stopReason))))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "session_info_update")
            (with-current-buffer (map-elt state :buffer)
              (agent-shell--set-session-title
@@ -4976,6 +5063,15 @@ around this call to reflect whether the update arrived out of turn."
             :data (list (cons :kind (map-elt message 'kind))
                         (cons :branch (map-elt message 'branch))
                         (cons :cwd (map-elt message 'cwd))))))
+        ((and (equal (map-elt acp-notification 'method) "_claude/sdkMessage")
+              (equal (map-nested-elt acp-notification '(params message subtype))
+                     "session_state_changed"))
+         ;; The CLI's own run state, in ACP v2's `state_update' vocabulary.
+         ;; It also covers the turns the CLI starts on its own, such as the
+         ;; follow-up to a finished background task.
+         (agent-shell--note-agent-state
+          state acp-notification
+          (map-nested-elt acp-notification '(params message state))))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
@@ -6745,6 +6841,9 @@ later non-terminal state makes it running once more.
                    (list (cons :name name)
                          (cons :task task)
                          (cons :state subagent-state)
+                         ;; The RFD state itself, which tells waiting
+                         ;; from running (see `agent-shell--child-states').
+                         (cons :work-state (map-nested-elt update '(state state)))
                          (cons :can-cancel can-cancel)
                          (cons :error error-message))))
       ;; A SendMessage ran an idle child again.  The summary kept at
@@ -10021,6 +10120,15 @@ Session events:
     :data contains :stop-reason, :usage and :meta
   `session-title-changed' - Session title updated
     :data contains :title
+  `state-changed'         - The session or one of its children changed
+    run state
+    :data contains :id, :state (\"running\", \"requires_action\" or
+    \"idle\", as ACP v2's `state_update' names them) and :stop-reason
+    (for example \"end_turn\", nil when not reported).  :id is nil for
+    the session itself, whose state only agents that declare one
+    report (Claude Code and omp), and covers the turns it starts on
+    its own too.  For a child it is \"subagent/ID\" or \"task/ID\",
+    reported for every agent with subagents or async tasks.
   `vcs-state-changed'     - The agent's shell command changed git state
     :data contains :kind (\"commit\", \"push\", \"merge\", \"rebase\"
     or a newer kind), :branch (may be nil) and :cwd (the directory the

@@ -79,7 +79,10 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    :client-capabilities '((subagents . ()))
    ;; omp gates background tasks, the session index and the fork point
    ;; on the client naming them here, as claude-agent-acp does.
-   :initialize-meta (agent-shell--air-client-capabilities-meta)
+   ;; `stateUpdate' asks it for ACP v2's `state_update' (see
+   ;; `state-changed' in `agent-shell-subscribe-to').
+   :initialize-meta (append (agent-shell--air-client-capabilities-meta)
+                            '((stateUpdate . t)))
    :client-maker (lambda (buffer)
                    (agent-shell-omp-make-client :buffer buffer))
    :install-instructions "See https://github.com/can1357/oh-my-pi omp (Oh My Pi) installation."))
