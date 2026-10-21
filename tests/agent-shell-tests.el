@@ -8093,6 +8093,54 @@ compose page was opened)."
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
 
+(ert-deftest agent-shell-viewport-paging-restores-point-per-page-test ()
+  "Test paging commands return to the point last read on each page.
+
+A page not read before opens at its start.  Non-interactive paging, the
+way `agent-shell-viewport-next-item' crosses pages, ignores the memory."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (current 2))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil)))
+            (agent-shell-viewport-view-mode))
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda () nil))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) `((:current . ,current) (:total . 3))))
+                    ((symbol-function 'agent-shell--turn-at-index)
+                     (lambda (index)
+                       (setq current index)
+                       (list (cons :prompt (format "page %d\n" index))
+                             (cons :response (make-string 40 ?x))
+                             (cons :position 1))))
+                    ((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest args)
+                       (let ((inhibit-read-only t))
+                         (erase-buffer)
+                         (insert (plist-get args :prompt)
+                                 (plist-get args :response))))))
+            (agent-shell-viewport--show-page 2)
+            (goto-char 20)
+            (call-interactively #'agent-shell-viewport-next-page)
+            (should (equal current 3))
+            (should (equal (point) (point-min)))
+            (goto-char 30)
+            (call-interactively #'agent-shell-viewport-previous-page)
+            (should (equal current 2))
+            (should (equal (point) 20))
+            (call-interactively #'agent-shell-viewport-next-page)
+            (should (equal (point) 30))
+            (agent-shell-viewport-next-page :backwards t :start-at-top t)
+            (should (equal current 2))
+            (should (equal (point) (point-min)))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell-viewport-next-page-jumps-n-pages-test ()
   "Test `agent-shell-viewport-next-page' jumps N pages.
 

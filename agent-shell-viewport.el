@@ -136,6 +136,15 @@ which changes out from under a stale comparison.")
 ;; Survives mode switches (edit <-> view) which clear buffer-local vars.
 (put 'agent-shell-viewport--page-cursor 'permanent-local t)
 
+(defvar-local agent-shell-viewport--page-points nil
+  "Alist mapping a history page index to the point last read on it.
+
+Recorded whenever a page is left, and consulted by the paging commands so
+returning to a page lands where reading stopped instead of on its prompt.
+Indexes count from the oldest page, as in
+`agent-shell-viewport--page-cursor'.")
+(put 'agent-shell-viewport--page-points 'permanent-local t)
+
 (defvar-local agent-shell-viewport--ring-index nil
   "Current index into `comint-input-ring' for history navigation.")
 ;; Survives mode switches (edit <-> view) which clear buffer-local vars.
@@ -1271,6 +1280,8 @@ point (recentered), else at the end.  Callers that append, like
 Remembers the page being left so a later `agent-shell-viewport-previous-page'
 can return to it."
   (when-let* ((pos (agent-shell-viewport--position :force-refresh t)))
+    (setf (alist-get (map-elt pos :current) agent-shell-viewport--page-points)
+          (point))
     (setq agent-shell-viewport--page-cursor
           `((:index . ,(map-elt pos :current))
             (:point . ,(point)))))
@@ -1456,7 +1467,7 @@ can return to it."
   (insert "continue")
   (agent-shell-viewport-compose-send))
 
-(defun agent-shell-viewport-previous-page (&optional n)
+(defun agent-shell-viewport-previous-page (&optional n restore-point)
   "Go back one page.
 
 From a history page, shows the preceding interaction.  From the compose
@@ -1465,16 +1476,21 @@ recorded), snapshotting the draft first.
 
 N (default 1) is how many interactions to move back; a prefix argument
 supplies it.  From the compose page, the return counts as the first of
-them.  A negative N moves forward instead, though never into compose."
+them.  A negative N moves forward instead, though never into compose.
+
+With RESTORE-POINT, as when called interactively, a history page shown
+again lands where it was last read."
   (declare (modes agent-shell-viewport-view-mode
                   agent-shell-viewport-edit-mode))
-  (interactive "p")
+  (interactive (list (prefix-numeric-value current-prefix-arg) t))
   (agent-shell-viewport--ensure-buffer)
   (if (derived-mode-p 'agent-shell-viewport-edit-mode)
       (agent-shell-viewport--leave-compose-page n)
-    (agent-shell-viewport-next-page :backwards t :start-at-top t :n n)))
+    (agent-shell-viewport-next-page :backwards t :start-at-top t :n n
+                                    :restore-point restore-point)))
 
-(cl-defun agent-shell-viewport-next-page (&key backwards start-at-top n)
+(cl-defun agent-shell-viewport-next-page (&key backwards start-at-top n
+                                               restore-point)
   "Show next interaction (request / response).
 
 If BACKWARDS is non-nil, go to previous interaction.
@@ -1482,13 +1498,16 @@ If START-AT-TOP is non-nil, position at point-min regardless of direction.
 N (default 1) is how many interactions to move; a prefix argument
 supplies it.  A negative N moves the other way, and a zero N does
 nothing.  A jump past either end stops on the first or last page.
+With RESTORE-POINT, as when called interactively, the page shown lands
+where it was last read, when it was read before.
 
 Paging never enters the compose page: a repeated key or a count that
 overshoots would otherwise land in the draft and type into it.  Use
 `agent-shell-viewport-reply' to compose."
   (declare (modes agent-shell-viewport-view-mode
                   agent-shell-viewport-edit-mode))
-  (interactive (list :n (prefix-numeric-value current-prefix-arg)))
+  (interactive (list :n (prefix-numeric-value current-prefix-arg)
+                     :restore-point t))
   (agent-shell-viewport--ensure-buffer)
   (when (derived-mode-p 'agent-shell-viewport-edit-mode)
     (user-error "No next page"))
@@ -1509,15 +1528,20 @@ overshoots would otherwise land in the draft and type into it.  Use
        ((and backwards (= current 1))
         (user-error "First page"))
        (t
+        (setf (alist-get current agent-shell-viewport--page-points) (point))
         (agent-shell-viewport--show-page
          (max 1 (min total (+ current (if backwards (- n) n))))
-         :at-end (and backwards (not start-at-top))))))))
+         :at-end (and backwards (not start-at-top))
+         :restore-point restore-point))))))
 
-(cl-defun agent-shell-viewport--show-page (index &key at-end)
+(cl-defun agent-shell-viewport--show-page (index &key at-end restore-point)
   "Show history page INDEX, counted from the oldest page.
 
-Point goes to the start of the page, or its end with AT-END.  Records
-INDEX as the page cursor and returns the shown (PROMPT . RESPONSE)."
+Point goes to the start of the page, or its end with AT-END.  With
+RESTORE-POINT, it goes instead to the point last read on the page, if
+recorded in `agent-shell-viewport--page-points' and still within the
+page.  Records INDEX as the page cursor and returns the shown
+\(PROMPT . RESPONSE)."
   (let ((next (with-current-buffer (agent-shell-viewport--shell-buffer)
                 ;; Index-based, rather than a relative
                 ;; comint-previous-prompt/next-prompt step, so a tool
@@ -1534,7 +1558,13 @@ INDEX as the page cursor and returns the shown (PROMPT . RESPONSE)."
                         (map-elt turn :response))))))
     (agent-shell-viewport--initialize
      :prompt (car next) :response (cdr next))
-    (goto-char (if at-end (point-max) (point-min)))
+    (goto-char
+     (let ((remembered (and restore-point
+                            (alist-get index agent-shell-viewport--page-points))))
+       (cond
+        ((and remembered (<= (point-min) remembered (point-max))) remembered)
+        (at-end (point-max))
+        (t (point-min)))))
     (agent-shell-viewport--recenter)
     (setq agent-shell-viewport--page-cursor
           `((:index . ,index)
