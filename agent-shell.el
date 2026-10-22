@@ -6192,17 +6192,47 @@ must end at a word boundary in LONG, so \"Read\" does not match
          (or (= (length short) (length long))
              (not (eq (char-syntax (aref long (length short))) ?w))))))
 
+(defvar-local agent-shell--display-width nil
+  "Body width of the window this shell's text was last read in.
+
+Recorded by `agent-shell--display-width' while the shell or its
+viewport is on screen, and used while neither is.")
+
+(defun agent-shell--display-width (buffer)
+  "Return the body width of the window BUFFER's rendered text is read in.
+
+Prefers a window showing BUFFER itself, then one showing BUFFER's
+viewport, whose page mirrors BUFFER's rendered text
+\(see `agent-shell-viewport--initialize'), and records that width.
+With neither showing -- say, both sit in another workspace -- returns
+the width last recorded, else 80.
+
+Never measures some other window: the selected or first window on the
+frame is unrelated to where the text is read, and can be far narrower
+or wider.  Measuring by it would cut the text to that width -- not just
+for display, but for good, since the text is rendered once and copied
+around after."
+  (if-let* (((buffer-live-p buffer))
+            (window (or (get-buffer-window buffer t)
+                        (when-let* ((viewport (agent-shell-viewport--buffer
+                                               :shell-buffer buffer :existing-only t)))
+                          (get-buffer-window viewport t)))))
+      (setf (buffer-local-value 'agent-shell--display-width buffer)
+            (window-body-width window))
+    (or (and (buffer-live-p buffer)
+             (buffer-local-value 'agent-shell--display-width buffer))
+        80)))
+
 (cl-defun agent-shell--fit-to-window-line (&key text buffer reserved)
   "Return TEXT ellipsized to fit on one line of BUFFER's window.
 
 RESERVED is the number of columns already taken on that line.  BUFFER
-displayed in no window is measured against the selected frame instead.
+displayed in no window is measured where its text is read instead (see
+`agent-shell--display-width').
 
 \"cd /tmp && make test\" with 10 columns to spare -> \"cd /tmp &…\""
   (when-let* ((text)
-              (available (- (window-body-width
-                             (or (and buffer (get-buffer-window buffer t))
-                                 (frame-first-window)))
+              (available (- (agent-shell--display-width buffer)
                             (or reserved 0))))
     (if (> (string-width text) available)
         (truncate-string-to-width text (max available 1) nil nil "…")

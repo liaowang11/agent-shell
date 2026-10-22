@@ -13561,12 +13561,16 @@ command would otherwise flash as a block before the description lands."
   (let ((state `((:tool-calls . (("t1" . ((:kind . "execute")
                                           (:status . "pending")
                                           (:title . ,(make-string 200 ?x)))))))))
-    (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 60)))
-      (let ((label (agent-shell-make-tool-call-label state "t1")))
-        (should (string-suffix-p "…" (map-elt label :title)))
-        (should (<= (+ (string-width (map-elt label :title))
-                       (string-width (map-elt label :status)))
-                    60))))
+    (save-window-excursion
+      (with-temp-buffer
+        (set-window-buffer (selected-window) (current-buffer))
+        (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 60)))
+          (let ((label (agent-shell-make-tool-call-label
+                        (cons (cons :buffer (current-buffer)) state) "t1")))
+            (should (string-suffix-p "…" (map-elt label :title)))
+            (should (<= (+ (string-width (map-elt label :title))
+                           (string-width (map-elt label :status)))
+                        60))))))
     ;; The description replaces the stand-in untouched once it arrives.
     (should (equal "Build it"
                    (substring-no-properties
@@ -13591,6 +13595,76 @@ body to measure."
       (should (equal "cd /tmp"
                      (agent-shell--fit-to-window-line
                       :text "cd /tmp" :buffer (current-buffer)))))))
+
+(ert-deftest agent-shell--fit-to-window-line-viewport-shown-test ()
+  "A shell buffer shown in no window is measured where its text is read.
+
+With a viewport taking over the display, the shell has no window of its
+own.  Measuring some unrelated window on the frame -- a narrow side
+window, say -- truncated a command to a fraction of the width its
+viewport page shows it at, and the text is rendered once, so the cut
+was permanent."
+  (save-window-excursion
+    (delete-other-windows)
+    (let* ((shell (generate-new-buffer " *agent-shell-fit-shell*"))
+           (viewport (get-buffer-create
+                      (concat (buffer-name shell) agent-shell-viewport--suffix)))
+           (text (make-string 80 ?x)))
+      (unwind-protect
+          (progn
+            ;; The viewport holds the display; the shell has no window.
+            (set-window-buffer (selected-window) viewport)
+            (let ((side (split-window-right)))
+              (set-window-buffer side (generate-new-buffer " *agent-shell-side*"))
+              (should-not (get-buffer-window shell t))
+              ;; SIDE stands in for the narrow window `frame-first-window'
+              ;; can land on.  Widths are stubbed so the test does not
+              ;; depend on the size of the frame it runs in.
+              (cl-letf (((symbol-function 'frame-first-window)
+                         (lambda (&optional _frame) side))
+                        ((symbol-function 'window-body-width)
+                         (lambda (&optional window _pixelwise)
+                           (if (eq window side) 20 200))))
+                (should (equal text
+                               (agent-shell--fit-to-window-line
+                                :text text :buffer shell))))
+              (kill-buffer (window-buffer side))))
+        (kill-buffer viewport)
+        (kill-buffer shell)))))
+
+(ert-deftest agent-shell--fit-to-window-line-hidden-uses-last-width-test ()
+  "A shell hidden along with its viewport is measured at its last width.
+
+With both off screen -- say, in another workspace -- the selected window
+is unrelated to where the text will be read.  Measuring by it cut
+commands to the width of whatever window happened to be selected, often
+a full-frame one far wider than the viewport page."
+  (save-window-excursion
+    (delete-other-windows)
+    (let* ((shell (generate-new-buffer " *agent-shell-fit-shell*"))
+           (viewport (get-buffer-create
+                      (concat (buffer-name shell) agent-shell-viewport--suffix)))
+           (other (generate-new-buffer " *agent-shell-other*"))
+           (text (make-string 80 ?x)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'window-body-width)
+                     (lambda (&optional window _pixelwise)
+                       (if (eq (window-buffer window) viewport) 40 200))))
+            ;; Rendered once while the viewport is shown: 40 columns.
+            (set-window-buffer (selected-window) viewport)
+            (should (= 40 (string-width
+                           (agent-shell--fit-to-window-line
+                            :text text :buffer shell))))
+            ;; Both hidden; the selected window is 200 wide.
+            (set-window-buffer (selected-window) other)
+            (should-not (get-buffer-window shell t))
+            (should-not (get-buffer-window viewport t))
+            (should (= 40 (string-width
+                           (agent-shell--fit-to-window-line
+                            :text text :buffer shell)))))
+        (kill-buffer other)
+        (kill-buffer viewport)
+        (kill-buffer shell)))))
 
 (ert-deftest agent-shell-make-tool-call-label-prefix-description-test ()
   "A title and description where one extends the other render once.
