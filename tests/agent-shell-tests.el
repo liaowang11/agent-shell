@@ -979,11 +979,11 @@ SESSION-ID defaults to \"s1\"."
                           (agent-shell-tests--claude-session-state "requires_action")
                           (agent-shell-tests--claude-session-state "idle")))
                    '((:event state-changed
-                      :data ((:state . "running") (:stop-reason)))
+                      :data ((:id) (:state . "running") (:stop-reason)))
                      (:event state-changed
-                      :data ((:state . "requires_action") (:stop-reason)))
+                      :data ((:id) (:state . "requires_action") (:stop-reason)))
                      (:event state-changed
-                      :data ((:state . "idle") (:stop-reason))))))
+                      :data ((:id) (:state . "idle") (:stop-reason))))))
     (should (equal (map-elt state :agent-state) "idle"))))
 
 (ert-deftest agent-shell--on-notification-state-update-test ()
@@ -996,9 +996,9 @@ SESSION-ID defaults to \"s1\"."
                     (list (agent-shell-tests--state-update "running")
                           (agent-shell-tests--state-update "idle" "end_turn")))
                    '((:event state-changed
-                      :data ((:state . "running") (:stop-reason)))
+                      :data ((:id) (:state . "running") (:stop-reason)))
                      (:event state-changed
-                      :data ((:state . "idle") (:stop-reason . "end_turn"))))))))
+                      :data ((:id) (:state . "idle") (:stop-reason . "end_turn"))))))))
 
 (ert-deftest agent-shell--on-notification-state-ignores-other-sessions-test ()
   "Only the root session's state is the shell's, and only known states count."
