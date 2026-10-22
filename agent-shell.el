@@ -4170,8 +4170,62 @@ state.  Only the root session's state counts, and only a state in
     (map-put! state :agent-state agent-state)
     (agent-shell--emit-event
      :event 'state-changed
-     :data (list (cons :state agent-state)
+     :data (list (cons :id nil)
+                 (cons :state agent-state)
                  (cons :stop-reason stop-reason)))))
+
+(defun agent-shell--child-states (state)
+  "Return the run state of each of STATE's subagents and async tasks.
+
+Each element is (ID RUN-STATE STOP-REASON), in the terms of
+`agent-shell--note-agent-state'.  ID is \"subagent/\" or \"task/\" and
+the child's own id: a path under the root, as the Program Status
+Protocol (OSC 7501) names records.  A subagent runs until its record
+gains `:ended-at', waiting while its last update said
+\"requires_action\"; an async task until its `:state' is terminal."
+  (append
+   (mapcar (lambda (entry)
+             (let ((subagent (cdr entry)))
+               (cons (concat "subagent/" (car entry))
+                     (if (map-elt subagent :ended-at)
+                         (list "idle" (pcase (map-elt subagent :state)
+                                        ("completed" "end_turn")
+                                        ("failed" "error")
+                                        ("cancelled" "cancelled")))
+                       (list (if (equal (map-elt subagent :work-state)
+                                        "requires_action")
+                                 "requires_action"
+                               "running")
+                             nil)))))
+           (map-elt state :native-subagents))
+   (mapcar (lambda (entry)
+             (cons (concat "task/" (car entry))
+                   (pcase (plist-get (cdr entry) :state)
+                     ("completed" (list "idle" "end_turn"))
+                     ("failed" (list "idle" "error"))
+                     ("stopped" (list "idle" "cancelled"))
+                     (_ (list "running" nil)))))
+           (map-elt state :async-tasks))))
+
+(defun agent-shell--sync-child-states (state)
+  "Emit `state-changed' for each of STATE's children whose run state changed.
+Compares `agent-shell--child-states' with what was last reported, so
+every subagent and async task change can call it.  Each event carries
+the child's `:id'."
+  (when-let* ((buffer (map-elt state :buffer))
+              ((buffer-live-p buffer)))
+    (let ((reported (map-elt state :child-states))
+          (current (agent-shell--child-states state)))
+      (agent-shell--ensure-state-key state :child-states)
+      (map-put! state :child-states current)
+      (with-current-buffer buffer
+        (dolist (child current)
+          (unless (equal (cdr child) (cdr (assoc (car child) reported)))
+            (agent-shell--emit-event
+             :event 'state-changed
+             :data (list (cons :id (car child))
+                         (cons :state (nth 1 child))
+                         (cons :stop-reason (nth 2 child))))))))))
 
 (defun agent-shell--note-unknown-session (state acp-notification)
   "Warn once that ACP-NOTIFICATION comes from a session STATE does not know.
@@ -6750,6 +6804,9 @@ later non-terminal state makes it running once more.
                    (list (cons :name name)
                          (cons :task task)
                          (cons :state subagent-state)
+                         ;; The RFD state itself, which tells waiting
+                         ;; from running (see `agent-shell--child-states').
+                         (cons :work-state (map-nested-elt update '(state state)))
                          (cons :can-cancel can-cancel)
                          (cons :error error-message))))
       ;; A SendMessage ran an idle child again.  The summary kept at
@@ -10013,12 +10070,15 @@ Session events:
     :data contains :stop-reason, :usage and :meta
   `session-title-changed' - Session title updated
     :data contains :title
-  `state-changed'         - The agent declared a new run state
-    :data contains :state (\"running\", \"requires_action\" or \"idle\",
-    as ACP v2's `state_update' names them) and :stop-reason (for
-    example \"end_turn\", nil when not reported).  It covers turns the
-    agent starts on its own too.  Only agents that report it: Claude
-    Code and omp.
+  `state-changed'         - The session or one of its children changed
+    run state
+    :data contains :id, :state (\"running\", \"requires_action\" or
+    \"idle\", as ACP v2's `state_update' names them) and :stop-reason
+    (for example \"end_turn\", nil when not reported).  :id is nil for
+    the session itself, whose state only agents that declare one
+    report (Claude Code and omp), and covers the turns it starts on
+    its own too.  For a child it is \"subagent/ID\" or \"task/ID\",
+    reported for every agent with subagents or async tasks.
   `vcs-state-changed'     - The agent's shell command changed git state
     :data contains :kind (\"commit\", \"push\", \"merge\", \"rebase\"
     or a newer kind), :branch (may be nil) and :cwd (the directory the

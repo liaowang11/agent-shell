@@ -1340,6 +1340,62 @@ merge only the fields they carry, and a terminal state retires it."
     (should (member "1-C1" (map-elt (agent-shell-tests--subagent-report rendered "child")
                                     :blocks)))))
 
+(defmacro agent-shell-tests--with-state-changes (var &rest body)
+  "Run BODY collecting the data of every `state-changed' into VAR, in order."
+  (declare (indent 1))
+  `(let* ((emit (symbol-function 'agent-shell--emit-event))
+          (,var nil))
+     (cl-letf (((symbol-function 'agent-shell--emit-event)
+                (lambda (&rest args)
+                  (when (eq (plist-get args :event) 'state-changed)
+                    (setq ,var (append ,var (list (plist-get args :data)))))
+                  (apply emit args))))
+       ,@body)))
+
+(ert-deftest agent-shell-subagent-state-changes-test ()
+  "A subagent's run state reaches subscribers under its own id."
+  (agent-shell-tests--with-state-changes changes
+    (agent-shell-tests--subagent-shell
+     (lambda (send _end-turn _prompt)
+       (funcall send "root" '(sessionUpdate . "subagent_update")
+                '(sessionId . "child") '(title . "Researcher")
+                '(state (state . "running")))
+       ;; Its work is no change of state.
+       (funcall send "child" '(sessionUpdate . "tool_call")
+                '(toolCallId . "C1") '(title . "Read foo.el")
+                '(kind . "read") '(status . "completed"))
+       (funcall send "root" '(sessionUpdate . "subagent_update")
+                '(sessionId . "child") '(state (state . "requires_action")))
+       (funcall send "root" '(sessionUpdate . "subagent_update")
+                '(sessionId . "child")
+                '(state (state . "idle") (stopReason . "end_turn")))))
+    (should (equal changes
+                   '(((:id . "subagent/child") (:state . "running") (:stop-reason))
+                     ((:id . "subagent/child") (:state . "requires_action")
+                      (:stop-reason))
+                     ((:id . "subagent/child") (:state . "idle")
+                      (:stop-reason . "end_turn")))))))
+
+(ert-deftest agent-shell-async-task-state-changes-test ()
+  "An async task's run state reaches subscribers under its own id."
+  (with-temp-buffer
+    (let ((state (list (cons :buffer (current-buffer))
+                       (cons :async-tasks nil)
+                       (cons :native-subagents nil)))
+          changes)
+      (cl-letf (((symbol-function 'agent-shell--emit-event)
+                 (lambda (&rest args) (push (plist-get args :data) changes))))
+        (agent-shell--save-async-task state "t1" "Build" "workflow" "desc" t t)
+        (agent-shell--sync-child-states state)
+        ;; Nothing changed since.
+        (agent-shell--sync-child-states state)
+        (agent-shell--set-async-task-state state "t1" "stopped")
+        (agent-shell--sync-child-states state))
+      (should (equal (nreverse changes)
+                     '(((:id . "task/t1") (:state . "running") (:stop-reason))
+                       ((:id . "task/t1") (:state . "idle")
+                        (:stop-reason . "cancelled"))))))))
+
 (defun agent-shell-tests--rfd-subagent-update (send session-id &rest fields)
   "Dispatch, via SEND, the RFD `subagent_update' for SESSION-ID with FIELDS.
 claude-agent-acp sends it on the parent, here the root."
