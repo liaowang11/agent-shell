@@ -17023,5 +17023,35 @@ returning the `archived' argument of each listing, oldest first."
                (should (equal (funcall listed) '("all" "all")))))))
       (kill-buffer other))))
 
+;;; Input ring history
+
+(ert-deftest agent-shell--input-history-round-trip-test ()
+  ;; shell-maker before 0.97.7 saved entries with their text properties,
+  ;; and compiled closures among them put NUL bytes in the history file,
+  ;; which it then read back as binary, so non-ASCII entries returned as
+  ;; raw bytes.  agent-shell requires 0.97.7 or later, which saves
+  ;; plain text and decodes old files itself; this pins that it reads
+  ;; entries as typed.
+  (let* ((shell-maker-root-path (make-temp-file "agent-shell-history" t))
+         (config (make-shell-maker-config :name "agent"))
+         (ring (make-ring 10)))
+    (unwind-protect
+        (progn
+          (ring-insert ring "测试")
+          (ring-insert ring (propertize "token消耗"
+                                        'modification-hooks (list "\0")
+                                        'face 'bold))
+          (with-temp-buffer
+            (setq-local comint-input-ring ring)
+            (shell-maker--write-input-ring-history config))
+          (with-temp-buffer
+            (comint-mode)
+            (shell-maker--read-input-ring-history config)
+            (let ((items (ring-elements comint-input-ring)))
+              (should (equal items '("token消耗" "测试")))
+              (should (seq-every-p #'multibyte-string-p items))
+              (should-not (text-properties-at 0 (car items))))))
+      (delete-directory shell-maker-root-path t))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here
