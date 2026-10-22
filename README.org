@@ -852,6 +852,8 @@ In view mode, use =r= to compose a reply, =R= to quote the response in a reply, 
 
 When a viewport command places or restores the cursor, the window shows the text above it if it is at the end of the buffer, with the cursor on the bottom line.  Otherwise the window centers on the cursor, stopping at the beginning of the buffer when necessary.  This applies to composing, restoring drafts, recalling prompt history, switching from the shell, and navigating pages or items; it does not recenter on every keystroke or streamed update.
 
+Command headings without a description show an ellipsized first line of the command.  Their width allows for the fold indicator, status label, group indentation, and Emacs's continuation marker when fringes are hidden.
+
 | Action                                      | Cursor destination                                           |
 |---------------------------------------------+--------------------------------------------------------------|
 | =r= without a selection                      | Saved draft position, or the end of a new empty draft         |
