@@ -2049,6 +2049,9 @@ framing blank stranded above the item it becomes.")
 
 (defun agent-shell-markdown--replace-list-marker (start end glyph)
   "Replace buffer text [START, END) with GLYPH, faced as a list marker.
+A face GLYPH already carries (an icon's, say) takes precedence;
+`agent-shell-markdown-list-marker' only fills what it leaves
+unspecified.
 The replaced text's application-level properties (agent-shell block
 ids and `agent-shell-ui-state', `read-only', `field') are carried
 onto GLYPH so it stays part of the surrounding output block; a bare
@@ -2057,7 +2060,8 @@ glyph."
   (let ((carried (agent-shell-markdown--carry-properties start)))
     (delete-region start end)
     (goto-char start)
-    (insert (propertize glyph 'face 'agent-shell-markdown-list-marker))
+    (insert glyph)
+    (add-face-text-property start (point) 'agent-shell-markdown-list-marker t)
     (when carried
       (add-text-properties start (point) carried))))
 

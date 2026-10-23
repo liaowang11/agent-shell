@@ -2517,6 +2517,31 @@ Outro"))))
     (should (eq (get-text-property (1- (point)) 'face)
                 'agent-shell-markdown-list-done))))
 
+(ert-deftest agent-shell-markdown-list-glyph-keeps-its-own-face ()
+  ;; A glyph string that carries a face (e.g. an icon) keeps it ahead of
+  ;; the marker face, for bullets and checkboxes alike; a plain glyph
+  ;; still gets the marker face alone.
+  (let ((agent-shell-markdown-list-bullets
+         (list (propertize "X" 'face 'error) "Y"))
+        (agent-shell-markdown-list-checkbox-unchecked
+         (propertize "U" 'face '(:inherit warning)))
+        (agent-shell-markdown-list-checkbox-checked "C"))
+    (with-temp-buffer
+      (insert "- Top\n  - Nested\n- [ ] Todo\n- [x] Done\n")
+      (agent-shell-markdown-replace-markup)
+      (goto-char (point-min))
+      (should (equal (get-text-property (point) 'face)
+                     '(error agent-shell-markdown-list-marker)))
+      (search-forward "Y")
+      (should (eq (get-text-property (match-beginning 0) 'face)
+                  'agent-shell-markdown-list-marker))
+      (search-forward "U")
+      (should (equal (get-text-property (match-beginning 0) 'face)
+                     '((:inherit warning) agent-shell-markdown-list-marker)))
+      (search-forward "C")
+      (should (eq (get-text-property (match-beginning 0) 'face)
+                  'agent-shell-markdown-list-marker)))))
+
 (ert-deftest agent-shell-markdown-list-ordered-keeps-number ()
   ;; Ordered items keep their number (no `display' swap) and face the
   ;; marker; no auto-renumbering, so the source round-trips.
