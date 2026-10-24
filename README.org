@@ -854,6 +854,8 @@ When a viewport command places or restores the cursor, the window shows the text
 
 Command headings without a description show an ellipsized first line of the command.  Their width allows for the fold indicator, status label, group indentation, and Emacs's continuation marker when fringes are hidden.
 
+While reading earlier output, streamed fragment updates keep the window anchored to the same text, including when labels or folded output above it change length.  If the anchored section itself is replaced, the window and cursor keep their character offsets within that section, limited to the replacement's length.  Reading at the end still follows new output.
+
 | Action                                      | Cursor destination                                           |
 |---------------------------------------------+--------------------------------------------------------------|
 | =r= without a selection                      | Saved draft position, or the end of a new empty draft         |

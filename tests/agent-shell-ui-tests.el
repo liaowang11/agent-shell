@@ -5,6 +5,165 @@
 
 ;;; Code:
 
+(defmacro agent-shell-ui-tests--with-reading-window (&rest body)
+  "Run BODY in a displayed fragment buffer, restoring windows afterward."
+  (declare (indent 0) (debug t))
+  `(save-window-excursion
+     (with-temp-buffer
+       (switch-to-buffer (current-buffer))
+       (agent-shell-ui-mode 1)
+       (agent-shell-ui-update-fragment
+        (agent-shell-ui-make-fragment-model
+         :block-id "earlier" :label-left "Working" :body "hidden output"
+         :group-id "activity" :group-label "Background activity" :group-expanded nil))
+       (agent-shell-ui-update-fragment
+        (agent-shell-ui-make-fragment-model
+         :block-id "reading" :label-left "Reading"
+         :body (mapconcat (lambda (n) (format "reading line %03d" n))
+                          (number-sequence 0 100) "\n"))
+        :expanded t)
+       (goto-char (point-min))
+       (search-forward "reading line 010")
+       (beginning-of-line)
+       (set-window-start (selected-window) (point) t)
+       (forward-line 3)
+       ,@body)))
+
+(ert-deftest agent-shell-ui-window-anchor-survives-earlier-updates-test ()
+  "Label changes and folded output above a reader do not move their view."
+  (agent-shell-ui-tests--with-reading-window
+    (dolist (label '("A much longer running status" "Done" "Working"))
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :block-id "earlier" :label-left label :body "more hidden output")
+       :append t)
+      (should (equal (buffer-substring-no-properties
+                      (window-start) (+ (window-start) 16))
+                     "reading line 010"))
+      (should (looking-at "reading line 013")))))
+
+(ert-deftest agent-shell-ui-window-anchor-survives-render-error-test ()
+  "An interrupted update restores the reading anchor before propagating errors."
+  (agent-shell-ui-tests--with-reading-window
+    (should (equal
+             (error-message-string
+              (should-error
+               (agent-shell-ui-update-fragment
+                (agent-shell-ui-make-fragment-model
+                 :block-id "earlier" :label-left "A longer failed status")
+                :on-post-process (lambda () (error "Render failed")))))
+             "Render failed"))
+    (should (equal (buffer-substring-no-properties
+                    (window-start) (+ (window-start) 16))
+                   "reading line 010"))
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model :block-id "earlier" :label-left "Done"))
+    (should (equal (buffer-substring-no-properties
+                    (window-start) (+ (window-start) 16))
+                   "reading line 010"))))
+
+(ert-deftest agent-shell-ui-window-anchor-survives-stream-append-test ()
+  "Appending to the block being read keeps its top line and point."
+  (agent-shell-ui-tests--with-reading-window
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :block-id "reading" :body "\nnew streamed line") :append t)
+    (should (equal (buffer-substring-no-properties
+                    (window-start) (+ (window-start) 16))
+                   "reading line 010"))
+    (should (looking-at "reading line 013"))))
+
+(ert-deftest agent-shell-ui-window-anchor-survives-body-replacement-test ()
+  "Replacing the anchored body keeps a bounded offset, not its header."
+  (agent-shell-ui-tests--with-reading-window
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :block-id "reading"
+      :body (mapconcat (lambda (n) (format "updated line %03d" n))
+                       (number-sequence 0 100) "\n")))
+    (should (equal (buffer-substring-no-properties
+                    (window-start) (+ (window-start) 16))
+                   "updated line 010"))
+    (should (looking-at "updated line 013"))
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model :block-id "reading" :body "short"))
+    (should (= (window-start)
+               (save-excursion (goto-char (point-min))
+                               (search-forward "short"))))))
+
+(ert-deftest agent-shell-ui-window-anchor-survives-label-regeneration-test ()
+  "An anchor inside a label survives label replacement and first body arrival."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model :block-id "status" :label-left "Working"))
+      (goto-char (point-min))
+      (search-forward "Wor")
+      (set-window-start (selected-window) (point) t)
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :block-id "status" :label-left "Updated status" :body "first body"))
+      (should (equal (buffer-substring-no-properties
+                      (window-start) (+ (window-start) 11))
+                     "ated status")))))
+
+(ert-deftest agent-shell-ui-window-anchor-below-regenerated-block-test ()
+  "Regenerating a block above the reader keeps the view on the text below.
+
+That includes a window start right at the end of the replaced text,
+where deletion collapses a marker onto the replacement's start."
+  (dolist (case '(;; Labels-only block regenerated when its body arrives.
+                  ((:block-id "earlier" :label-left "Working")
+                   (:block-id "earlier" :label-left "Working" :body "first body")
+                   (0 1))
+                  ;; Body replaced; it ends in a newline, so its end
+                  ;; starts the separator line two lines above the reader.
+                  ((:block-id "earlier" :label-left "Working" :body "a\nb\n\n")
+                   (:block-id "earlier" :body "x\ny\nz\n\n")
+                   (0 1 2))))
+    (save-window-excursion
+      (with-temp-buffer
+        (switch-to-buffer (current-buffer))
+        (agent-shell-ui-mode 1)
+        (let ((reading-start
+               (lambda ()
+                 (save-excursion (goto-char (point-min))
+                                 (search-forward "Reading")
+                                 (line-beginning-position)))))
+          (dolist (lines-above (caddr case))
+            (let ((inhibit-read-only t))
+              (erase-buffer))
+            (agent-shell-ui-update-fragment
+             (apply #'agent-shell-ui-make-fragment-model (car case)) :expanded t)
+            (agent-shell-ui-update-fragment
+             (agent-shell-ui-make-fragment-model
+              :block-id "reading" :label-left "Reading" :body "reading body")
+             :expanded t)
+            (goto-char (funcall reading-start))
+            (forward-line (- lines-above))
+            (set-window-start (selected-window) (point) t)
+            (let ((offset (- (funcall reading-start) (window-start))))
+              (agent-shell-ui-update-fragment
+               (apply #'agent-shell-ui-make-fragment-model (cadr case)))
+              (should (= (window-start)
+                         (- (funcall reading-start) offset))))))))))
+
+(ert-deftest agent-shell-ui-window-start-at-end-shows-new-output-test ()
+  "New output inserted at a window start at the buffer end stays in view."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (agent-shell-ui-mode 1)
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model :block-id "first" :body "first body"))
+      (let ((end (point-max)))
+        (set-window-start (selected-window) end t)
+        (agent-shell-ui-update-fragment
+         (agent-shell-ui-make-fragment-model :block-id "second" :body "new block"))
+        (should (= (window-start) end))
+        (should (string-match-p "new block" (buffer-substring (window-start) (point-max))))))))
+
 (ert-deftest agent-shell-ui-create-new-fragment-preserves-existing-test ()
   "Creating a fragment with a reused ID preserves the earlier fragment."
   (with-temp-buffer
