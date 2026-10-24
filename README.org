@@ -852,6 +852,8 @@ In view mode, use =r= to compose a reply, =R= to quote the response in a reply, 
 
 When a viewport command places or restores the cursor, the window shows the text above it if it is at the end of the buffer, with the cursor on the bottom line.  Otherwise the window centers on the cursor, stopping at the beginning of the buffer when necessary.  This applies to composing, restoring drafts, recalling prompt history, switching from the shell, and navigating pages or items; it does not recenter on every keystroke or streamed update.
 
+While reading earlier output, streamed fragment updates keep the window anchored to the same text, including when labels or folded output above it change length.  If the anchored section itself is replaced, the window and cursor keep their character offsets within that section, limited to the replacement's length.  Reading at the end still follows new output.
+
 | Action                                      | Cursor destination                                           |
 |---------------------------------------------+--------------------------------------------------------------|
 | =r= without a selection                      | Saved draft position, or the end of a new empty draft         |

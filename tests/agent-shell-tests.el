@@ -7,6 +7,45 @@
 
 ;;; Code:
 
+(ert-deftest agent-shell-render-view-preserves-reading-anchor-test ()
+  "Full rendering, including markdown labels, keeps the reader anchored."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (agent-shell-ui-mode 1)
+      (agent-shell--render-view-fragment
+       :model (agent-shell-ui-make-fragment-model
+               :block-id "earlier" :label-left "Working" :label-right "*status*"
+               :body "hidden output"))
+      (agent-shell--render-view-fragment
+       :model (agent-shell-ui-make-fragment-model
+               :block-id "reading"
+               :body (mapconcat (lambda (n) (format "reading line %03d" n))
+                                (number-sequence 0 100) "\n")))
+      (goto-char (point-min))
+      (search-forward "reading line 010")
+      (beginning-of-line)
+      (set-window-start (selected-window) (point) t)
+      (forward-line 3)
+      (dolist (label '("**A longer running status**" "*Done*" "`Working`"))
+        (agent-shell--render-view-fragment
+         :model (agent-shell-ui-make-fragment-model
+                 :block-id "earlier" :label-right label :body "more output")
+         :append t)
+        (should (equal (buffer-substring-no-properties
+                        (window-start) (+ (window-start) 16))
+                       "reading line 010"))
+        (should (looking-at "reading line 013")))
+      ;; A reader who returns to the end still follows new output.
+      (goto-char (point-max))
+      (set-window-start (selected-window) (point-max) t)
+      (agent-shell--render-view-fragment
+       :model (agent-shell-ui-make-fragment-model
+               :block-id "reading" :body "\nlatest streamed output")
+       :append t)
+      (should (eobp))
+      (should (string-suffix-p "latest streamed output\n\n" (buffer-string))))))
+
 (defconst agent-shell-tests--directory
   (file-name-directory (or load-file-name buffer-file-name))
   "Directory holding this test file.")

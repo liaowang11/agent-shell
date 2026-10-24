@@ -158,6 +158,40 @@ initial fold state.  v1 is two-level: a group may not itself be nested."
                        text)
   (insert text))
 
+(defvar agent-shell-ui--window-start nil
+  "Window-start marker for the current fragment update.
+Replacement paths adjust it when the anchored text itself is replaced.")
+
+(defvar agent-shell-ui--reading-point nil
+  "Point marker adjusted alongside the window start during visible updates.")
+
+(defun agent-shell-ui--anchor-offset (marker start end)
+  "Return MARKER's offset inside START through END, or nil outside it."
+  (when (and (markerp marker)
+             (eq (marker-buffer marker) (current-buffer))
+             (<= start marker) (< marker end))
+    (- marker start)))
+
+(defmacro agent-shell-ui--with-replaced-window-anchor (start end &rest body)
+  "Run BODY replacing START through END, preserving an anchor inside it.
+A marker follows edits outside the replaced text.  Inside it, keep the
+old character offset, bounded by the replacement's end (point after BODY),
+rather than letting deletion collapse the marker to the section start."
+  (declare (indent 2) (debug (form form body)))
+  `(let* ((replacement-start ,start)
+          (replacement-end ,end)
+          (anchor-offset (agent-shell-ui--anchor-offset
+                          agent-shell-ui--window-start replacement-start replacement-end))
+          (point-offset (agent-shell-ui--anchor-offset
+                         agent-shell-ui--reading-point replacement-start replacement-end)))
+     (prog1 (progn ,@body)
+       (when anchor-offset
+         (set-marker agent-shell-ui--window-start
+                     (min (+ replacement-start anchor-offset) (point))))
+       (when point-offset
+         (set-marker agent-shell-ui--reading-point
+                     (min (+ replacement-start point-offset) (point)))))))
+
 (cl-defun agent-shell-ui-update-fragment (model &key append create-new on-post-process navigation expanded no-undo)
   "Update or add a fragment using MODEL.
 
@@ -178,7 +212,9 @@ already-rendered content, so `agent-shell-markdown' frozen ranges
 stay intact and streaming append is O(new-chunk) rather than
 O(accumulated-body).  Label-only updates leave the body untouched."
   (let* ((window (get-buffer-window (current-buffer)))
-         (saved-window-start (and window (window-start window)))
+         (agent-shell-ui--window-start
+          (and window (copy-marker (window-start window) t)))
+         (agent-shell-ui--reading-point (and window (copy-marker (point))))
          ;; Marker so it survives the edits made while updating the block.
          ;; Bound out here so the unwind form below can release it.
          (block-end nil))
@@ -341,10 +377,12 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                                             (map-elt model :group-qualified-id))
                                       (cons :group-indent
                                             (map-elt model :group-indent)))))
-                          (delete-region block-start current-block-end)
-                          (goto-char block-start)
-                          (agent-shell-ui--insert-fragment
-                           final-model qualified-id (not collapsed) navigation))))))
+                          (agent-shell-ui--with-replaced-window-anchor
+                              block-start current-block-end
+                            (delete-region block-start current-block-end)
+                            (goto-char block-start)
+                            (agent-shell-ui--insert-fragment
+                             final-model qualified-id (not collapsed) navigation)))))))
                   (setq padding-end (or (marker-position block-end) (point)))))
                ;; New group child, inserted into the group's region.  The
                ;; group's trailing separator (after the header) already sits
@@ -425,8 +463,16 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                     (cons :group-header (map-elt group-header :range))))))
       (when (markerp block-end)
         (set-marker block-end nil))
-      (when window
-        (set-window-start window saved-window-start t)))))
+      (when agent-shell-ui--reading-point
+        (unwind-protect
+            (goto-char agent-shell-ui--reading-point)
+          (set-marker agent-shell-ui--reading-point nil)))
+      (when agent-shell-ui--window-start
+        (unwind-protect
+            (when (and (window-live-p window)
+                       (eq (window-buffer window) (current-buffer)))
+              (set-window-start window agent-shell-ui--window-start t))
+          (set-marker agent-shell-ui--window-start nil))))))
 
 (defun agent-shell-ui--read-fragment-labels (block-start block-end)
   "Return alist with :label-left and :label-right strings (no properties).
@@ -565,23 +611,24 @@ matches the body's current visibility, not caller-supplied state."
          (state (get-text-property (max body-start (1- body-end))
                                    'agent-shell-ui-state))
          (body-invisible (agent-shell-ui--body-invisible-p body-start body-end)))
-    (delete-region body-start body-end)
-    (goto-char body-start)
-    (when (and (stringp new-body) (not (string-empty-p new-body)))
-      (let ((trimmed new-body))
-        (when (string-prefix-p "\n" trimmed)
-          (setq trimmed (string-trim-left trimmed "\n")))
-        (when (string-suffix-p "\n\n" trimmed)
-          (setq trimmed (concat (string-trim-right trimmed) "\n\n")))
-        (let ((insert-start (point)))
-          (insert (agent-shell-ui--indent-text
-                   (string-remove-prefix "  " trimmed)
-                   (concat (or (map-elt state :group-indent) "") "  ")))
-          (let ((insert-end (point)))
-            (agent-shell-ui--apply-body-section-properties
-             insert-start insert-end qualified-id state body-invisible)
-            (agent-shell-ui--apply-trailing-whitespace-invisible
-             insert-start insert-end)))))
+    (agent-shell-ui--with-replaced-window-anchor body-start body-end
+      (delete-region body-start body-end)
+      (goto-char body-start)
+      (when (and (stringp new-body) (not (string-empty-p new-body)))
+        (let ((trimmed new-body))
+          (when (string-prefix-p "\n" trimmed)
+            (setq trimmed (string-trim-left trimmed "\n")))
+          (when (string-suffix-p "\n\n" trimmed)
+            (setq trimmed (concat (string-trim-right trimmed) "\n\n")))
+          (let ((insert-start (point)))
+            (insert (agent-shell-ui--indent-text
+                     (string-remove-prefix "  " trimmed)
+                     (concat (or (map-elt state :group-indent) "") "  ")))
+            (let ((insert-end (point)))
+              (agent-shell-ui--apply-body-section-properties
+               insert-start insert-end qualified-id state body-invisible)
+              (agent-shell-ui--apply-trailing-whitespace-invisible
+               insert-start insert-end))))))
     ;; Point sits at the end of what we wrote (or at BODY-START when the
     ;; new body was empty), so the caller can take the new range from here
     ;; rather than searching the block for it again (issue #757).
@@ -655,21 +702,22 @@ be handed in."
       (let* ((region-start (car region))
              (region-end (cdr region))
              (state (get-text-property region-start 'agent-shell-ui-state)))
-        (delete-region region-start region-end)
-        (goto-char region-start)
-        (let ((insert-start (point)))
-          (insert (agent-shell-ui-make-foldable-text
-                   :text new-text
-                   :hint "toggle"))
-          (let ((insert-end (point)))
-            (add-text-properties insert-start insert-end
-                                 (append (list 'agent-shell-ui-section section
-                                               'read-only t
-                                               'front-sticky '(read-only))
-                                         (agent-shell-ui--fragment-help-echo-properties qualified-id)))
-            (when state
-              (put-text-property insert-start insert-end
-                                 'agent-shell-ui-state state))))))))
+        (agent-shell-ui--with-replaced-window-anchor region-start region-end
+          (delete-region region-start region-end)
+          (goto-char region-start)
+          (let ((insert-start (point)))
+            (insert (agent-shell-ui-make-foldable-text
+                     :text new-text
+                     :hint "toggle"))
+            (let ((insert-end (point)))
+              (add-text-properties insert-start insert-end
+                                   (append (list 'agent-shell-ui-section section
+                                                 'read-only t
+                                                 'front-sticky '(read-only))
+                                           (agent-shell-ui--fragment-help-echo-properties qualified-id)))
+              (when state
+                (put-text-property insert-start insert-end
+                                     'agent-shell-ui-state state)))))))))
 
 
 (cl-defun agent-shell-ui-delete-fragment (&key namespace-id block-id no-undo)
