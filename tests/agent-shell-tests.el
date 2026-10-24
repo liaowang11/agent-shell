@@ -8,6 +8,63 @@
 
 ;;; Code:
 
+(ert-deftest agent-shell-render-view-preserves-reading-anchor-test ()
+  "Full rendering, including markdown labels, keeps the reader anchored."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (agent-shell-ui-mode 1)
+      (agent-shell--render-view-fragment
+       :model (agent-shell-ui-make-fragment-model
+               :block-id "earlier" :label-left "Working" :label-right "*status*"
+               :body "hidden output"))
+      (agent-shell--render-view-fragment
+       :model (agent-shell-ui-make-fragment-model
+               :block-id "reading"
+               :body (mapconcat (lambda (n) (format "reading line %03d" n))
+                                (number-sequence 0 100) "\n")))
+      (goto-char (point-min))
+      (search-forward "reading line 010")
+      (beginning-of-line)
+      (set-window-start (selected-window) (point) t)
+      (forward-line 3)
+      (dolist (label '("**A longer running status**" "*Done*" "`Working`"))
+        (agent-shell--render-view-fragment
+         :model (agent-shell-ui-make-fragment-model
+                 :block-id "earlier" :label-right label :body "more output")
+         :append t)
+        (should (equal (buffer-substring-no-properties
+                        (window-start) (+ (window-start) 16))
+                       "reading line 010"))
+        (should (looking-at "reading line 013")))
+      ;; A reader who returns to the end still follows new output.
+      (goto-char (point-max))
+      (set-window-start (selected-window) (point-max) t)
+      (agent-shell--render-view-fragment
+       :model (agent-shell-ui-make-fragment-model
+               :block-id "reading" :body "\nlatest streamed output")
+       :append t)
+      (should (= (window-start)
+                 (save-excursion (search-backward "latest") (pos-bol))))
+      (should (eobp))
+      (should (string-suffix-p "latest streamed output\n\n" (buffer-string))))))
+
+(ert-deftest agent-shell-update-fragment-above-prompt-stays-in-view-test ()
+  "A block rendered above the prompt shows when the window starts on the prompt."
+  (agent-shell-tests--with-persistent-prompt-shell
+   (lambda ()
+     (save-window-excursion
+       (switch-to-buffer (current-buffer))
+       (let ((prompt-line (pos-bol)))
+         (set-window-start (selected-window) prompt-line t)
+         (agent-shell--update-fragment
+          :state agent-shell--state :block-id "late" :label-left "Late"
+          :body "late body" :above-last-prompt t :expanded t)
+         (should (= (window-start) prompt-line))
+         (should (string-match-p
+                  "late body"
+                  (buffer-substring-no-properties (window-start) (point-max)))))))))
+
 (defconst agent-shell-tests--directory
   (file-name-directory (or load-file-name buffer-file-name))
   "Directory holding this test file.")
