@@ -8693,6 +8693,11 @@ MESSAGE-ID and RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
                 (padding-end (map-nested-elt range '(:padding :end)))
                 (block-start (map-nested-elt range '(:block :start)))
                 (block-end (map-nested-elt range '(:block :end))))
+      ;; `agent-shell-ui-update-fragment' already kept a scrolled-back
+      ;; reader on their text; restore that start, not the stale one.
+      ;; A marker, so the markdown rendering below can't leave it stale.
+      (when window
+        (setq saved-window-start (copy-marker (window-start window))))
       ;; Rendered output carries `read-only t' from
       ;; `agent-shell-ui--insert-fragment', so stamping a property over
       ;; it needs `inhibit-read-only' as the render calls below do.
@@ -8735,7 +8740,9 @@ MESSAGE-ID and RENDER-BODY-IMAGES as in `agent-shell--update-fragment'."
     ;; above it legitimately moves it, and restoring would make the
     ;; window jump.
     (when (and window (not auto-scroll))
-      (set-window-start window saved-window-start t))))
+      (set-window-start window saved-window-start t))
+    (when (markerp saved-window-start)
+      (set-marker saved-window-start nil))))
 
 (defun agent-shell--arm-stream-render-timer (state)
   "Schedule STATE's pending batch without postponing an existing timer.
@@ -9015,6 +9022,11 @@ can recover the ACP `messageId' a rendered message came from (used by
                    (padding-end (map-nested-elt range '(:padding :end)))
                    (block-start (map-nested-elt range '(:block :start)))
                    (block-end (map-nested-elt range '(:block :end))))
+         ;; `agent-shell-ui-update-fragment' already kept a scrolled-back
+         ;; reader on their text; restore that start, not the stale one.
+         ;; A marker, so the markdown rendering below can't leave it stale.
+         (when window
+           (setq saved-window-start (copy-marker (window-start window))))
          ;; Markdown can change section lengths after `range' is
          ;; returned.  Track the positions used after rendering.
          (let ((tracked-ranges
@@ -9099,6 +9111,8 @@ can recover the ACP `messageId' a rendered message came from (used by
       ;; back, never while following (see #964).
       (when (and window (not follow-output))
         (set-window-start window saved-window-start t))
+      (when (markerp saved-window-start)
+        (set-marker saved-window-start nil))
       (when (markerp saved-point)
         (set-marker saved-point nil))
       (when (markerp saved-mark)
