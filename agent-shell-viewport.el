@@ -113,6 +113,7 @@
 (defvar agent-shell-prefer-viewport-interaction)
 (defvar agent-shell-busy-submit-default-function)
 (defvar agent-shell-viewport-dismiss-on-send)
+(defvar agent-shell-viewport-reply-style)
 (defvar agent-shell-preferred-agent-config)
 (defvar agent-shell-session-strategy)
 (defvar agent-shell--state)
@@ -843,6 +844,35 @@ buffer."
                 (end (next-single-property-change start 'agent-shell-viewport-prompt)))
       (buffer-substring end (point-max)))))
 
+(defun agent-shell-viewport--response-messages ()
+  "Return the agent's messages in the buffer response, or nil if none.
+
+Messages are the top-level `agent_message_chunk' fragments, joined by a
+blank line.  Thoughts, tool calls and a subagent's messages (nested in
+its row's group) are left out."
+  (when-let* ((start (agent-shell-viewport--response-start)))
+    ;; A body can span several `agent-shell-ui-state' intervals, so collect
+    ;; text per fragment rather than per interval.
+    (let ((pos start)
+          (messages))
+      (while (< pos (point-max))
+        (let* ((state (get-text-property pos 'agent-shell-ui-state))
+               (qualified-id (map-elt state :qualified-id))
+               (next (next-single-property-change pos 'agent-shell-ui-state nil (point-max))))
+          (when (and qualified-id
+                     (not (map-elt state :group-id))
+                     (string-suffix-p "-agent_message_chunk" qualified-id)
+                     (eq (get-text-property pos 'agent-shell-ui-section) 'body))
+            (let ((text (buffer-substring-no-properties pos next)))
+              (if (equal (car (car messages)) qualified-id)
+                  (setcdr (car messages) (concat (cdr (car messages)) text))
+                (push (cons qualified-id text) messages))))
+          (setq pos next)))
+      (when messages
+        (string-join (mapcar (lambda (message) (string-trim (cdr message)))
+                             (nreverse messages))
+                     "\n\n")))))
+
 (defun agent-shell-viewport--prompt-start ()
   "Return the start position of the prompt, or nil if no prompt."
   (save-excursion
@@ -1315,25 +1345,201 @@ can return to it."
                    (point-max))))
     (agent-shell-viewport--recenter)))
 
-(defun agent-shell-viewport-reply ()
-  "Reply as a follow-up and compose another prompt/query."
+(defun agent-shell-viewport-reply (&optional other-style)
+  "Reply as a follow-up to the selected text, or to the page.
+
+Composes on the compose page or appends to the parked draft from the
+minibuffer, following `agent-shell-viewport-reply-style'.  With a
+prefix argument OTHER-STYLE, replies the other way, which with the
+minibuffer style is how the compose page opens on the draft."
   (declare (modes agent-shell-viewport-view-mode))
-  (interactive)
+  (interactive "P")
+  (if (agent-shell-viewport--reply-in-minibuffer-p other-style)
+      (progn
+        (unless (derived-mode-p 'agent-shell-viewport-view-mode)
+          (user-error "Not in a shell viewport buffer"))
+        (let ((region (map-elt (agent-shell--get-region :deactivate t) :content)))
+          (agent-shell-viewport--reply-to-draft
+           :quoted-text (when region (string-trim region)))))
+    (agent-shell-viewport--compose-reply)))
+
+(defun agent-shell-viewport--reply-in-minibuffer-p (other-style)
+  "Return non-nil when a reply goes through the minibuffer.
+OTHER-STYLE non-nil picks the style `agent-shell-viewport-reply-style'
+does not name."
+  (xor other-style (eq agent-shell-viewport-reply-style 'minibuffer)))
+
+(defun agent-shell-viewport--compose-reply ()
+  "Switch to the compose page, quoting the selected text, if any."
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)
     (user-error "Not in a shell viewport buffer"))
   (let ((region (map-elt (agent-shell--get-region :deactivate t) :content)))
     (agent-shell-viewport--enter-compose-page
      :quoted-text (when region (string-trim region)))))
 
-(defun agent-shell-viewport-quote-reply ()
-  "Reply with the entire response block-quoted."
-  (declare (modes agent-shell-viewport-view-mode))
+(defvar agent-shell-viewport--reply-preview-lines 4
+  "Most lines of quoted text previewed above a minibuffer reply.")
+
+(defvar agent-shell-viewport--reply-preview-reserved-rows 4
+  "Minibuffer rows a minibuffer reply keeps clear of the preview.
+Room for the prompt, the label `agent-shell-chat-mode' puts above it,
+and a line of input.")
+
+(defun agent-shell-viewport--reply-preview (text width rows)
+  "Return a preview of quoted TEXT, cut to fit WIDTH columns and ROWS.
+
+Opens with a caption line and keeps to
+`agent-shell-viewport--reply-preview-lines' lines of TEXT, indented
+under the caption, with a final \"…\" line when TEXT has more.  Ends
+with a newline, so the prompt starts on a line of its own.  Returns nil
+when ROWS leaves no room for a line of TEXT.  For example, with 2 lines:
+
+  Replying to:
+    one
+    two
+    …
+
+The caption keeps the first row plain ASCII.  A glyph rising above the
+font's ascent grows the first row of a window past the height the
+minibuffer is sized for, and a preview taller than the minibuffer can
+grow overflows it.  Either way redisplay can only scroll past the whole
+preview, an overlay string at one position, to point, hiding the prompt
+and the input."
+  (let* ((lines (split-string text "\n"))
+         (fits (min agent-shell-viewport--reply-preview-lines (1- rows)))
+         (shown (if (length> lines fits)
+                    (append (seq-take lines (min agent-shell-viewport--reply-preview-lines
+                                                 (- rows 2)))
+                            '("…"))
+                  lines)))
+    (when (length> shown (if (length> lines fits) 1 0))
+      (concat (propertize "Replying to:\n" 'face 'shadow)
+              (mapconcat (lambda (line)
+                           (propertize (concat "  " (truncate-string-to-width
+                                                     line (- width 2) nil nil "…"))
+                                       'face 'agent-shell-markdown-blockquote))
+                         shown "\n")
+              "\n"))))
+
+(defun agent-shell-viewport--max-minibuffer-rows ()
+  "Return how many rows the current minibuffer window can grow to."
+  (if (floatp max-mini-window-height)
+      (floor (* max-mini-window-height (frame-height)))
+    max-mini-window-height))
+
+(defun agent-shell-viewport--show-reply-preview (text)
+  "Preview TEXT above the prompt of the current minibuffer.
+Shows nothing when the minibuffer has no room for it."
+  (when-let* ((preview (agent-shell-viewport--reply-preview
+                        text (window-max-chars-per-line)
+                        (- (agent-shell-viewport--max-minibuffer-rows)
+                           agent-shell-viewport--reply-preview-reserved-rows))))
+    ;; An after-string, not a before-string: at one position, after-strings
+    ;; display ahead of other overlays' before-strings, such as the label
+    ;; `agent-shell-chat-mode' puts over the prompt, whereas before-strings
+    ;; of equal priority come in no set order (see `compare_overlay_entries'
+    ;; in xdisp.c).
+    (overlay-put (make-overlay (point-min) (point-min)) 'after-string preview)))
+
+(defvar agent-shell-viewport--reply-send nil
+  "How the minibuffer reply being read asked to send the draft.
+
+\\<agent-shell-viewport-edit-mode-map>nil to only add the reply to the draft, `default' to send it as
+\\[agent-shell-viewport-compose-send] does on the compose page, or
+`override' as \\[agent-shell-viewport-compose-send-override] does.")
+
+(defun agent-shell-viewport-reply-send ()
+  "Add the minibuffer reply to the draft and send the draft."
   (interactive)
+  (setq agent-shell-viewport--reply-send 'default)
+  (exit-minibuffer))
+
+(defun agent-shell-viewport-reply-send-override ()
+  "Add the minibuffer reply to the draft and send it through the override route.
+
+See `agent-shell-viewport-compose-send-override'."
+  (interactive)
+  (setq agent-shell-viewport--reply-send 'override)
+  (exit-minibuffer))
+
+(defvar agent-shell-viewport-reply-minibuffer-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'agent-shell-viewport-reply-send)
+    (define-key map (kbd "M-RET") #'agent-shell-viewport-reply-send-override)
+    (define-key map (kbd "M-<return>") #'agent-shell-viewport-reply-send-override)
+    map)
+  "Keymap added while reading a minibuffer reply from the viewport.
+
+RET only adds the reply to the draft; these keys send the draft too,
+bound as the compose page binds its send commands.")
+
+(cl-defun agent-shell-viewport--reply-to-draft (&key quoted-text)
+  "Read a reply from the minibuffer and append it to the parked draft.
+
+QUOTED-TEXT, when non-nil, goes in as a block quote ahead of the reply.
+The draft is what `agent-shell-viewport--compose-snapshot' parks, so the
+compose page opens on it, with point at its end.  Quitting, or an empty
+reply with no QUOTED-TEXT, leaves the draft alone.
+
+While reading, QUOTED-TEXT is previewed above the prompt (see
+`agent-shell-viewport--reply-preview'), and the keys in
+`agent-shell-viewport-reply-minibuffer-map' send the draft, reply
+included, from the compose page."
+  (let* ((agent-shell-viewport--reply-send nil)
+         (reply (string-trim
+                 (minibuffer-with-setup-hook
+                     (lambda ()
+                       (use-local-map (make-composed-keymap
+                                       agent-shell-viewport-reply-minibuffer-map
+                                       (current-local-map)))
+                       (when (and quoted-text (not (string-empty-p quoted-text)))
+                         (agent-shell-viewport--show-reply-preview quoted-text)))
+                   (with-current-buffer (agent-shell-viewport--shell-buffer)
+                     (agent-shell--prompt-queue-read)))))
+         (addition (string-join
+                    (delq nil (list (when quoted-text
+                                      (agent-shell--block-quote quoted-text))
+                                    (unless (string-empty-p reply) reply)))
+                    "\n\n")))
+    (unless (string-empty-p addition)
+      (let ((content (if-let* ((draft (map-elt agent-shell-viewport--compose-snapshot
+                                               :content)))
+                         (concat draft "\n\n" addition)
+                       addition)))
+        (setq agent-shell-viewport--compose-snapshot
+              `((:content . ,content)
+                (:location . ,(1+ (length content)))))
+        (unless agent-shell-viewport--reply-send
+          (agent-shell--echo "Reply added to draft"))))
+    (when agent-shell-viewport--reply-send
+      (unless agent-shell-viewport--compose-snapshot
+        (user-error "Nothing to send"))
+      ;; Sent from the compose page, as `agent-shell-viewport-reply-yes'
+      ;; does, so the draft takes whichever route that page would.
+      (agent-shell-viewport--enter-compose-page)
+      (goto-char (point-max))
+      (if (eq agent-shell-viewport--reply-send 'override)
+          (agent-shell-viewport-compose-send-override)
+        (agent-shell-viewport-compose-send)))))
+
+(defun agent-shell-viewport-quote-reply (&optional other-style)
+  "Reply with the agent's messages block-quoted.
+
+Falls back to the entire response when it holds no agent message.
+Follows `agent-shell-viewport-reply-style', or with a prefix argument
+OTHER-STYLE, the other style (see `agent-shell-viewport-reply')."
+  (declare (modes agent-shell-viewport-view-mode))
+  (interactive "P")
   (unless (derived-mode-p 'agent-shell-viewport-view-mode)
     (user-error "Not in a shell viewport buffer"))
-  (let ((response (or (agent-shell-viewport--response) "")))
-    (agent-shell-viewport--enter-compose-page
-     :quoted-text (string-trim (substring-no-properties response)))))
+  (let ((response (or (agent-shell-viewport--response-messages)
+                      (agent-shell-viewport--response)
+                      "")))
+    (if (agent-shell-viewport--reply-in-minibuffer-p other-style)
+        (agent-shell-viewport--reply-to-draft
+         :quoted-text (string-trim (substring-no-properties response)))
+      (agent-shell-viewport--enter-compose-page
+       :quoted-text (string-trim (substring-no-properties response))))))
 
 (defun agent-shell-viewport-reply-yes ()
   "Reply with \"yes\" and send immediately."
@@ -1341,7 +1547,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "yes")
   (agent-shell-viewport-compose-send))
@@ -1352,7 +1558,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "1")
   (agent-shell-viewport-compose-send))
@@ -1363,7 +1569,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "2")
   (agent-shell-viewport-compose-send))
@@ -1374,7 +1580,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "3")
   (agent-shell-viewport-compose-send))
@@ -1385,7 +1591,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "4")
   (agent-shell-viewport-compose-send))
@@ -1396,7 +1602,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "5")
   (agent-shell-viewport-compose-send))
@@ -1407,7 +1613,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "6")
   (agent-shell-viewport-compose-send))
@@ -1418,7 +1624,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "7")
   (agent-shell-viewport-compose-send))
@@ -1429,7 +1635,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "8")
   (agent-shell-viewport-compose-send))
@@ -1440,7 +1646,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "9")
   (agent-shell-viewport-compose-send))
@@ -1451,7 +1657,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "more")
   (agent-shell-viewport-compose-send))
@@ -1462,7 +1668,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "again")
   (agent-shell-viewport-compose-send))
@@ -1473,7 +1679,7 @@ can return to it."
   (interactive)
   (when (agent-shell-viewport--busy-p)
     (user-error "Busy, please wait"))
-  (agent-shell-viewport-reply)
+  (agent-shell-viewport--compose-reply)
   (goto-char (point-max))
   (insert "continue")
   (agent-shell-viewport-compose-send))

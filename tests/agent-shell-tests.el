@@ -6100,6 +6100,245 @@ so the command must not append a second time."
         (when-let ((vp (get-buffer " *test-shell* [viewport]")))
           (kill-buffer vp))))))
 
+(ert-deftest agent-shell-viewport-minibuffer-reply-appends-to-draft-test ()
+  "With `agent-shell-viewport-reply-style' `minibuffer', a reply is read
+from the minibuffer and appended to the parked draft.
+
+The selected text goes in as a block quote ahead of the reply, so
+replies to several parts of a response add up in one draft while the
+page stays shown.  Quitting, or an empty reply with nothing selected,
+leaves the draft alone."
+  (dolist (case `((:snapshot ((:content . "my draft") (:location . 3))
+                   :region (1 . 5) :input "why?"
+                   :expected ,(concat "my draft\n\n> page\n\nwhy?"))
+                  (:snapshot nil :region (1 . 5) :input ""
+                   :expected "> page")
+                  (:snapshot nil :input "hi" :expected "hi")
+                  (:snapshot ((:content . "my draft") (:location . 3))
+                   :input "")
+                  (:snapshot ((:content . "my draft") (:location . 3))
+                   :input quit)))
+    (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+          (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+          (input (plist-get case :input))
+          (agent-shell-viewport-reply-style 'minibuffer))
+      (unwind-protect
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell--prompt-queue-read)
+                       (lambda (&rest _)
+                         (if (eq input 'quit)
+                             (signal 'quit nil)
+                           input))))
+              (agent-shell-viewport-view-mode)
+              (let ((inhibit-read-only t))
+                (insert "page text"))
+              (setq agent-shell-viewport--compose-snapshot
+                    (plist-get case :snapshot))
+              (when-let* ((region (plist-get case :region)))
+                (setq-local transient-mark-mode t)
+                (set-mark (car region))
+                (goto-char (cdr region))
+                (activate-mark))
+              (if (eq input 'quit)
+                  (should (eq (condition-case nil
+                                  (agent-shell-viewport-reply)
+                                (quit 'quit))
+                              'quit))
+                (agent-shell-viewport-reply))
+              (should (derived-mode-p 'agent-shell-viewport-view-mode))
+              (should (equal (buffer-string) "page text"))
+              (should-not (region-active-p))
+              (if-let* ((expected (plist-get case :expected)))
+                  (should (equal agent-shell-viewport--compose-snapshot
+                                 `((:content . ,expected)
+                                   (:location . ,(1+ (length expected))))))
+                (should (equal agent-shell-viewport--compose-snapshot
+                               (plist-get case :snapshot))))))
+        (kill-buffer viewport-buffer)
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell-viewport-reply-preview-test ()
+  "The preview of quoted text is short and captioned.
+
+It keeps to `agent-shell-viewport--reply-preview-lines' lines, and to
+the rows given, each cut to the width, marks what it leaves out, and
+ends the last line so the prompt starts on its own.  The caption is
+ASCII, so no glyph grows the minibuffer's first row."
+  (let ((agent-shell-viewport--reply-preview-lines 2))
+    (should (equal (substring-no-properties
+                    (agent-shell-viewport--reply-preview "one\ntwo" 20 10))
+                   "Replying to:\n  one\n  two\n"))
+    (should (equal (substring-no-properties
+                    (agent-shell-viewport--reply-preview "one\ntwo\nthree" 20 10))
+                   "Replying to:\n  one\n  two\n  …\n"))
+    (should (equal (substring-no-properties
+                    (agent-shell-viewport--reply-preview "a long line here" 8 10))
+                   "Replying to:\n  a lon…\n"))
+    (should (eq (get-text-property
+                 0 'face (agent-shell-viewport--reply-preview "one" 20 10))
+                'shadow))
+    (should (eq (get-text-property
+                 (length "Replying to:\n")
+                 'face (agent-shell-viewport--reply-preview "one" 20 10))
+                'agent-shell-markdown-blockquote)))
+  ;; Fewer rows than lines: as many lines as fit, then the cut mark.
+  (should (equal (substring-no-properties
+                  (agent-shell-viewport--reply-preview "one\ntwo\nthree" 20 3))
+                 "Replying to:\n  one\n  …\n"))
+  (should (equal (substring-no-properties
+                  (agent-shell-viewport--reply-preview "one" 20 2))
+                 "Replying to:\n  one\n"))
+  ;; No room for a line of text: no preview.
+  (should-not (agent-shell-viewport--reply-preview "one\ntwo" 20 2))
+  (should-not (agent-shell-viewport--reply-preview "one" 20 1)))
+
+(ert-deftest agent-shell-viewport-minibuffer-reply-previews-quote-test ()
+  "A minibuffer reply shows the quoted text above the prompt while reading.
+
+The preview is display-only, so the input read is just the reply."
+  (dolist (case '((:region (1 . 5) :preview "Replying to:\n  page\n")
+                  (:preview nil)))
+    (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+          (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+          (agent-shell-viewport-reply-style 'minibuffer)
+          (max-mini-window-height 20)
+          (preview :unread))
+      (unwind-protect
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell--prompt-queue-read)
+                       (lambda (&rest _)
+                         (with-temp-buffer
+                           (run-hooks 'minibuffer-setup-hook)
+                           (setq preview
+                                 (seq-some (lambda (overlay)
+                                             (overlay-get overlay 'after-string))
+                                           (overlays-in (point-min) (point-max))))
+                           (insert "why?")
+                           (buffer-string)))))
+              (agent-shell-viewport-view-mode)
+              (let ((inhibit-read-only t))
+                (insert "page text"))
+              (when-let* ((region (plist-get case :region)))
+                (setq-local transient-mark-mode t)
+                (set-mark (car region))
+                (goto-char (cdr region))
+                (activate-mark))
+              (agent-shell-viewport-reply)
+              (should (equal (and preview (substring-no-properties preview))
+                             (plist-get case :preview)))))
+        (kill-buffer viewport-buffer)
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell-viewport-minibuffer-reply-send-test ()
+  "Keys in a minibuffer reply add it to the draft and send the draft.
+
+\\`C-c C-c' sends as the compose page's does, and \\`M-RET' through
+the override route, as there.  With no draft and no reply there is
+nothing to send."
+  (dolist (case `((:key "C-c C-c" :input "why?" :sent compose-send
+                   :expected ,(concat "my draft\n\n> page\n\nwhy?"))
+                  (:key "M-RET" :input "why?" :sent compose-send-override
+                   :expected ,(concat "my draft\n\n> page\n\nwhy?"))
+                  (:key "C-c C-c" :input "" :no-draft t :no-region t)))
+    (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+          (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+          (agent-shell-viewport-reply-style 'minibuffer)
+          (sent nil))
+      (unwind-protect
+          (with-current-buffer viewport-buffer
+            (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--position)
+                       (lambda (&rest _) '((:current . 1) (:total . 1))))
+                      ((symbol-function 'agent-shell-viewport--recenter)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--initialize)
+                       (lambda (&rest _)
+                         (let ((inhibit-read-only t))
+                           (erase-buffer))))
+                      ((symbol-function 'exit-minibuffer) #'ignore)
+                      ((symbol-function 'agent-shell--prompt-queue-read)
+                       (lambda (&rest _)
+                         (with-temp-buffer
+                           (run-hooks 'minibuffer-setup-hook)
+                           (insert (plist-get case :input))
+                           (call-interactively (key-binding (kbd (plist-get case :key))))
+                           (buffer-string))))
+                      ((symbol-function 'agent-shell-viewport-compose-send)
+                       (lambda (&rest _)
+                         (setq sent (list 'compose-send (buffer-string)))))
+                      ((symbol-function 'agent-shell-viewport-compose-send-override)
+                       (lambda (&rest _)
+                         (setq sent (list 'compose-send-override (buffer-string))))))
+              (agent-shell-viewport-view-mode)
+              (let ((inhibit-read-only t))
+                (insert "page text"))
+              (unless (plist-get case :no-draft)
+                (setq agent-shell-viewport--compose-snapshot
+                      '((:content . "my draft") (:location . 3))))
+              (unless (plist-get case :no-region)
+                (setq-local transient-mark-mode t)
+                (set-mark 1)
+                (goto-char 5)
+                (activate-mark))
+              (if (plist-get case :sent)
+                  (progn
+                    (agent-shell-viewport-reply)
+                    (should (equal (car sent) (plist-get case :sent)))
+                    (should (equal (substring-no-properties (cadr sent))
+                                   (plist-get case :expected))))
+                (should-error (agent-shell-viewport-reply) :type 'user-error)
+                (should-not sent))))
+        (kill-buffer viewport-buffer)
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell-viewport-reply-prefix-uses-the-other-style-test ()
+  "A prefix argument replies in the style `agent-shell-viewport-reply-style'
+does not name.
+
+With the minibuffer style, it is how the compose page opens on the
+draft the minibuffer replies added up to."
+  (let ((shell-buffer (generate-new-buffer " *agent-shell shell*"))
+        (viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]"))
+        (agent-shell-viewport-reply-style 'minibuffer))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) shell-buffer))
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) '((:current . 1) (:total . 1))))
+                    ((symbol-function 'agent-shell-viewport--recenter)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest _)
+                       (let ((inhibit-read-only t))
+                         (erase-buffer))))
+                    ((symbol-function 'agent-shell--prompt-queue-read)
+                     (lambda (&rest _) (error "Read from the minibuffer"))))
+            (agent-shell-viewport-view-mode)
+            (let ((inhibit-read-only t))
+              (insert "page text"))
+            (setq agent-shell-viewport--compose-snapshot
+                  '((:content . "my draft") (:location . 9)))
+            (agent-shell-viewport-reply '(4))
+            (should (derived-mode-p 'agent-shell-viewport-edit-mode))
+            (should (equal (buffer-string) "my draft"))
+            (should (= (point) 9))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
+
 (ert-deftest agent-shell-prompt-queue-dwim-restores-compose-snapshot-test ()
   "Test `agent-shell-prompt-queue-dwim' restores a preserved compose draft.
 
@@ -8870,6 +9109,61 @@ what was just added."
     (should (string-prefix-p "my draft\n\n" (map-elt result :content)))
     (should (string-match-p "the answer" (map-elt result :content)))
     (should (equal (map-elt result :point) (1+ (length (map-elt result :content)))))))
+
+(ert-deftest agent-shell-viewport-quote-reply-quotes-only-agent-messages-test ()
+  "Test a quoting reply quotes the agent's messages and nothing else.
+
+Thoughts, tool calls and a subagent's messages (nested in its row's
+group) stay out of the quote, including their collapsed bodies."
+  (let ((viewport-buffer (generate-new-buffer " *agent-shell shell* [viewport]")))
+    (unwind-protect
+        (with-current-buffer viewport-buffer
+          (cl-letf (((symbol-function 'agent-shell-viewport--update-header)
+                     #'ignore)
+                    ((symbol-function 'agent-shell-viewport--position)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'agent-shell-viewport--shell-buffer)
+                     (lambda (&rest _) viewport-buffer))
+                    ((symbol-function 'agent-shell-viewport--initialize)
+                     (lambda (&rest _)
+                       (let ((inhibit-read-only t))
+                         (erase-buffer)))))
+            (agent-shell-viewport-view-mode)
+            (let ((inhibit-read-only t))
+              (insert (propertize "the question\n" 'agent-shell-viewport-prompt t))
+              (agent-shell-ui-update-fragment
+               (agent-shell-ui-make-fragment-model
+                :namespace-id "1" :block-id "1-agent_thought_chunk"
+                :label-left "Thinking" :body "secret thought"))
+              (agent-shell-ui-update-fragment
+               (agent-shell-ui-make-fragment-model
+                :namespace-id "1" :block-id "1-agent_message_chunk"
+                :body "First message."))
+              (agent-shell-ui-update-fragment
+               (agent-shell-ui-make-fragment-model
+                :namespace-id "1" :block-id "toolu_1"
+                :label-left "Read" :body "tool output"))
+              (agent-shell-ui-update-fragment
+               (agent-shell-ui-make-fragment-model
+                :namespace-id "1" :block-id "sub-1-agent_message_chunk"
+                :body "subagent message"
+                :group-id "subagent-row" :group-label "Task"))
+              (agent-shell-ui-update-fragment
+               (agent-shell-ui-make-fragment-model
+                :namespace-id "1" :block-id "2-agent_message_chunk"
+                :body "Final "))
+              ;; Streamed as a second chunk of the same message.
+              (agent-shell-ui-update-fragment
+               (agent-shell-ui-make-fragment-model
+                :namespace-id "1" :block-id "2-agent_message_chunk"
+                :body "answer.")
+               :append t))
+            (agent-shell-viewport-quote-reply)
+            (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                           "> First message.\n> \n> Final answer.\n\n"))))
+      (with-current-buffer viewport-buffer
+        (setq agent-shell-viewport--clean-up nil))
+      (kill-buffer viewport-buffer))))
 
 (ert-deftest agent-shell-viewport-reply-n-appends-after-restored-draft-test ()
   "Test `agent-shell-viewport-reply-1' appends its answer at the draft's end.
