@@ -693,6 +693,25 @@ Prompts are sent without switching to watch the response."
 ;; transitioning does not reset it.
 (put 'agent-shell-viewport-dismiss-on-send 'permanent-local t)
 
+(defcustom agent-shell-viewport-reply-style 'compose
+  "How `agent-shell-viewport-reply' and `agent-shell-viewport-quote-reply' reply.
+
+`compose' switches to the compose page, with the selected text, if
+any, quoted in the draft.
+
+`minibuffer' reads the reply from the minibuffer and appends it,
+after the selected text as a block quote, to the parked draft.  The
+start of that text is previewed above the prompt.  The page stays
+shown, so several parts of a response can be replied to in turn and
+sent together.  RET adds the reply to the draft; \\`C-c C-c' or
+\\`M-RET' adds it and sends the draft, as the compose page's keys do.
+
+\\<agent-shell-viewport-view-mode-map>A prefix argument on either command replies in the other style, so
+\\[universal-argument] \\[agent-shell-viewport-reply] opens the compose page on the draft."
+  :type '(choice (const :tag "Compose page" compose)
+                 (const :tag "Minibuffer, appended to the draft" minibuffer))
+  :group 'agent-shell)
+
 (defcustom agent-shell-embed-file-size-limit 102400
   "Maximum file size in bytes for embedding with ContentBlock::Resource.
 Files larger than this will use ContentBlock::ResourceLink instead.
