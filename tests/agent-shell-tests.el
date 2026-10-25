@@ -14312,6 +14312,25 @@ effort suffix, so showing both repeats the description."
     (should (equal "Readme update Read"
                    (substring-no-properties (funcall label "Readme update" "Read"))))))
 
+(ert-deftest agent-shell-make-tool-call-label-merged-read-dims-line-range-test ()
+  "A read whose title and description render once keeps its dimmed range."
+  (let ((label (lambda (title description)
+                 (map-elt (agent-shell-make-tool-call-label
+                           `((:tool-calls . (("t1" . ((:kind . "read")
+                                                      (:status . "completed")
+                                                      (:title . ,title)
+                                                      (:description . ,description))))))
+                           "t1")
+                          :title))))
+    (dolist (rendered (list (funcall label "file.el (10 - 20)" "file.el (10 - 20)")
+                            (funcall label "file.el (10 - 20)" "file.el")
+                            (funcall label "file.el" "file.el (10 - 20)")))
+      (should (equal "file.el (10 - 20)" (substring-no-properties rendered)))
+      (should (equal 'default (get-text-property 0 'font-lock-face rendered)))
+      (should (equal 'agent-shell-section-annotation
+                     (get-text-property (string-search "(" rendered)
+                                        'font-lock-face rendered))))))
+
 (ert-deftest agent-shell--tag-untagged-output-tags-same-chars-test ()
   "Tagging only the untagged tail covers what a whole-range tag would."
   (with-temp-buffer

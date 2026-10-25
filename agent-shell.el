@@ -6445,10 +6445,12 @@ Returns propertized labels in :status and :title propertized."
            (stats (agent-shell--format-diffs-line-stats (map-elt tool-call :diffs)))
            (label (cond ((and title description
                               (agent-shell--label-extends-p description title))
-                         (propertize title 'font-lock-face 'default))
+                         (agent-shell--propertize-tool-call-title
+                          :title title :kind (map-elt tool-call :kind)))
                         ((and title description
                               (agent-shell--label-extends-p title description))
-                         (propertize description 'font-lock-face 'default))
+                         (agent-shell--propertize-tool-call-title
+                          :title description :kind (map-elt tool-call :kind)))
                         ((and title description)
                          (concat
                           (agent-shell--propertize-tool-call-title
