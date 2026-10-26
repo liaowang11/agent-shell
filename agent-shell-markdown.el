@@ -2060,7 +2060,8 @@ plain copy yields the rendered bullet / checkbox, like the other
 renderers); the original markdown is stashed on
 `agent-shell-markdown-source' for `agent-shell-copy-as-markdown'.
 An ordered `N.' keeps its number.  A display-only `line-prefix'
-adds the base indent, and the line is tagged
+adds the base indent, a matching `wrap-prefix' lines wrapped rows up
+with the item's text, and the line is tagged
 `agent-shell-markdown-list-rendered' so `--pad-rendered-blocks'
 frames it.  A checked task item's text gets
 `agent-shell-markdown-list-done'.
@@ -2097,11 +2098,14 @@ reconstructing to `- [x] Done'."
          (source (unless (get-text-property line-start
                                             'agent-shell-markdown-source)
                    (agent-shell-markdown-reconstruct
-                    line-start (marker-position content-end)))))
+                    line-start (marker-position content-end))))
+         ;; Where the rendered marker ends, set by the branch rewriting it.
+         (glyph-end nil))
     (cond
      (ordered
       (add-face-text-property marker-start marker-end
-                              'agent-shell-markdown-list-marker))
+                              'agent-shell-markdown-list-marker)
+      (setq glyph-end marker-end))
      (checkbox
       (let ((glyph (if (equal checkbox " ")
                        agent-shell-markdown-list-checkbox-unchecked
@@ -2109,18 +2113,34 @@ reconstructing to `- [x] Done'."
         ;; Replace the whole `- [ ]' run (marker, gap, box) with one glyph.
         (agent-shell-markdown--replace-list-marker
          marker-start (+ content-start 3) glyph)
+        (setq glyph-end (+ marker-start (length glyph)))
         (unless (equal checkbox " ")
           (save-excursion
-            (goto-char (+ marker-start (length glyph)))
+            (goto-char glyph-end)
             (skip-chars-forward " \t" (marker-position content-end))
             (add-face-text-property (point) (marker-position content-end)
                                     'agent-shell-markdown-list-done)))))
      (t
-      (agent-shell-markdown--replace-list-marker
-       marker-start marker-end
-       (agent-shell-markdown--list-bullet (/ indent-width 2)))))
-    (put-text-property line-start (marker-position end)
-                       'line-prefix agent-shell-markdown-list-line-prefix)
+      (let ((glyph (agent-shell-markdown--list-bullet (/ indent-width 2))))
+        (agent-shell-markdown--replace-list-marker
+         marker-start marker-end glyph)
+        (setq glyph-end (+ marker-start (length glyph))))))
+    ;; A wrapped row takes the `wrap-prefix' of the char it starts on, so
+    ;; every char gets one wide enough to reach past the rendered nesting
+    ;; indent, marker and gap to the item's text.  Measured after the
+    ;; marker rewrite, which can change its width (`- [x] ' becomes `✓ ').
+    (let ((text-start (save-excursion
+                        (goto-char glyph-end)
+                        (skip-chars-forward " \t" (marker-position content-end))
+                        (point))))
+      (add-text-properties
+       line-start (marker-position end)
+       `(line-prefix ,agent-shell-markdown-list-line-prefix
+         wrap-prefix ,(concat agent-shell-markdown-list-line-prefix
+                              (make-string
+                               (string-width (buffer-substring-no-properties
+                                              line-start text-start))
+                               ?\s)))))
     (when source
       (put-text-property line-start (marker-position content-end)
                          'agent-shell-markdown-source source))
@@ -2133,6 +2153,19 @@ reconstructing to `- [x] Done'."
     (set-marker end nil)
     (set-marker content-end nil)))
 
+(defun agent-shell-markdown--rendered-list-marker-p (start end)
+  "Return non-nil when the list marker spanning START..END is rendered text.
+Only markdown source makes a list item.  A frozen char was produced by
+an earlier render (an escaped `\\-' decoded back to `-', an inline
+code body), so a line whose marker holds one is not a list item, even
+though its text now looks like one.  Neither is a line whose marker
+sits inside markup a pass stripped (bold, italic, strikethrough, a
+header, a link), which stashed its source on what it left: in
+`**1. Title.** body' the `1.' is bold text, so the line stays a
+paragraph, as in CommonMark."
+  (or (text-property-any start end 'agent-shell-markdown-frozen t)
+      (text-property-not-all start end 'agent-shell-markdown-source nil)))
+
 (cl-defun agent-shell-markdown--style-lists (&key avoid-ranges complete)
   "Render markdown list lines: bullets, task checkboxes, ordered numbers.
 
@@ -2143,7 +2176,9 @@ marker replaced by a glyph and gets a base indent, via
 stashed on `agent-shell-markdown-source' so
 `agent-shell-copy-as-markdown' round-trips it; a plain copy yields
 the rendered glyphs.  Lines inside AVOID-RANGES (e.g. fenced code
-blocks) are left untouched.  A list item on the last line, with no
+blocks) are left untouched, and so are lines whose marker is
+rendered text (see `agent-shell-markdown--rendered-list-marker-p').
+A list item on the last line, with no
 newline yet, renders only when COMPLETE says no more text is coming.
 
 For example, the buffer:
@@ -2161,15 +2196,18 @@ a two-column base indent."
              (line-end (match-end 0))
              (avoid (agent-shell-markdown-in-avoid-range-p
                      line-start line-end avoid-ranges)))
-        (if avoid
-            (goto-char (cdr avoid))
+        (cond
+         (avoid (goto-char (cdr avoid)))
+         ((agent-shell-markdown--rendered-list-marker-p
+           (match-beginning 2) (match-end 2)))
+         (t
           (agent-shell-markdown--render-list-line
            :line-start line-start
            :line-end line-end
            :indent-width (- (match-end 1) (match-beginning 1))
            :marker-start (match-beginning 2)
            :marker-end (match-end 2)
-           :content-start (match-end 3)))))
+           :content-start (match-end 3))))))
     ;; The loop above is newline-anchored, so a list item on the last
     ;; line is left raw: more of it may still stream in.  Render it once
     ;; COMPLETE says nothing will.  A newline just past a narrowed
@@ -2181,6 +2219,8 @@ a two-column base indent."
       (when (and (not (get-text-property (point)
                                          'agent-shell-markdown-list-rendered))
                  (looking-at agent-shell-markdown--list-item-last-line-regexp)
+                 (not (agent-shell-markdown--rendered-list-marker-p
+                       (match-beginning 2) (match-end 2)))
                  (not (agent-shell-markdown-in-avoid-range-p
                        (match-beginning 0) (match-end 0) avoid-ranges)))
         (agent-shell-markdown--render-list-line
@@ -2434,11 +2474,17 @@ called at `• one', this returns the position past `• two', not the
 one partway through the first line."
   (let ((end (or (next-single-property-change start property nil (point-max))
                  (point-max))))
-    (while (let ((line-end (if (and (< end (point-max))
-                                    (not (eq (char-after end) ?\n)))
-                               (save-excursion (goto-char end)
-                                               (line-end-position))
-                             end)))
+    (while (let ((line-end (cond
+                            ;; The range ran through its line's newline,
+                            ;; so the line is whole and the next line
+                            ;; starts untagged: it is not a partly tagged
+                            ;; line to reach through.
+                            ((eq (char-before end) ?\n) (1- end))
+                            ((and (< end (point-max))
+                                  (not (eq (char-after end) ?\n)))
+                             (save-excursion (goto-char end)
+                                             (line-end-position)))
+                            (t end))))
              (and (< line-end (point-max))
                   (eq (char-after line-end) ?\n)
                   (get-text-property (1+ line-end) property)
