@@ -2459,7 +2459,8 @@ plain copy yields the rendered bullet / checkbox, like the other
 renderers); the original markdown is stashed on
 `agent-shell-markdown-source' for `agent-shell-copy-as-markdown'.
 An ordered `N.' keeps its number.  A display-only `line-prefix'
-adds the base indent, and the line is tagged
+adds the base indent, a matching `wrap-prefix' lines wrapped rows up
+with the item's text, and the line is tagged
 `agent-shell-markdown-list-rendered' so `--pad-rendered-blocks'
 frames it.  A checked task item's text gets
 `agent-shell-markdown-list-done'.
@@ -2496,11 +2497,14 @@ reconstructing to `- [x] Done'."
          (source (unless (get-text-property line-start
                                             'agent-shell-markdown-source)
                    (agent-shell-markdown-reconstruct
-                    line-start (marker-position content-end)))))
+                    line-start (marker-position content-end))))
+         ;; Where the rendered marker ends, set by the branch rewriting it.
+         (glyph-end nil))
     (cond
      (ordered
       (add-face-text-property marker-start marker-end
-                              'agent-shell-markdown-list-marker))
+                              'agent-shell-markdown-list-marker)
+      (setq glyph-end marker-end))
      (checkbox
       (let ((glyph (if (equal checkbox " ")
                        agent-shell-markdown-list-checkbox-unchecked
@@ -2508,18 +2512,34 @@ reconstructing to `- [x] Done'."
         ;; Replace the whole `- [ ]' run (marker, gap, box) with one glyph.
         (agent-shell-markdown--replace-list-marker
          marker-start (+ content-start 3) glyph)
+        (setq glyph-end (+ marker-start (length glyph)))
         (unless (equal checkbox " ")
           (save-excursion
-            (goto-char (+ marker-start (length glyph)))
+            (goto-char glyph-end)
             (skip-chars-forward " \t" (marker-position content-end))
             (add-face-text-property (point) (marker-position content-end)
                                     'agent-shell-markdown-list-done)))))
      (t
-      (agent-shell-markdown--replace-list-marker
-       marker-start marker-end
-       (agent-shell-markdown--list-bullet (/ indent-width 2)))))
-    (put-text-property line-start (marker-position end)
-                       'line-prefix agent-shell-markdown-list-line-prefix)
+      (let ((glyph (agent-shell-markdown--list-bullet (/ indent-width 2))))
+        (agent-shell-markdown--replace-list-marker
+         marker-start marker-end glyph)
+        (setq glyph-end (+ marker-start (length glyph))))))
+    ;; A wrapped row takes the `wrap-prefix' of the char it starts on, so
+    ;; every char gets one wide enough to reach past the rendered nesting
+    ;; indent, marker and gap to the item's text.  Measured after the
+    ;; marker rewrite, which can change its width (`- [x] ' becomes `✓ ').
+    (let ((text-start (save-excursion
+                        (goto-char glyph-end)
+                        (skip-chars-forward " \t" (marker-position content-end))
+                        (point))))
+      (add-text-properties
+       line-start (marker-position end)
+       `(line-prefix ,agent-shell-markdown-list-line-prefix
+         wrap-prefix ,(concat agent-shell-markdown-list-line-prefix
+                              (make-string
+                               (string-width (buffer-substring-no-properties
+                                              line-start text-start))
+                               ?\s)))))
     (when source
       (put-text-property line-start (marker-position content-end)
                          'agent-shell-markdown-source source))
