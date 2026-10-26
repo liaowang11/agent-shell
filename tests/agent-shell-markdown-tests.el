@@ -2554,6 +2554,82 @@ Outro"))))
     (should (equal (get-text-property (point-min) 'line-prefix)
                    agent-shell-markdown-list-line-prefix))))
 
+(defun agent-shell-markdown-tests--list-wrap-prefixes ()
+  "Return each line's text and the `wrap-prefix' widths found on its chars."
+  (let (lines)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let (widths)
+          (dotimes (i (- (line-end-position) (point)))
+            (cl-pushnew (string-width (or (get-text-property (+ (point) i)
+                                                             'wrap-prefix)
+                                          ""))
+                        widths))
+          (push (cons (buffer-substring-no-properties (point) (line-end-position))
+                      (nreverse widths))
+                lines))
+        (forward-line 1)))
+    (nreverse lines)))
+
+(defconst agent-shell-markdown-tests--list-wrap-source
+  "- Bullet\n  - Nested\n-   Wide gap\n1. One\n10. Ten\n100) Hundred\n- [ ] Todo\n- [x] Done\nprose\n- Last"
+  "List source covering every marker shape a wrap-prefix must measure.")
+
+(defconst agent-shell-markdown-tests--list-wrap-expected
+  '(("• Bullet" 6) ("  ◦ Nested" 8) ("•   Wide gap" 8) ("1. One" 7)
+    ("10. Ten" 8) ("100) Hundred" 9) ("□ Todo" 6) ("✓ Done" 6)
+    ("") ("prose" 2) ("") ("• Last" 6))
+  "Rendered lines of `agent-shell-markdown-tests--list-wrap-source' and their
+`wrap-prefix' widths under the default 4-column list prefix and a 2-column
+host indent.  The blank lines frame the prose off from the list.")
+
+(ert-deftest agent-shell-markdown-list-wraps-under-item-text ()
+  ;; A wrapped row of a list item lines up with the item's text: its
+  ;; `wrap-prefix' is the list's base indent plus the rendered marker,
+  ;; nesting indent and gap included.  Every char of the line carries it,
+  ;; since a continuation row takes the prefix of the char it starts on.
+  ;; Prose keeps the host's own indent.
+  (let ((agent-shell-markdown-list-bullets '("•" "◦")))
+    (with-temp-buffer
+      (insert (propertize agent-shell-markdown-tests--list-wrap-source
+                          'line-prefix "  " 'wrap-prefix "  "))
+      (agent-shell-markdown-replace-markup :complete t)
+      (should (equal (agent-shell-markdown-tests--list-wrap-prefixes)
+                     agent-shell-markdown-tests--list-wrap-expected)))))
+
+(ert-deftest agent-shell-markdown-list-wraps-under-item-text-when-streamed ()
+  ;; Same as above, but arriving in chunks that split markers, gaps and
+  ;; checkboxes, each chunk carrying the host indent the way a fragment
+  ;; body's chunks do.
+  (let ((agent-shell-markdown-list-bullets '("•" "◦"))
+        (source agent-shell-markdown-tests--list-wrap-source))
+    (dolist (chunk-size '(1 2 3 5 7))
+      (with-temp-buffer
+        (let ((i 0))
+          (while (< i (length source))
+            (goto-char (point-max))
+            (insert (propertize (substring source i (min (length source)
+                                                         (+ i chunk-size)))
+                                'line-prefix "  " 'wrap-prefix "  "))
+            (setq i (+ i chunk-size))
+            (agent-shell-markdown-replace-markup)))
+        (agent-shell-markdown-replace-markup :complete t)
+        (should (equal (cons chunk-size
+                             (agent-shell-markdown-tests--list-wrap-prefixes))
+                       (cons chunk-size
+                             agent-shell-markdown-tests--list-wrap-expected)))))))
+
+(ert-deftest agent-shell-markdown-list-wrap-follows-line-prefix ()
+  ;; The wrap indent builds on `agent-shell-markdown-list-line-prefix', so
+  ;; a caller rebinding it (the welcome banner's news list) still wraps
+  ;; under the item text.
+  (let ((agent-shell-markdown-list-bullets '("•"))
+        (agent-shell-markdown-list-line-prefix (make-string 7 ?\s)))
+    (let ((out (agent-shell-markdown-convert "- News item\n")))
+      (should (equal (get-text-property 0 'wrap-prefix out)
+                     (make-string 9 ?\s))))))
+
 (ert-deftest agent-shell-markdown-list-framed-when-flush-against-prose ()
   ;; A list flush against prose gains a blank line on each side.  The
   ;; buffer text shows the rendered glyphs (base indent is display-only).
@@ -2676,16 +2752,42 @@ Outro"))))
                            (agent-shell-markdown-replace-markup)
                            (substring-no-properties (buffer-string))))))))))
 
-(ert-deftest agent-shell-markdown-list-joins-bold-numbered-items ()
-  ;; Bold-prefixed points like `**1. X**' become ordered list items once
-  ;; the bold markup is stripped, so a blank line the author left between
-  ;; them is joined too, and sub-bullets written tight stay tight.
+(ert-deftest agent-shell-markdown-list-bold-numbered-points-stay-paragraphs ()
+  ;; Bold-prefixed points like `**1. X**' are paragraphs, as in
+  ;; CommonMark: the marker sits inside the bold, so stripping the bold
+  ;; doesn't make them ordered list items.  The blank line the author
+  ;; left between them stays, and a list under one is framed off from it.
   (let ((agent-shell-markdown-list-bullets '("•")))
     (with-temp-buffer
       (insert "**1. First** point.\n\n**2. Second** point:\n- a\n- b\n")
       (agent-shell-markdown-replace-markup)
       (should (equal (substring-no-properties (buffer-string))
-                     "1. First point.\n2. Second point:\n• a\n• b\n")))))
+                     "1. First point.\n\n2. Second point:\n\n• a\n• b\n")))))
+
+(ert-deftest agent-shell-markdown-list-not-matched-after-markup-is-stripped ()
+  ;; A line is a list item only when its source starts with a marker.
+  ;; Text that only starts with one once emphasis, header, link or
+  ;; strikethrough markup is stripped stays prose, wherever a stream split
+  ;; it.  A real item whose text starts with bold still renders.
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (dolist (source '("**1. Bold.** Body\n" "*1. Italic.* Body\n"
+                      "# 1. Header\n" "~~- Struck~~ body\n"
+                      "[1. Link](https://example.com) body\n"))
+      (dotimes (split (length source))
+        (let ((out (agent-shell-markdown-tests--render-split source split)))
+          (should (equal (list source split nil)
+                         (list source split
+                               (text-property-not-all
+                                0 (length out)
+                                'agent-shell-markdown-list-rendered nil
+                                out)))))))
+    (dolist (source '("1. **Bold.** Body\n" "- **Bold.** Body\n"))
+      (dotimes (split (length source))
+        (let ((out (agent-shell-markdown-tests--render-split source split)))
+          (should (equal (list source split t)
+                         (list source split
+                               (get-text-property
+                                0 'agent-shell-markdown-list-rendered out)))))))))
 
 (ert-deftest agent-shell-markdown-list-keeps-blank-bordering-prose ()
   ;; A blank with a list item on only one side frames the list off from
@@ -2696,6 +2798,34 @@ Outro"))))
       (agent-shell-markdown-replace-markup)
       (should (equal (substring-no-properties (buffer-string))
                      "intro\n\n• A\n• B\n\nafter\n")))))
+
+(ert-deftest agent-shell-markdown-block-end-stops-at-untagged-line ()
+  ;; A tagged line's range runs through its newline, so it ends at the
+  ;; start of the next line.  That line is untagged, not a partly tagged
+  ;; one, so the block ends there rather than reaching through it to the
+  ;; tagged line after.
+  (with-temp-buffer
+    (insert (propertize "• one\n" 'agent-shell-markdown-list-rendered t)
+            "prose\n"
+            (propertize "• two\n" 'agent-shell-markdown-list-rendered t))
+    (should (equal (agent-shell-markdown--block-end
+                    (point-min) 'agent-shell-markdown-list-rendered)
+                   (+ (point-min) (length "• one\n"))))))
+
+(ert-deftest agent-shell-markdown-list-frames-prose-between-items ()
+  ;; Prose between two items frames off from both, however the text
+  ;; arrived: in one call or split anywhere in a stream.
+  (let ((agent-shell-markdown-list-bullets '("•")))
+    (dolist (source '("- one\nprose\n- two\n" "- one\nprose\n- two"))
+      (dotimes (split (length source))
+        (should (equal (list source split
+                             (substring-no-properties
+                              (agent-shell-markdown-tests--render-split
+                               source split)))
+                       (list source split
+                             (concat "• one\n\nprose\n\n• two"
+                                     (if (string-suffix-p "\n" source)
+                                         "\n" "")))))))))
 
 (ert-deftest agent-shell-markdown-list-last-line-renders-when-complete ()
   ;; Regression: a response ending in a list item with no newline after
@@ -2781,6 +2911,33 @@ Outro"))))
     (should (null (text-property-not-all
                    (point-min) (point-max)
                    'agent-shell-markdown-list-rendered nil)))))
+
+(defun agent-shell-markdown-tests--render-split (source split)
+  "Render SOURCE streamed as two chunks split at SPLIT, then completed.
+Returns the rendered buffer text.  SPLIT 0 renders SOURCE in one call."
+  (with-temp-buffer
+    (unless (zerop split)
+      (insert (substring source 0 split))
+      (agent-shell-markdown-replace-markup))
+    (goto-char (point-max))
+    (insert (substring source split))
+    (agent-shell-markdown-replace-markup :complete t)
+    (buffer-string)))
+
+(ert-deftest agent-shell-markdown-list-not-matched-on-rendered-marker ()
+  ;; Regression: once rendered, an escaped `\-' or `\.' decodes back to
+  ;; the bare char, and inline code keeps its body.  Neither is markdown
+  ;; source any more, so a later call must not read the line as a list
+  ;; item, wherever the stream split it.
+  (dolist (source '("\\- escaped\n" "1\\. escaped\n" "`1. code` text\n"))
+    (dotimes (split (length source))
+      (let ((out (agent-shell-markdown-tests--render-split source split)))
+        (should (equal (list source split nil)
+                       (list source split
+                             (text-property-not-all
+                              0 (length out)
+                              'agent-shell-markdown-list-rendered nil
+                              out))))))))
 
 (ert-deftest agent-shell-markdown-list-glyph-keeps-surrounding-block ()
   ;; Regression: replacing a marker with a glyph must carry the
