@@ -3483,7 +3483,8 @@ is safe to call on display and on resize."
       (when regions
         (let ((inhibit-read-only t)
               (buffer-undo-list t)
-              (modified (buffer-modified-p)))
+              (modified (buffer-modified-p))
+              (watermarks (agent-shell-markdown--watermark-markers)))
           ;; Preserve point (`agent-shell-markdown--render-table' moves point
           ;; and can be triggered at arbitrary times).
           (unwind-protect
@@ -3495,7 +3496,45 @@ is safe to call on display and on resize."
                          (cons :end (marker-position (nth 1 region)))))
                   (set-marker (nth 0 region) nil)
                   (set-marker (nth 1 region) nil)))
+            (agent-shell-markdown--restore-watermarks watermarks)
             (restore-buffer-modified-p modified)))))))
+
+(defun agent-shell-markdown--watermark-markers ()
+  "Return each streaming watermark in the buffer as a pair of markers.
+
+Each element is (ANCHOR . FRONTIER): ANCHOR at the char carrying an
+`agent-shell-markdown-watermark' offset, FRONTIER at the position that
+offset points to.  The offset is relative to ANCHOR, so re-laying out a
+table between the two changes where it points.  Markers follow the
+edit instead, and `agent-shell-markdown--restore-watermarks' turns them
+back into offsets.  A frontier inside a re-rendered table collapses to
+the table's start, which only means re-scanning it."
+  (let ((pos (point-min))
+        (pairs nil))
+    (while (setq pos (text-property-not-all
+                      pos (point-max) 'agent-shell-markdown-watermark nil))
+      (let ((offset (get-text-property pos 'agent-shell-markdown-watermark)))
+        (when (integerp offset)
+          (push (cons (copy-marker pos)
+                      (copy-marker (min (point-max) (+ pos offset))))
+                pairs)))
+      (setq pos (next-single-property-change
+                 pos 'agent-shell-markdown-watermark nil (point-max))))
+    pairs))
+
+(defun agent-shell-markdown--restore-watermarks (pairs)
+  "Store each (ANCHOR . FRONTIER) in PAIRS back as a watermark offset.
+
+PAIRS is as returned by `agent-shell-markdown--watermark-markers'.  The
+markers are released afterwards."
+  (with-silent-modifications
+    (pcase-dolist (`(,anchor . ,frontier) pairs)
+      (when (< anchor (point-max))
+        (put-text-property anchor (1+ anchor)
+                           'agent-shell-markdown-watermark
+                           (max 0 (- frontier anchor))))
+      (set-marker anchor nil)
+      (set-marker frontier nil))))
 
 (defun agent-shell-markdown--displayed-window-width ()
   "Return the body pixel width of a window showing the current buffer, or nil.
