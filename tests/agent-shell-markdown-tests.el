@@ -3349,6 +3349,31 @@ after" nil)))))
         (agent-shell-markdown-rerender-tables)
         (should (= calls 0))))))
 
+(ert-deftest agent-shell-markdown-rerender-tables-keeps-watermark-on-its-text ()
+  ;; The streaming watermark is an offset from the start of the rendered
+  ;; text.  A table re-laid out shorter while the text below it is still
+  ;; streaming moves that text up, so the offset must shrink with it.
+  ;; Otherwise the frontier lands past the start of the unfinished last
+  ;; line, and once its closing `**' arrives the bold is never rendered.
+  (with-temp-buffer
+    (insert "| A | B |\n|---|---|\n| 1 | 2 |\n\n**bold that is still stream")
+    (agent-shell-markdown-replace-markup)
+    (let ((table (buffer-substring-no-properties
+                  (point-min)
+                  (next-single-property-change
+                   (point-min) 'agent-shell-markdown-table-source))))
+      (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) 'w))
+                ((symbol-function 'window-body-width) (lambda (&rest _) 500))
+                ((symbol-function 'agent-shell-markdown--render-table-source)
+                 (cl-function (lambda (&key _source _window)
+                                (substring table 2)))))
+        (agent-shell-markdown-rerender-tables)))
+    (goto-char (point-max))
+    (insert "ing**\n")
+    (agent-shell-markdown-replace-markup)
+    (should (string-match-p "^bold that is still streaming$"
+                            (substring-no-properties (buffer-string))))))
+
 (ert-deftest agent-shell-markdown-rerender-tables-restores-modified-on-error ()
   ;; A re-layout that errors partway must still leave the buffer's
   ;; modified flag as it found it.
