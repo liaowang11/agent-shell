@@ -772,7 +772,7 @@ world.\" with face `agent-shell-markdown-bold' on \"world\"."
         (changed nil))
     (goto-char (point-min))
     (while (re-search-forward
-            (rx (or line-start (syntax whitespace))
+            (rx (or line-start (any space punct))
                 (group
                  (or (seq "**" (group (one-or-more
                                        (agent-shell-markdown--emphasis-content "*")))
@@ -780,13 +780,17 @@ world.\" with face `agent-shell-markdown-bold' on \"world\"."
                      (seq "__" (group (one-or-more
                                        (agent-shell-markdown--emphasis-content "_")))
                           "__")))
-                (or (syntax punctuation) (syntax whitespace) line-end))
+                (or (any space punct) line-end))
             nil t)
       (let* ((markup-start (match-beginning 1))
              (markup-end (match-end 1))
              (avoid (agent-shell-markdown-in-avoid-range-p
                      markup-start markup-end avoid-ranges)))
         (cond
+         ;; A delimiter is not punctuation before another run of itself:
+         ;; the second `*' in `*** hello ***' must not open bold.
+         ((eq (char-before markup-start) (char-after markup-start))
+          (goto-char (1+ markup-start)))
          (avoid
           (goto-char (cdr avoid)))
          ((agent-shell-markdown--straddles-avoid-range-p
