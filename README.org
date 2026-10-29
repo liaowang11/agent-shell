@@ -836,6 +836,8 @@ You can select and start any of the known agent shells (see =agent-shell-agent-c
 
 Viewport is an alternative interface for composing prompts and viewing one request/response interaction at a time.  It uses a separate buffer named after its associated shell with =" [viewport]"= appended.  This buffer switches between =agent-shell-viewport-edit-mode= while composing and =agent-shell-viewport-view-mode= while reading.
 
+Agent responses use the same Markdown renderer in the shell and viewport.  Bold markup such as =Bill—**text**= or =(__text__)= renders next to punctuation without extra spaces.  Markup inside inline code or fenced source blocks stays literal.
+
 Use one of these entry points to create and initialize the viewport buffer:
 
 - From an agent shell, type =C-c C-o= (=agent-shell-other-buffer=).  At the live prompt this opens the viewport for composing; from an earlier interaction it opens the viewport at that interaction.  Use =C-c C-o= again to return to the shell (=o= also works from viewport view mode).

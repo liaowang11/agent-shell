@@ -35,6 +35,59 @@
                  '(("hello " nil)
                    ("world" (agent-shell-markdown-bold))))))
 
+(ert-deftest agent-shell-markdown-convert-bold-punctuation-boundaries ()
+  "Bold renders after punctuation and inside quotes or brackets."
+  (dolist (delimiter '("**" "__"))
+    (pcase-dolist (`(,prefix ,suffix)
+                  '(("Right, Bill—" " in that checkout.")
+                    ("(" ")")
+                    ("“" "”")
+                    ("[" "]")
+                    ("see," ".")))
+      (ert-info ((format "delimiter=%s prefix=%s suffix=%s"
+                         delimiter prefix suffix))
+        (should (equal (agent-shell-markdown--deconstruct
+                        (agent-shell-markdown-convert
+                         (concat prefix delimiter "agent-shell" delimiter suffix)))
+                       `((,prefix nil)
+                         ("agent-shell" (agent-shell-markdown-bold))
+                         (,suffix nil))))))))
+
+(ert-deftest agent-shell-markdown-bold-inside-strike-keeps-both-faces ()
+  "Rendering bold next to strike delimiters preserves both styles."
+  (dolist (source '("~~**bold-strike**~~" "~~__bold-strike__~~"))
+    (let ((rendered (agent-shell-markdown-convert source)))
+      (should (equal (substring-no-properties rendered) "bold-strike"))
+      (dotimes (pos (length rendered))
+        (let ((faces (get-text-property pos 'face rendered)))
+          (should (memq 'agent-shell-markdown-bold faces))
+          (should (memq 'agent-shell-markdown-strikethrough faces)))))))
+
+(ert-deftest agent-shell-markdown-bold-underscore-intraword-stays-literal ()
+  "Punctuation support must not turn identifier underscores into bold."
+  (dolist (source '("prefix__value__suffix"
+                    "prefix__value__"
+                    "__value__suffix"))
+    (should (equal (agent-shell-markdown--deconstruct
+                    (agent-shell-markdown-convert source))
+                   `((,source nil))))))
+
+(ert-deftest agent-shell-markdown-bold-after-punctuation-streams ()
+  "An em-dash-adjacent bold span renders wherever its stream splits."
+  (let ((source "Right, Bill—**agent-shell does not enable it** in that checkout."))
+    (dotimes (split (1+ (length source)))
+      (ert-info ((format "split=%s" split))
+        (with-temp-buffer
+          (insert (substring source 0 split))
+          (agent-shell-markdown-replace-markup :render-images nil)
+          (goto-char (point-max))
+          (insert (substring source split))
+          (agent-shell-markdown-replace-markup :render-images nil :complete t)
+          (should (equal (agent-shell-markdown--deconstruct (buffer-string))
+                         '(("Right, Bill—" nil)
+                           ("agent-shell does not enable it" (agent-shell-markdown-bold))
+                           (" in that checkout." nil)))))))))
+
 (ert-deftest agent-shell-markdown-escaped-asterisk-in-bold ()
   ;; Regression: `**let vs let\\***' is bold text ending in an escaped
   ;; literal `*' (CommonMark).  The escape lets the bold span match and
@@ -310,11 +363,6 @@
                    ("b" (agent-shell-markdown-strikethrough))
                    (" c" nil)))))
 
-(ert-deftest agent-shell-markdown-convert-strikethrough-wrapping-bold ()
-  (should (equal (agent-shell-markdown--deconstruct
-                  (agent-shell-markdown-convert "~~**bold-strike**~~"))
-                 '(("bold-strike" (agent-shell-markdown-bold agent-shell-markdown-strikethrough))))))
-
 (ert-deftest agent-shell-markdown-convert-header-level-1 ()
   ;; Header rendering requires a trailing newline to complete; an
   ;; eob-only header is treated as still streaming and left raw.
@@ -502,13 +550,6 @@ it is still picked up by the bare-URL linkifier."
     (should (equal "see [x](http://a(b) please" (substring-no-properties rendered)))
     ;; The label is left as prose rather than becoming a link title.
     (should-not (get-text-property 5 'agent-shell-markdown-url rendered))))
-
-(ert-deftest agent-shell-markdown-convert-link-with-bold-inside-untouched ()
-  ;; Bold inside link title is left literal (mirrors markdown-overlays:
-  ;; bold regex requires whitespace/BOL before `**', and `[' isn't either).
-  (should (equal (agent-shell-markdown--deconstruct
-                  (agent-shell-markdown-convert "[**bold**](url)"))
-                 '(("**bold**" (agent-shell-markdown-link))))))
 
 (ert-deftest agent-shell-markdown-convert-link-after-image-not-confused ()
   ;; `[X](Y)' inside `![X](Y)' must not be treated as a link.
