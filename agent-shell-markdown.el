@@ -318,6 +318,11 @@ CONTEXT keys:
                   delimiters that fall inside a verbatim span (e.g. a
                   literal `\\(x\\)' the agent meant as code, not math).
 
+  :complete       Non-nil when nothing will be appended to the region
+                  (the turn ended, or a whole string is converted), so
+                  a renderer should not hold a :watermark for a
+                  construct that can no longer close.
+
 Each function returns an alist (nil for no-op).  Recognised keys:
 
   :watermark  Buffer position the streaming frontier must not pass,
@@ -447,7 +452,8 @@ block is left as literal text."
         ;; Build the render context (fenced-block descriptors + inline
         ;; `code' ranges) once, via the same function any external code
         ;; renders a static region through, so the two cannot drift.
-        (setq context (agent-shell-markdown-context))
+        (setq context (append (agent-shell-markdown-context)
+                              (list (cons :complete (and (or complete force) t)))))
         (setq source-blocks (map-elt context :source-blocks))
         ;; Inline `code' spans, computed before the renderers run so an
         ;; external renderer can skip verbatim spans the same way it skips
