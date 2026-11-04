@@ -1481,6 +1481,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :last-agent-message-ids nil)
         (cons :last-agent-message-block-ids nil)
         (cons :chunked-group-count 0)
+        (cons :notice-count 0)
         (cons :activity-group-count 0)
         (cons :activity-group-latest-id nil)
         ;; Keep the root entry record from the start.  A root message may be
@@ -4186,6 +4187,29 @@ Clears STATE's `:expanded-activity-group'."
       (agent-shell--note-unknown-session state acp-notification))
     (agent-shell--dispatch-notification :state state :acp-notification acp-notification)))
 
+(defun agent-shell--render-notice (state notice)
+  "Render NOTICE, a `notice' session update, in STATE's shell.
+
+Session notices (https://agentclientprotocol.com/rfds/session-notices)
+carry advisory text that is not part of the conversation: omp's idle
+recap, retries, model fallbacks, config warnings.  The title is the
+label, colored by severity; the description is the body.  Each notice
+gets its own block, above the prompt when no request is in flight."
+  (let* ((count (1+ (or (map-elt state :notice-count) 0)))
+         (face (pcase (map-elt notice 'severity)
+                 ("error" 'agent-shell-error)
+                 ("warning" 'agent-shell-warning)
+                 (_ 'agent-shell-section-heading)))
+         (description (map-elt notice 'description)))
+    (map-put! state :notice-count count)
+    (agent-shell--update-fragment
+     :state state
+     :block-id (format "notice-%d" count)
+     :label-left (propertize (or (map-elt notice 'title) "Notice") 'font-lock-face face)
+     :body (and (stringp description) (not (string-empty-p description)) description)
+     :expanded t
+     :above-last-prompt (not (agent-shell--active-requests-p state)))))
+
 (defun agent-shell--notification-subagent-group (state acp-notification)
   "Return ACP-NOTIFICATION's subagent group for `agent-shell--subagent-group'.
 
@@ -5020,6 +5044,11 @@ around this call to reflect whether the update arrived out of turn."
                 state (agent-shell--prompt-suggestions-from-acp
                        (map-elt meta 'promptSuggestions)))))
            ;; Note: No need to set :last-entry-type as no text was inserted.
+           nil)
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "notice")
+           (agent-shell--render-notice state (map-nested-elt acp-notification '(params update)))
+           ;; Note: No need to set :last-entry-type: the notice is its own
+           ;; block, and a streamed agent message continues past it.
            nil)
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "config_option_update")
            ;; claude-agent-acp also reports each native subagent's model

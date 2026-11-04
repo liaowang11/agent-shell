@@ -1447,6 +1447,52 @@ prompt -- unlabeled, not as an error fragment."
       ;; Separated from the previous turn by its dedicated namespace.
       (should (equal (plist-get captured :namespace-id) "out-of-turn")))))
 
+;; Session notices RFD (https://agentclientprotocol.com/rfds/session-notices).
+(ert-deftest agent-shell--on-notification-notice-renders-out-of-turn-test ()
+  "A `notice' update renders its title and description above the prompt.
+
+omp sends its idle recap this way, with no request in flight.  Each
+notice gets its own block, so a second one does not overwrite the first."
+  (let ((agent-shell--stream-render-interval nil)
+        (state (list (cons :chunked-group-count 0)
+                     (cons :notice-count 0)
+                     (cons :last-entry-type "agent_message_chunk")
+                     (cons :active-requests nil)
+                     (cons :last-activity-time nil)
+                     (cons :last-agent-message-ids nil)))
+        (calls nil))
+    (cl-letf (((symbol-function 'agent-shell--emit-event) #'ignore)
+              ((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--update-fragment)
+               (lambda (&rest args) (push args calls))))
+      (dolist (update '(((sessionUpdate . "notice") (severity . "info")
+                         (title . "Recap") (description . "Parser fix shipped; run the suite next."))
+                        ((sessionUpdate . "notice") (severity . "warning")
+                         (title . "Fallback: a -> b"))))
+        (agent-shell--on-notification
+         :state state
+         :acp-notification `((method . "session/update")
+                             (params (update ,@update)))))
+      (setq calls (nreverse calls))
+      (should (= (length calls) 2))
+      (let ((recap (nth 0 calls))
+            (fallback (nth 1 calls)))
+        (should (equal (substring-no-properties (plist-get recap :label-left)) "Recap"))
+        (should (equal (plist-get recap :body) "Parser fix shipped; run the suite next."))
+        (should (plist-get recap :above-last-prompt))
+        (should (equal (substring-no-properties (plist-get fallback :label-left)) "Fallback: a -> b"))
+        (should (eq (get-text-property 0 'font-lock-face (plist-get fallback :label-left))
+                    'agent-shell-warning))
+        (should-not (equal (plist-get recap :block-id) (plist-get fallback :block-id))))
+      ;; Rendering a notice must not end the streamed agent message.
+      (should (equal (map-elt state :last-entry-type) "agent_message_chunk")))))
+
+(ert-deftest agent-shell-omp-advertises-session-notices-test ()
+  "omp is sent `session.notices', so its notices arrive as `notice' updates."
+  (should (assq 'notices (map-elt (map-elt (agent-shell-omp-make-agent-config)
+                                           :client-capabilities)
+                                  'session))))
+
 (ert-deftest agent-shell--on-notification-in-turn-message-unlabeled-test ()
   "An in-turn `agent_message_chunk' renders inline, not above the prompt.
 

@@ -76,7 +76,12 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    :welcome-function #'agent-shell-omp--welcome-message
    ;; omp relays task subagents in the subagents RFD form once it has the
    ;; RFD; an older omp answers with AIR's `subagent_spawned' draft.
-   :client-capabilities '((subagents . ()))
+   ;; `session.notices' (session notices RFD) gets omp's notices -- idle
+   ;; recap, retries, fallbacks, config warnings -- as `notice' updates
+   ;; instead of bold agent message lines; omp sends the idle recap only
+   ;; to a client that declares it.
+   :client-capabilities '((subagents . ())
+                          (session . ((notices . ()))))
    ;; omp gates background tasks, the session index and the fork point
    ;; on the client naming them here, as claude-agent-acp does.
    ;; `stateUpdate' asks it for ACP v2's `state_update' (see
