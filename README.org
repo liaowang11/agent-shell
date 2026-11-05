@@ -1613,6 +1613,7 @@ nonblank content also folds the current group.
 |                                                       | agent-shell-copy-last-output                            | Copy the last agent output to the kill ring.                                  |
 |                                                       | agent-shell-copy-link-url-at-point                      | Copy the rendered Markdown link URL at POS (or point) to the kill ring.       |
 |                                                       | agent-shell-copy-session-id                             | Copy the current session ID to the kill ring.                                 |
+|                                                       | agent-shell-copy-session-name                           | Copy the name other agent sessions use to message this one.                   |
 |                                                       | agent-shell-copy-source-block-at-point                  | Copy the rendered fenced code block body at POS (or point) to the kill ring.  |
 |                                                       | agent-shell-cursor-start-agent                          | Start an interactive Cursor agent shell.                                      |
 | C-<tab>                                               | agent-shell-cycle-session-mode                          | Cycle through available session modes for the current `agent-shell' session.  |
