@@ -2664,6 +2664,26 @@ Example:
         (message "Copied session ID: %s" session-id))
     (user-error "No active session")))
 
+(defun agent-shell-copy-session-name ()
+  "Copy the name other agent sessions use to message this one.
+
+For Claude Code that is the name its `/list-agents' shows for \"This
+session\", such as \"agent-shell-74 [5223af]\".  The agent reports it,
+and again whenever it changes; only the fork of claude-agent-acp does.
+
+Works from both shell and viewport buffers."
+  (declare (modes agent-shell-mode
+                  agent-shell-viewport-view-mode
+                  agent-shell-viewport-edit-mode))
+  (interactive)
+  (let* ((shell (or (agent-shell--current-shell)
+                    (user-error "Not in a shell or viewport buffer")))
+         (name (or (map-nested-elt (buffer-local-value 'agent-shell--state shell)
+                                   '(:session :messaging-name))
+                   (user-error "The agent has not reported a session name"))))
+    (kill-new name)
+    (message "Copied session name: %s" name)))
+
 (defun agent-shell-copy-last-output ()
   "Copy the last agent output to the kill ring.
 
@@ -5042,7 +5062,15 @@ around this call to reflect whether the update arrived out of turn."
              (when (and (listp meta) (assq 'promptSuggestions meta))
                (agent-shell--set-prompt-suggestions
                 state (agent-shell--prompt-suggestions-from-acp
-                       (map-elt meta 'promptSuggestions)))))
+                       (map-elt meta 'promptSuggestions))))
+             ;; The fork of claude-agent-acp sends the name other Claude
+             ;; sessions use to message this one (see
+             ;; `agent-shell-copy-session-name').
+             (when-let* ((address (and (listp meta)
+                                       (map-nested-elt meta '(claudeCode messagingName address))))
+                         ((stringp address)))
+               ;; Absent from the session's initial keys, so not `map-put!'.
+               (setf (alist-get :messaging-name (map-elt state :session)) address)))
            ;; Note: No need to set :last-entry-type as no text was inserted.
            nil)
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "notice")

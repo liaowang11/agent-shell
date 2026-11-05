@@ -8135,6 +8135,64 @@ instead."
       (should-error (agent-shell-copy-session-id)
                     :type 'user-error))))
 
+;; claude-agent-acp's `_meta.claudeCode.messagingName', as it sends it.
+(defconst agent-shell-tests--messaging-name-meta
+  '((claudeCode
+     (messagingName
+      (address . "agent-shell-74 [5223af]")
+      (name . "agent-shell-74")
+      (nameSource . "derived")
+      (socketPath . "/tmp/cc-socks/74239.sock")))))
+
+(ert-deftest agent-shell--on-notification-session-info-update-stores-messaging-name-test ()
+  "`session_info_update' stores the agent's messaging name for copying."
+  (let* ((state (list (cons :buffer (current-buffer))
+                      ;; As `agent-shell--make-state' seeds it.
+                      (cons :session (list (cons :id "s1") (cons :title nil)))
+                      (cons :tool-calls nil)
+                      (cons :last-entry-type nil)
+                      (cons :last-activity-time nil)))
+         (agent-shell--state state))
+    (cl-letf (((symbol-function 'agent-shell--append-transcript) #'ignore)
+              ((symbol-function 'agent-shell--emit-event) #'ignore)
+              ((symbol-function 'agent-shell--update-header-and-mode-line) #'ignore))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       `((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "session_info_update")
+           (_meta . ,agent-shell-tests--messaging-name-meta)))))
+      (should (equal (map-nested-elt state '(:session :messaging-name))
+                     "agent-shell-74 [5223af]"))
+      ;; An update that only carries a title keeps the name.
+      (agent-shell--on-notification
+       :state state
+       :acp-notification
+       '((method . "session/update")
+         (params
+          (update
+           (sessionUpdate . "session_info_update")
+           (title . "A title")))))
+      (should (equal (map-nested-elt state '(:session :messaging-name))
+                     "agent-shell-74 [5223af]")))))
+
+(ert-deftest agent-shell-copy-session-name-test ()
+  "Test `agent-shell-copy-session-name' copies the stored messaging name."
+  (let ((kill-ring nil))
+    (with-temp-buffer
+      (setq-local agent-shell--state
+                  `((:session . ((:id . "s1")
+                                 (:messaging-name . "agent-shell-74 [5223af]")))))
+      (cl-letf (((symbol-function 'agent-shell--current-shell)
+                 (lambda () (current-buffer))))
+        (agent-shell-copy-session-name)
+        (should (equal (current-kill 0) "agent-shell-74 [5223af]"))
+        ;; An agent that never sent one.
+        (setq-local agent-shell--state `((:session . ((:id . "s1")))))
+        (should-error (agent-shell-copy-session-name) :type 'user-error)))))
+
 (ert-deftest agent-shell-last-activity-time-test ()
   "Test `agent-shell-last-activity-time' reads current or given buffer."
   (let ((time (encode-time '(0 0 12 29 9 2026 nil -1 t))))
