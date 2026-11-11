@@ -4262,6 +4262,48 @@ gets its own block, above the prompt when no request is in flight."
      :expanded t
      :above-last-prompt (not (agent-shell--active-requests-p state)))))
 
+(defun agent-shell--session-failure (meta)
+  "Return the AIR `sessionFailure' record in META, a `_meta' alist, or nil.
+
+claude-agent-acp sends it in a `session_info_update' and in the
+`session/prompt' response of a turn that failed."
+  (let ((failure (and (listp meta)
+                      (map-nested-elt meta '(jetbrains air sessionFailure)))))
+    (and (listp failure) failure)))
+
+(defun agent-shell--render-session-failure (state failure)
+  "Render FAILURE, an AIR `sessionFailure' record, in STATE's shell.
+
+claude-agent-acp reports retries, lost connections, usage limits and
+provider errors this way to a client that names the capability (see
+`agent-shell--air-client-capabilities-meta').  The title is the label,
+colored by severity; `details' (a retry's cause and wait) is the body.
+Each record has a stable `id' whose later revisions (the next retry
+attempt, then the turn's error) replace the same block."
+  (agent-shell--update-fragment
+   :state state
+   :block-id (format "session-failure-%s" (or (map-elt failure 'id) "?"))
+   :label-left (propertize (or (map-elt failure 'title) "Claude failure")
+                           'font-lock-face
+                           (if (equal (map-elt failure 'severity) "warning")
+                               'agent-shell-warning
+                             'agent-shell-error))
+   :body (let ((details (map-elt failure 'details)))
+           (and (stringp details) (not (string-empty-p details)) details))
+   :expanded t
+   :above-last-prompt (not (agent-shell--active-requests-p state))))
+
+(defun agent-shell--prompt-response-success-p (acp-response)
+  "Return non-nil when ACP-RESPONSE, a `session/prompt' result, ended well.
+
+A turn claude-agent-acp failed still stops with `end_turn', carrying
+its error as an AIR `sessionFailure' record in the response's `_meta'."
+  (and (equal (map-elt acp-response 'stopReason) "end_turn")
+       (not (equal (map-elt (agent-shell--session-failure
+                             (map-elt acp-response '_meta))
+                            'severity)
+                   "error"))))
+
 (defun agent-shell--notification-subagent-group (state acp-notification)
   "Return ACP-NOTIFICATION's subagent group for `agent-shell--subagent-group'.
 
@@ -5086,7 +5128,11 @@ around this call to reflect whether the update arrived out of turn."
              ;; AIR goal: a snapshot, or null once cleared.  Updates
              ;; that only carry a title have no `goal' key.
              (when (and (listp air) (assq 'goal air))
-               (agent-shell--set-goal state (map-elt air 'goal))))
+               (agent-shell--set-goal state (map-elt air 'goal)))
+             ;; AIR sessionFailure: a retry warning, or an error that
+             ;; outlives its turn (a lost connection, a replayed limit).
+             (when-let* ((failure (and (listp air) (map-elt air 'sessionFailure))))
+               (agent-shell--render-session-failure state failure)))
            ;; The prompt the agent predicts comes next, outside the AIR
            ;; namespace.  An empty list clears it; updates that only carry
            ;; a title have no `promptSuggestions' key.
@@ -10640,10 +10686,12 @@ don't implement the extension ignore the unrecognized `_meta' key."
   "Return the AIR `_meta' naming every extension feature this client renders.
 
 The agent gates each feature on the client naming it here: background
-tasks on \"asyncTasks\", and the ordered, bounded `session/list' on
-\"sessionIndex\".  A feature rendered but not named is dead code, since
-the agent never sends its notifications; a feature named but not
-rendered leaves its notifications unhandled.  Keep this list and what
+tasks on \"asyncTasks\", the ordered, bounded `session/list' on
+\"sessionIndex\", and retry warnings and typed turn failures on
+\"sessionFailure\" (see `agent-shell--render-session-failure').  A
+feature rendered but not named is dead code, since the agent never
+sends its notifications; a feature named but not rendered leaves its
+notifications unhandled.  Keep this list and what
 `agent-shell--dispatch-notification' handles in step.
 
 Leave out \"nativeSubagentSessions\": naming it makes claude-agent-acp
@@ -10653,7 +10701,7 @@ instead of the subagents RFD.
 Unlike the others, the agent answers \"sessionIndex\" by advertising it
 back (see `agent-shell--air-capability-advertised-p'), and only then
 accepts the list options of `agent-shell--make-session-list-request'."
-  (agent-shell--air-capabilities-meta "asyncTasks" "sessionIndex"))
+  (agent-shell--air-capabilities-meta "asyncTasks" "sessionIndex" "sessionFailure"))
 
 (defun agent-shell--air-extension-supported-p (acp-response)
   "Return non-nil when ACP-RESPONSE's agent implements the AIR extension.
@@ -13240,8 +13288,9 @@ reads the buffer's prompt capabilities."
                      (agent-shell--save-usage :state (agent-shell--state)
                                                :acp-usage (map-elt acp-response 'usage)
                                                :acp-meta (map-elt acp-response '_meta)))
-                   (let ((success (equal (map-elt acp-response 'stopReason)
-                                         "end_turn")))
+                   (let ((success (agent-shell--prompt-response-success-p acp-response))
+                         (failure (agent-shell--session-failure
+                                   (map-elt acp-response '_meta))))
                      ;; Display usage box at end of turn if enabled and data available
                      (when (and success
                                 agent-shell-show-usage-at-turn-end
@@ -13252,14 +13301,17 @@ reads the buffer's prompt capabilities."
                         :label-left (propertize "Usage" 'font-lock-face 'agent-shell-section-heading)
                         :body (agent-shell--format-usage (map-elt (agent-shell--state) :usage) t)
                         :create-new t))
-                     (unless success
+                     (cond
+                      (failure
+                       (agent-shell--render-session-failure (agent-shell--state) failure))
+                      ((not success)
                        (agent-shell--update-fragment
                         :state (agent-shell--state)
                         :block-id (format "%s-stop-reason"
                                           (map-elt (agent-shell--state) :request-count))
                         :body (agent-shell--stop-reason-description
                                (map-elt acp-response 'stopReason))
-                        :create-new t))
+                        :create-new t)))
                      (agent-shell-heartbeat-stop
                       :heartbeat (map-elt agent-shell--state :heartbeat))
                      ;; No more chunks are coming, so markup the streaming
