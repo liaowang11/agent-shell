@@ -7039,7 +7039,10 @@ one leaving what is known alone.
 
 Two more are recorded: a `capabilities' naming `cancel' lets the user
 stop this one subagent (see `agent-shell--send-subagent-cancel');
-claude-agent-acp sends it on the announce only.  A failed state's
+claude-agent-acp sends it on the announce only.  An update that carries
+`capabilities' replaces it, so a `null' one, as claude-agent-acp sends
+with an `unknown' state for a child it forgot at a reset, takes the
+stop away; one that omits the field keeps it.  A failed state's
 `error.message' is the failure's text, shown in the row; it can come in
 a later update than the failure itself.
 
@@ -7087,6 +7090,11 @@ later non-terminal state makes it running once more.
                          (cons :work-state (map-nested-elt update '(state state)))
                          (cons :can-cancel can-cancel)
                          (cons :error error-message))))
+      ;; A `capabilities' that names no `cancel' (null or `{}', both
+      ;; decoded as nil) clears the stop, which the filter above keeps.
+      (when (and (assq 'capabilities update) (not can-cancel))
+        (agent-shell--update-native-subagent
+         state subagent-session-id (list (cons :can-cancel nil))))
       ;; A SendMessage ran an idle child again.  The summary kept at
       ;; retirement would otherwise stand in for its new work.
       (when (and subagent-state

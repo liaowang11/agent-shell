@@ -2719,6 +2719,31 @@ whole of it on our side."
     (should (map-elt (agent-shell--native-subagent state "child") :can-cancel))
     (should-not (map-elt (agent-shell--native-subagent state "other") :can-cancel))))
 
+(ert-deftest agent-shell-rfd-subagent-unknown-at-reset-drops-its-cancel-capability-test ()
+  "An `unknown' child with `capabilities: null' is lost and no longer stoppable.
+
+claude-agent-acp forgets its children at a conversation reset and
+reports a child still working as `unknown' with `capabilities: null'
+(`rfdEndState' in native-subagents.ts): it can no longer observe or
+stop it.  acp.el decodes the null as nil, so an explicit
+`capabilities' clears the cancel capability, while an update that
+omits the field keeps it.  If the child runs again, its later updates
+must not bring back a stop the agent can no longer honor."
+  (let* ((rendered (agent-shell-tests--subagent-shell
+                    (lambda (send _end-turn _prompt)
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(title . "Researcher") '(capabilities (cancel))
+                       '(state (state . "running")))
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(state (state . "unknown")) '(capabilities))
+                      (agent-shell-tests--rfd-subagent-update
+                       send "child" '(state (state . "running"))))))
+         (state (map-elt rendered :state))
+         (subagent (agent-shell--native-subagent state "child")))
+    (should (equal (map-elt subagent :state) "running"))
+    (should-not (map-elt subagent :can-cancel))
+    (should-not (agent-shell-subagents--stoppable state))))
+
 (ert-deftest agent-shell-subagents-list-stops-a-cancellable-subagent-test ()
   "Stopping a cancellable subagent sends `session/cancel' for it alone.
 
