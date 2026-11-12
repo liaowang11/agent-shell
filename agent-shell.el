@@ -2699,9 +2699,9 @@ Example:
 (defun agent-shell-copy-session-name ()
   "Copy the name other agent sessions use to message this one.
 
-For Claude Code that is the name its `/list-agents' shows for \"This
-session\", such as \"agent-shell-74 [5223af]\".  The agent reports it,
-and again whenever it changes; only the fork of claude-agent-acp does.
+It is the name the agent's `/list-agents' shows for \"This session\",
+such as \"agent-shell-74 [5223af]\".  The agent reports it, and again
+whenever it changes; only the forks of claude-agent-acp and omp do.
 
 Works from both shell and viewport buffers."
   (declare (modes agent-shell-mode
@@ -5141,7 +5141,7 @@ around this call to reflect whether the update arrived out of turn."
                (agent-shell--set-prompt-suggestions
                 state (agent-shell--prompt-suggestions-from-acp
                        (map-elt meta 'promptSuggestions))))
-             ;; The fork of claude-agent-acp sends the name other Claude
+             ;; The forks of claude-agent-acp and omp send the name other
              ;; sessions use to message this one (see
              ;; `agent-shell-copy-session-name').
              (when-let* ((address (and (listp meta)
