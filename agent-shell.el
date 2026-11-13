@@ -3326,6 +3326,37 @@ they carry no `text'."
                                  (agent-shell--tool-call-content-items content)))
              "\n\n"))
 
+(defun agent-shell--tool-call-session-links (content)
+  "Return links opening the subagents named in tool call CONTENT, or nil.
+
+claude-agent-acp appends a `session' item naming the child a TaskStop
+or SendMessage acted on, to the call's report and to every update that
+replaces its content.  Each link names the child as the current shell's
+state knows it, falling back to its session id.  Kept apart from the
+call's output so a link alone doesn't count as output."
+  (when-let* ((state agent-shell--state)
+              (session-ids (delete-dups
+                            (delq nil
+                                  (mapcar (lambda (item)
+                                            (when (equal (map-elt item 'type) "session")
+                                              (map-elt item 'sessionId)))
+                                          (agent-shell--tool-call-content-items content))))))
+    (mapconcat
+     (lambda (session-id)
+       (agent-shell--make-button
+        :text (format "→ %s"
+                      (or (map-elt (agent-shell--native-subagent state session-id) :name)
+                          session-id))
+        :help "Open this subagent's buffer"
+        :kind 'subagent-session
+        :boxed nil
+        :properties (list 'font-lock-face 'agent-shell-link 'face 'agent-shell-link)
+        :action (lambda ()
+                  (interactive)
+                  (agent-shell-subagents-display state session-id))))
+     session-ids
+     "\n")))
+
 (defun agent-shell--format-console-block (text &optional lang)
   "Return TEXT fenced as a code block tagged LANG, or nil when TEXT is empty.
 
@@ -3417,7 +3448,8 @@ sent separately."
                 (agent-shell--join-non-empty-sections
                  (or command-block input-block)
                  terminal-output-block
-                 body-text))))
+                 body-text
+                 (agent-shell--tool-call-session-links (map-elt tool-call :content))))))
     (unless (string-empty-p body)
       body)))
 

@@ -830,6 +830,39 @@ twice is two entries and says so."
   "Return SESSION-ID's buffer report from RENDERED."
   (map-elt (map-elt rendered :subagents) session-id))
 
+(ert-deftest agent-shell-tool-call-session-content-links-to-the-subagent-test ()
+  "A tool call's `session' content renders as a link into that subagent.
+
+claude-agent-acp appends `{type: session, sessionId}' to a TaskStop or
+SendMessage aimed at a child it has announced.  The body names the
+child and opens its buffer."
+  (let (link-text opened body)
+    (agent-shell-tests--subagent-shell
+     (lambda (send _end-turn _prompt)
+       (let ((agent-shell-tool-use-expand-by-default t))
+         (agent-shell-tests--spawn-and-work send)
+         (funcall send "root" '(sessionUpdate . "tool_call") '(toolCallId . "T2")
+                  '(title . "TaskStop") '(kind . "other") '(status . "in_progress")
+                  '(content . [((type . "session") (sessionId . "child"))]))
+         ;; An update without content keeps the call's content, link and all.
+         (funcall send "root" '(sessionUpdate . "tool_call_update") '(toolCallId . "T2")
+                  '(status . "completed") '(rawOutput (formatted_output . "Stopped")))
+         (setq body (agent-shell--tool-call-body
+                     (map-nested-elt agent-shell--state '(:tool-calls "T2"))))
+         (let ((pos (text-property-any (point-min) (point-max)
+                                       'button 'subagent-session)))
+           (should pos)
+           (setq link-text (buffer-substring-no-properties
+                            pos (next-single-property-change
+                                 pos 'button nil (point-max))))
+           (save-window-excursion
+             (funcall (lookup-key (get-text-property pos 'keymap) (kbd "RET")))
+             (setq opened major-mode))))))
+    (should (string-match-p "Researcher" link-text))
+    ;; The link is not output: the raw output still shows.
+    (should (string-match-p "Stopped" body))
+    (should (eq opened 'agent-shell-subagent-mode))))
+
 (ert-deftest agent-shell-subagent-content-renders-in-its-own-buffer-test ()
   "A subagent's work renders in its buffer, and the shell keeps one row.
 
