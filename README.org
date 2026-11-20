@@ -328,6 +328,8 @@ bun install -g @oh-my-pi/pi-coding-agent
 
 See https://github.com/can1357/oh-my-pi for details.
 
+In an OMP prompt, type =^= at the start of the prompt or after whitespace to complete a =provider/id= model selector from the session's ACP model list. With =agent-shell-completion-mode= off, invoke =completion-at-point= manually. OMP accepts optional =:effort= suffixes, but agent-shell does not suggest them.
+
 *** Antigravity
 
 For Antigravity, install the Antigravity CLI and make sure =agy= is on your =PATH= (agent-shell runs =agy acp=). Sign in once via an interactive =agy= session or with:
@@ -1613,7 +1615,7 @@ nonblank content also folds the current group.
 |                                                       | agent-shell-clear-goal                                  | Clear the current session's goal.                                             |
 |                                                       | agent-shell-cline-start-agent                           | Start an interactive Cline agent shell.                                       |
 |                                                       | agent-shell-codebuddy-start-agent                       | Start an interactive CodeBuddy agent shell.                                   |
-|                                                       | agent-shell-completion-mode                             | Toggle popping completion as @ or / are typed.                                |
+|                                                       | agent-shell-completion-mode                             | Toggle popping completion as @, /, or OMP ^ is typed.                          |
 |                                                       | agent-shell-copy-as-markdown                            | Copy the region between BEG and END to the kill ring as markdown.             |
 |                                                       | agent-shell-copy-last-output                            | Copy the last agent output to the kill ring.                                  |
 |                                                       | agent-shell-copy-link-url-at-point                      | Copy the rendered Markdown link URL at POS (or point) to the kill ring.       |
