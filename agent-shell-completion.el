@@ -28,6 +28,7 @@
 
 (require 'comint)
 (require 'map)
+(require 'agent-shell-config)
 (require 'agent-shell-project)
 
 (declare-function agent-shell--file-mention "agent-shell")
@@ -135,10 +136,8 @@ For example, completing at the end of a buffer holding
 
 (defvar-local agent-shell-completion--shell-buffer nil
   "Override shell buffer to source completion data from.
-When non-nil, file and command CAPFs read project files and
-available commands from this buffer instead of the current one.
 Set in non-shell buffers (e.g. the minibuffer) that want to offer
-@ and / completion against a specific shell.")
+@, /, and ^ completion against a specific shell.")
 
 (defun agent-shell-completion--source-buffer ()
   "Return the buffer to source completion data from.
@@ -206,17 +205,63 @@ buffer.  Returns nil if the override is set but its buffer is dead."
           :company-kind (lambda (_) 'function)
           :exit-function #'agent-shell--capf-exit-with-space)))
 
+(defun agent-shell-completion--model-token-start ()
+  "Return the start of the selector after ^ in the live prompt.
+For example, in \"Ask ^ollama/qwen3:8b\", return the position of the o."
+  (let ((input-start (agent-shell-completion--input-start)))
+    (when (and (>= (point) input-start)
+               (or (not (derived-mode-p 'comint-mode))
+                   (> input-start (point-min))))
+      (save-excursion
+        (skip-chars-backward "^[:space:]^" input-start)
+        (when (and (> (point) input-start) (eq (char-before) ?^))
+          (let ((start (point)))
+            (backward-char)
+            (when (or (= (point) input-start)
+                      (/= (skip-chars-backward "[:space:]" (1- (point))) 0))
+              start)))))))
+
+(defun agent-shell--model-completion-at-point ()
+  "Complete OMP model mentions from the backing shell's ACP options."
+  (when-let* ((start (agent-shell-completion--model-token-start))
+              (source (or agent-shell-completion--shell-buffer
+                          (agent-shell--shell-buffer :no-error t :no-create t)))
+              ((buffer-live-p source))
+              (state (buffer-local-value 'agent-shell--state source))
+              ((eq (map-nested-elt state '(:agent-config :identifier)) 'omp))
+              (models (agent-shell--get-available-models state)))
+    (let* ((choices (mapcar (lambda (model)
+                              (cons (map-elt model :model-id) (map-elt model :name)))
+                            models))
+           (end (save-excursion
+                  (let ((cursor (point)))
+                    (skip-chars-forward "^[:space:]^")
+                    (unless (assoc (buffer-substring-no-properties start (point)) choices)
+                      (skip-chars-backward ".,;:!?" cursor))
+                    (point)))))
+      (list start end choices
+            :exclusive 'no
+            :company-prefix-length t
+            :annotation-function
+            (lambda (id)
+              (when-let* ((name (map-elt choices id)))
+                (concat "  " name)))
+            :exit-function
+            (lambda (id status)
+              (when (eobp)
+                (agent-shell--capf-exit-with-space id status)))))))
+
 (defun agent-shell--trigger-completion-at-point ()
-  "Trigger completion when @ or / is typed at a word boundary.
-Each pops only when `agent-shell-file-completion-enabled' or
-`agent-shell-command-completion-enabled' respectively allows it.
-Only triggers when the character is at line start or after whitespace,
-preventing spurious completions mid-word or in paths.  / additionally
-requires being at the start of the input, where agents recognize
-commands."
-  (when (and (memq (char-before) '(?@ ?/))
-             (or (= (point) (1+ (line-beginning-position)))
-                 (memq (char-before (1- (point))) '(?\s ?\t ?\n))))
+  "Trigger completion after @, /, or ^ in their respective contexts.
+The file and command options control @ and /.  ^ pops only when the
+live prompt has OMP model candidates."
+  (cond
+   ((eq (char-before) ?^)
+    (when (agent-shell--model-completion-at-point)
+      (completion-at-point)))
+   ((and (memq (char-before) '(?@ ?/))
+         (or (= (point) (1+ (line-beginning-position)))
+             (memq (char-before (1- (point))) '(?\s ?\t ?\n))))
     (cond
      ((and (eq (char-before) ?@)
            agent-shell-file-completion-enabled)
@@ -224,17 +269,18 @@ commands."
      ((and (eq (char-before) ?/)
            agent-shell-command-completion-enabled
            (agent-shell--command-completion-at-point))
-      (completion-at-point)))))
+      (completion-at-point))))))
 
 (defun agent-shell-completion--setup ()
-  "Offer @ and / completion via `completion-at-point' in the current buffer.
+  "Offer @, /, and OMP ^ completion via `completion-at-point'.
 
-Also offers it while reading queued prompts.  Popping completion as @
-or / are typed is left to `agent-shell-completion-mode', enabled here
+Also offers it while reading queued prompts.  Popping completion as @,
+/, or ^ is typed is left to `agent-shell-completion-mode', enabled here
 unless `agent-shell-file-completion-enabled' and
 `agent-shell-command-completion-enabled' are both nil."
   (add-hook 'completion-at-point-functions #'agent-shell--file-completion-at-point nil t)
   (add-hook 'completion-at-point-functions #'agent-shell--command-completion-at-point nil t)
+  (add-hook 'completion-at-point-functions #'agent-shell--model-completion-at-point nil t)
   (add-hook 'agent-shell-prompt-queue-setup-minibuffer-functions
             #'agent-shell-completion--setup-queued-prompt)
   (when (or agent-shell-file-completion-enabled
@@ -242,10 +288,10 @@ unless `agent-shell-file-completion-enabled' and
     (agent-shell-completion-mode +1)))
 
 (defun agent-shell-completion--setup-minibuffer (shell-buffer)
-  "Enable @ and / completion in the current minibuffer for SHELL-BUFFER.
+  "Enable @, /, and OMP ^ completion in the minibuffer for SHELL-BUFFER.
 
-@ always completes project files.  / completes available agent commands
-when SHELL-BUFFER has received them via ACP; if not, / is a no-op.
+@ completes project files.  / and ^ complete commands and OMP model
+selectors, respectively, when SHELL-BUFFER has received them via ACP.
 
 Completion pops as they are typed only when SHELL-BUFFER has
 `agent-shell-completion-mode' enabled, so user preference set in the
@@ -256,6 +302,8 @@ shell carries over."
               #'agent-shell--file-completion-at-point nil t)
     (add-hook 'completion-at-point-functions
               #'agent-shell--command-completion-at-point nil t)
+    (add-hook 'completion-at-point-functions
+              #'agent-shell--model-completion-at-point nil t)
     (when (buffer-local-value 'agent-shell-completion-mode shell-buffer)
       (add-hook 'post-self-insert-hook
                 #'agent-shell--trigger-completion-at-point nil t))
@@ -269,6 +317,8 @@ shell carries over."
                #'agent-shell--file-completion-at-point t)
   (remove-hook 'completion-at-point-functions
                #'agent-shell--command-completion-at-point t)
+  (remove-hook 'completion-at-point-functions
+               #'agent-shell--model-completion-at-point t)
   (remove-hook 'post-self-insert-hook
                #'agent-shell--trigger-completion-at-point t)
   (remove-hook 'minibuffer-exit-hook
@@ -287,7 +337,7 @@ EVENT is an alist as that hook documents, for example:
     (agent-shell-completion--setup-minibuffer shell-buffer)))
 
 (define-minor-mode agent-shell-completion-mode
-  "Toggle popping completion as @ or / are typed.
+  "Toggle popping completion as @, /, or OMP ^ is typed.
 
 With the mode off, \\[completion-at-point] still completes them."
   :lighter " @/Compl"

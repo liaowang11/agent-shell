@@ -281,5 +281,52 @@ still be typing."
       (agent-shell--capf-exit-with-space "help" status)
       (should (equal (buffer-string) "/help")))))
 
+(ert-deftest agent-shell-completion-model-in-queued-prompt-test ()
+  "Complete a canonical OMP selector without changing adjacent punctuation."
+  (let ((shell (generate-new-buffer " *agent-shell-completion-test*"))
+        (completion-styles '(basic)))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell
+            (setq-local agent-shell--state
+                        (list '(:agent-config . ((:identifier . omp)))
+                              (cons :config-options nil)))
+            (agent-shell--save-config-options
+             :state agent-shell--state
+             :acp-config-options '(((id . "model") (type . "select") (category . "model")
+                                    (currentValue . "ollama/qwen3:8b")
+                                    (options . [((value . "ollama/qwen3:8b")
+                                                 (name . "Qwen 3"))])))))
+          (with-temp-buffer
+            (agent-shell-completion--setup-queued-prompt `((:shell-buffer . ,shell)))
+            (insert "Ask ^ollama/qwen3:8, please.")
+            (search-backward ",")
+            (completion-at-point)
+            (should (equal (buffer-string) "Ask ^ollama/qwen3:8b, please."))))
+      (kill-buffer shell))))
+
+(ert-deftest agent-shell-completion-model-popup-scope-test ()
+  "A ^ at a token boundary pops only for an OMP prompt with model data."
+  (with-temp-buffer
+    (comint-mode)
+    (let ((agent-shell-file-completion-enabled t)
+          (agent-shell-command-completion-enabled t)
+          (popped nil))
+      (cl-letf (((symbol-function 'agent-shell--shell-buffer) (lambda (&rest _) (current-buffer)))
+                ((symbol-function 'completion-at-point) (lambda () (setq popped t))))
+        (dolist (case '((omp "^" t t) (omp "Ask ^" t t) (omp "x^" t nil)
+                        (other "^" t nil) (omp "^" nil nil)))
+          (erase-buffer)
+          (insert "Test>")
+          (setq-local comint-last-prompt (cons (copy-marker (point-min)) (copy-marker (point))))
+          (setq-local agent-shell--state
+                      `((:agent-config . ((:identifier . ,(nth 0 case))))
+                        (:session . ((:models . ,(when (nth 2 case)
+                                                  '(((:model-id . "ollama/qwen3:8b")))))))))
+          (setq popped nil)
+          (insert (nth 1 case))
+          (agent-shell--trigger-completion-at-point)
+          (should (eq popped (nth 3 case))))))))
+
 (provide 'agent-shell-completion-tests)
 ;;; agent-shell-completion-tests.el ends here
