@@ -3738,6 +3738,57 @@ index 0000000..0000000 100644
                       (:description . nil)
                       (:group . "Other")))))))
 
+(ert-deftest agent-shell--normalize-config-options-reasoning-efforts-test ()
+  "Test `agent-shell--normalize-config-options' keeps each model's effort levels.
+claude-agent-acp names them at `_meta.jetbrains.air.reasoningEfforts' on
+each `model' option entry for AIR clients."
+  (let* ((options (agent-shell--normalize-config-options
+                   [((id . "model")
+                     (category . "model")
+                     (type . "select")
+                     (currentValue . "opus")
+                     (options . [((value . "opus")
+                                  (name . "Opus 5.5")
+                                  (_meta . ((jetbrains . ((air . ((version . 1)
+                                                                  (reasoningEfforts . ((values . ["low" "medium" "high" "xhigh" "max"])
+                                                                                       (recommended . "medium"))))))))))
+                                 ((value . "claude-haiku-4-5-20251001")
+                                  (name . "Haiku 4.5"))]))
+                    ((id . "pick")
+                     (type . "select")
+                     (options . [((group . "g")
+                                  (name . "G")
+                                  (options . [((value . "sonnet")
+                                               (name . "Sonnet")
+                                               (_meta . ((jetbrains . ((air . ((reasoningEfforts . ((values . ["low" "max"])
+                                                                                                    (recommended . "low"))))))))))]))]))]))
+         (models (agent-shell--config-option-as-models (car options))))
+    (should (equal (map-elt (car (map-elt (car options) :options)) :reasoning-efforts)
+                   '("low" "medium" "high" "xhigh" "max")))
+    (should (equal (map-elt (car (map-elt (cadr options) :options)) :reasoning-efforts)
+                   '("low" "max")))
+    ;; An entry without the key gets none, so other agents' alists are unchanged.
+    (should-not (assq :reasoning-efforts (cadr (map-elt (car options) :options))))
+    (should (equal (map-elt (car models) :reasoning-efforts)
+                   '("low" "medium" "high" "xhigh" "max")))
+    (should-not (assq :reasoning-efforts (cadr models)))))
+
+(ert-deftest agent-shell--model-choices-test ()
+  "Test `agent-shell--model-choices' shows effort levels only when known."
+  ;; No model names effort levels: no effort column.
+  (should (equal (agent-shell--model-choices
+                  '(((:model-id . "a") (:name . "Alpha"))
+                    ((:model-id . "bb") (:name . "B"))))
+                 '(("Alpha  (a)" . "a")
+                   ("B      (bb)" . "bb"))))
+  ;; Some do: each row lists its levels, and a model without any says so.
+  (should (equal (agent-shell--model-choices
+                  '(((:model-id . "opus") (:name . "Opus")
+                     (:reasoning-efforts . ("low" "medium" "high" "xhigh" "max")))
+                    ((:model-id . "haiku") (:name . "Haiku"))))
+                 '(("Opus   (opus)   effort: low/medium/high/xhigh/max" . "opus")
+                   ("Haiku  (haiku)  no effort levels" . "haiku")))))
+
 (ert-deftest agent-shell--config-option-value-choices-test ()
   "Test `agent-shell--config-option-value-choices'."
   ;; Ungrouped and uniquely named values keep their bare names.

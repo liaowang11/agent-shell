@@ -15987,6 +15987,38 @@ Optionally, get notified of completion with ON-SUCCESS function."
      :mode-id selected-mode-id
      :on-success on-success)))
 
+(defun agent-shell--model-choices (models)
+  "Return model picker choices for MODELS as (TITLE . MODEL-ID) pairs.
+
+Each title aligns the model's name and id.  When any model names its
+effort levels (:reasoning-efforts, from claude-agent-acp), every title
+also lists them, so the picker shows which efforts a model offers
+before switching to it.
+
+For example:
+
+  (agent-shell--model-choices
+   \\='(((:model-id . \"opus\") (:name . \"Opus\")
+      (:reasoning-efforts . (\"low\" \"max\")))
+     ((:model-id . \"haiku\") (:name . \"Haiku\"))))
+  => \\='((\"Opus   (opus)   effort: low/max\" . \"opus\")
+       (\"Haiku  (haiku)  no effort levels\" . \"haiku\"))"
+  (let ((columns (list (lambda (model)
+                         (map-elt model :name))
+                       (lambda (model)
+                         (format "(%s)" (map-elt model :model-id))))))
+    (when (seq-some (lambda (model) (map-elt model :reasoning-efforts)) models)
+      (setq columns
+            (append columns
+                    (list (lambda (model)
+                            (if-let* ((efforts (map-elt model :reasoning-efforts)))
+                                (concat "effort: " (string-join efforts "/"))
+                              "no effort levels"))))))
+    (seq-mapn (lambda (title model)
+                (cons title (map-elt model :model-id)))
+              (agent-shell--align-alist :data models :columns columns)
+              models)))
+
 (defun agent-shell-set-session-model (&optional on-success)
   "Set session model.
 
@@ -16006,16 +16038,7 @@ Optionally, get notified of completion with ON-SUCCESS function."
                                                        (string= (map-elt model :model-id) current-model-id))
                                                      available-models)
                                            :name)))
-         (model-choices (seq-mapn (lambda (title model)
-                                    (cons title (map-elt model :model-id)))
-                                  (agent-shell--align-alist
-                                   :data available-models
-                                   :columns (list
-                                             (lambda (model)
-                                               (map-elt model :name))
-                                             (lambda (model)
-                                               (format "(%s)" (map-elt model :model-id)))))
-                                  available-models))
+         (model-choices (agent-shell--model-choices available-models))
          (selection (completing-read "Set model: "
                                      (mapcar #'car model-choices)
                                      nil t nil nil

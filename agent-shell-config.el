@@ -71,15 +71,37 @@ For example:
                   (lambda (acp-entry)
                     (if (map-elt acp-entry 'group)
                         (mapcar (lambda (acp-value)
-                                  `((:value . ,(map-elt acp-value 'value))
-                                    (:name . ,(map-elt acp-value 'name))
-                                    (:description . ,(map-elt acp-value 'description))
-                                    (:group . ,(map-elt acp-entry 'name))))
+                                  (agent-shell--normalize-config-option-value
+                                   acp-value (map-elt acp-entry 'name)))
                                 (append (map-elt acp-entry 'options) nil))
-                      (list `((:value . ,(map-elt acp-entry 'value))
-                              (:name . ,(map-elt acp-entry 'name))
-                              (:description . ,(map-elt acp-entry 'description))))))
+                      (list (agent-shell--normalize-config-option-value acp-entry))))
                   (append (map-elt acp-option 'options) nil)))))
+
+(defun agent-shell--normalize-config-option-value (acp-value &optional group)
+  "Normalize ACP-VALUE (one entry of a config option) to an internal alist.
+
+GROUP, when non-nil, is the display name of the group holding it.
+claude-agent-acp names a model's effort levels, lowest first, at
+`_meta.jetbrains.air.reasoningEfforts.values' on each `model' entry;
+those become :reasoning-efforts.  Entries without them get no such key.
+
+For example:
+
+  (agent-shell--normalize-config-option-value
+   \\='((value . \"opus\") (name . \"Opus\")
+     (_meta (jetbrains (air (reasoningEfforts (values . [\"low\" \"max\"])))))))
+  => \\='((:value . \"opus\") (:name . \"Opus\") (:description . nil)
+       (:reasoning-efforts . (\"low\" \"max\")))"
+  (let ((efforts (append (map-nested-elt acp-value
+                                         '(_meta jetbrains air reasoningEfforts values))
+                         nil)))
+    (append `((:value . ,(map-elt acp-value 'value))
+              (:name . ,(map-elt acp-value 'name))
+              (:description . ,(map-elt acp-value 'description)))
+            (when group
+              `((:group . ,group)))
+            (when efforts
+              `((:reasoning-efforts . ,efforts))))))
 
 (defun agent-shell--normalize-config-options (acp-config-options)
   "Normalize ACP-CONFIG-OPTIONS (ACP `configOptions') to internal alists.
@@ -290,7 +312,8 @@ For example:
   "Convert OPTION values to legacy model display shape.
 
 Each value becomes an alist with :model-id, :name, and :description
-so existing model UI code works unchanged.
+so existing model UI code works unchanged, plus :reasoning-efforts when
+the agent named the model's effort levels.
 
 For example:
 
@@ -302,9 +325,11 @@ For example:
         (:name . \"Sonnet\")
         (:description . nil)))"
   (mapcar (lambda (value)
-            `((:model-id . ,(map-elt value :value))
-              (:name . ,(map-elt value :name))
-              (:description . ,(map-elt value :description))))
+            (append `((:model-id . ,(map-elt value :value))
+                      (:name . ,(map-elt value :name))
+                      (:description . ,(map-elt value :description)))
+                    (when-let* ((efforts (map-elt value :reasoning-efforts)))
+                      `((:reasoning-efforts . ,efforts)))))
           (map-elt option :options)))
 
 (defun agent-shell--config-option-as-modes (option)
