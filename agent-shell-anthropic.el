@@ -170,9 +170,12 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
    ;; `session_message' to each child.  `session.compaction' asks for
    ;; `compaction_update' instead of the synthetic "Compact conversation"
    ;; tool call; without it a restored session replays the compaction
-   ;; summary as its first user prompt.
+   ;; summary as its first user prompt.  `session.cursors' asks for the
+   ;; `cursor_update' before each prompt, which
+   ;; `agent-shell-edit-prompt-at-point' rewinds or forks at.
    :client-capabilities '((subagents . ())
-                          (session . ((compaction . ()))))
+                          (session . ((compaction . ())
+                                      (cursors . ()))))
    :session-meta `((claudeCode
                     . ((options
                         . ((thinking

@@ -101,6 +101,7 @@
 (require 'agent-shell-prompt-suggestion)
 (require 'agent-shell-qoder)
 (require 'agent-shell-qwen)
+(require 'agent-shell-rewind)
 (require 'agent-shell-styles)
 (require 'agent-shell-subagents)
 (require 'agent-shell-usage)
@@ -1569,12 +1570,14 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-system-prompt nil)
         (cons :supports-session-delete nil)
         (cons :supports-fork-point nil)
+        (cons :supports-session-rewind nil)
         (cons :supports-session-index nil)
         (cons :supports-session-batch-get nil)
         (cons :supports-steering nil)
         (cons :resume-session-id nil)
         (cons :fork-session-id nil)
         (cons :fork-message-id nil)
+        (cons :cursors nil)
         (cons :pending-restore nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
@@ -4522,10 +4525,12 @@ around this call to reflect whether the update arrived out of turn."
          ;; `shell-maker--extract-history' can pair the command with
          ;; its response.  Skipped while pending-restore is buffering
          ;; (nothing is being rendered yet).
+         ;; A replayed `cursor_update' follows its user message and renders
+         ;; nothing, so the update after it closes the prompt instead.
          (when (and (not (map-elt state :pending-restore))
                     (equal (map-elt state :last-entry-type) "user_message_chunk")
-                    (not (equal (map-nested-elt acp-notification '(params update sessionUpdate))
-                                "user_message_chunk")))
+                    (not (member (map-nested-elt acp-notification '(params update sessionUpdate))
+                                 '("user_message_chunk" "cursor_update"))))
            ;; User prompts may be replayed in multiple chunks.  Keep chunk
            ;; text contiguous and add the live-path trailing separator only
            ;; when the prompt is complete.
@@ -5270,6 +5275,11 @@ around this call to reflect whether the update arrived out of turn."
                         (cons :meta (map-nested-elt acp-notification '(params update _meta)))))
            ;; Note: This is session-level state, no need to set :last-entry-type
            nil)
+          ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "cursor_update")
+           ;; Session cursors: where `agent-shell-edit-prompt-at-point' can
+           ;; rewind or fork.  Nothing renders, so `:last-entry-type' stays.
+           (agent-shell--handle-cursor-update
+            state (map-nested-elt acp-notification '(params update))))
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "session_push_end")
            ;; Before the turn ends, or a queued prompt dispatched by
            ;; `on-finished' takes over the pending chunk's namespace.
@@ -10851,8 +10861,12 @@ instead of the subagents RFD.
 
 Unlike the others, the agent answers \"sessionIndex\" by advertising it
 back (see `agent-shell--air-capability-advertised-p'), and only then
-accepts the list options of `agent-shell--make-session-list-request'."
-  (agent-shell--air-capabilities-meta "asyncTasks" "sessionIndex" "sessionFailure"))
+accepts the list options of `agent-shell--make-session-list-request'.
+\"sessionRewind\" is answered the same way, and enables
+`_session/rewind' and the `rewind' capability of the session cursors
+`agent-shell-edit-prompt-at-point' acts at."
+  (agent-shell--air-capabilities-meta
+   "asyncTasks" "sessionIndex" "sessionFailure" "sessionRewind"))
 
 (defun agent-shell--air-extension-supported-p (acp-response)
   "Return non-nil when ACP-RESPONSE's agent implements the AIR extension.
@@ -11094,6 +11108,9 @@ Must provide ON-INITIATED (lambda ())."
                    (map-put! agent-shell--state :supports-session-batch-get
                              (agent-shell--air-capability-advertised-p
                               acp-response "sessionBatchGet"))
+                   (map-put! agent-shell--state :supports-session-rewind
+                             (agent-shell--air-capability-advertised-p
+                              acp-response "sessionRewind"))
                    ;; Advertised to any client that sent AIR `_meta'.
                    (map-put! agent-shell--state :goal-capability
                              (agent-shell--goal-capability acp-response))
