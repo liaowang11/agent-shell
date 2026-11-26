@@ -1577,6 +1577,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :resume-session-id nil)
         (cons :fork-session-id nil)
         (cons :fork-message-id nil)
+        (cons :fork-cursor-id nil)
         (cons :cursors nil)
         (cons :pending-restore nil)
         (cons :prompt-capabilities nil)
@@ -1968,7 +1969,7 @@ starts a fresh shell with the same agent configuration.
 
 When SESSION-ID is provided, resume that session instead of starting new.
 
-Works from both shell and viewport buffers."
+Works from both shell and viewport buffers.  Returns the new shell buffer."
   (declare (modes agent-shell-mode
                   agent-shell-viewport-view-mode
                   agent-shell-viewport-edit-mode))
@@ -2024,7 +2025,8 @@ Works from both shell and viewport buffers."
               (dolist (window live-windows)
                 (set-window-buffer window new-shell-buffer))
               (select-window (car live-windows)))
-          (agent-shell--display-buffer new-shell-buffer))))))
+          (agent-shell--display-buffer new-shell-buffer)))
+      new-shell-buffer)))
 
 ;;;###autoload
 (defun agent-shell-reload ()
@@ -2043,10 +2045,12 @@ Works from both shell and viewport buffers."
       (user-error "No active session to reload"))
     (agent-shell-restart :session-id session-id)))
 
-(cl-defun agent-shell--fork-shell-buffer (&key shell-buffer message-id from-viewport)
+(cl-defun agent-shell--fork-shell-buffer (&key shell-buffer message-id cursor-id from-viewport)
   "Start a new shell forking SHELL-BUFFER's session.
 MESSAGE-ID, when given, forks up to that message instead of the
 session's latest turn (see `agent-shell--fork-message-meta').
+CURSOR-ID, when given instead, forks the history before that session
+cursor (see `agent-shell--make-session-fork-request').
 FROM-VIEWPORT controls whether the new buffer is shown via the
 viewport or as a plain shell buffer.  Returns the new shell buffer."
   (let ((session-id (map-nested-elt (buffer-local-value 'agent-shell--state shell-buffer)
@@ -2064,6 +2068,7 @@ viewport or as a plain shell buffer.  Returns the new shell buffer."
                              :session-strategy 'new
                              :fork-session-id session-id
                              :fork-message-id message-id
+                             :fork-cursor-id cursor-id
                              :new-session t
                              :no-focus t)))
       (if (or from-viewport agent-shell-prefer-viewport-interaction)
@@ -8409,7 +8414,8 @@ own banner, passing along their shell-maker config."
    "✨ (or ask your employer to).\n\n"))
 
 (cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id
-                                   fork-session-id fork-message-id outgoing-request-decorator cwd)
+                                   fork-session-id fork-message-id fork-cursor-id
+                                   outgoing-request-decorator cwd)
   "Programmatically start shell with CONFIG.
 
 See `agent-shell-make-agent-config' for config format.
@@ -8428,6 +8434,8 @@ FORK-MESSAGE-ID, only meaningful alongside FORK-SESSION-ID, forks up to
 that message instead of the session's latest turn; ignored by agents
 that don't advertise claude-agent-acp's AIR fork-point extension (see
 `agent-shell--initiate-session-fork-by-id').
+FORK-CURSOR-ID, also only alongside FORK-SESSION-ID, forks the history
+before that session cursor instead.
 OUTGOING-REQUEST-DECORATOR is passed through to `acp-make-client'."
   (unless (version<= agent-shell--shell-maker-minimum-version shell-maker-version)
     (error "Please update shell-maker to version %s or newer"
@@ -8567,6 +8575,8 @@ variable (see makunbound)"))
         (map-put! agent-shell--state :fork-session-id fork-session-id))
       (when fork-message-id
         (map-put! agent-shell--state :fork-message-id fork-message-id))
+      (when fork-cursor-id
+        (map-put! agent-shell--state :fork-cursor-id fork-cursor-id))
       ;; Snapshot the strategy also in case it was dynamically re-bound
       (setq-local agent-shell-session-strategy
                   (or session-strategy agent-shell-session-strategy))
@@ -11577,6 +11587,7 @@ Must provide ON-SESSION-INIT (lambda ())."
           (agent-shell--initiate-session-fork-by-id
            :session-id fork-session-id
            :message-id (map-elt (agent-shell--state) :fork-message-id)
+           :cursor-id (map-elt (agent-shell--state) :fork-cursor-id)
            :shell-buffer shell-buffer
            :on-session-init on-session-init)
         ;; Forking not supported. Start a new session.
@@ -12524,11 +12535,38 @@ sets it is not repeated.  Agents that do not know it ignore it."
             (list (cons 'generateSessionTitle t)))
           (when message-id (agent-shell--fork-message-meta message-id))))
 
-(cl-defun agent-shell--initiate-session-fork-by-id (&key session-id message-id shell-buffer
-                                                         on-session-init)
+(cl-defun agent-shell--make-session-fork-request (&key session-id cwd mcp-servers meta
+                                                      system-prompt cursor-id)
+  "Return a `session/fork' request, forking before CURSOR-ID when given.
+
+SESSION-ID, CWD, MCP-SERVERS, META and SYSTEM-PROMPT are as in
+`acp-make-session-fork-request'.  CURSOR-ID is a session cursor the
+agent announced with the `fork' capability (the session cursors RFD):
+the fork copies the history before it.
+
+  (agent-shell--make-session-fork-request
+   :session-id \"s1\" :cwd \"/tmp\" :cursor-id \"before:u2\")
+  ;; => ((:method . \"session/fork\")
+  ;;     (:params . ((sessionId . \"s1\") (cwd . \"/tmp\")
+  ;;                 (mcpServers . []) (cursorId . \"before:u2\"))))"
+  (let ((request (acp-make-session-fork-request
+                  :session-id session-id
+                  :cwd cwd
+                  :mcp-servers mcp-servers
+                  :meta meta
+                  :system-prompt system-prompt)))
+    (if cursor-id
+        (list (assq :method request)
+              (cons :params (append (map-elt request :params)
+                                    (list (cons 'cursorId cursor-id)))))
+      request)))
+
+(cl-defun agent-shell--initiate-session-fork-by-id (&key session-id message-id cursor-id
+                                                         shell-buffer on-session-init)
   "Fork session SESSION-ID with SHELL-BUFFER and ON-SESSION-INIT.
 MESSAGE-ID, when given, forks up to that message rather than the
-session's latest turn; see `agent-shell--fork-message-meta'."
+session's latest turn; see `agent-shell--fork-message-meta'.  CURSOR-ID,
+when given, forks before that session cursor instead."
   (agent-shell--update-bootstrapping-fragment
    :state (agent-shell--state)
    :block-id "starting"
@@ -12537,14 +12575,15 @@ session's latest turn; see `agent-shell--fork-message-meta'."
   (agent-shell--send-request
    :state (agent-shell--state)
    :client (map-elt (agent-shell--state) :client)
-   :request (acp-make-session-fork-request
+   :request (agent-shell--make-session-fork-request
              :session-id session-id
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
              :meta (agent-shell--fork-request-meta
                     (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
-                    message-id)
-             :system-prompt (agent-shell--system-prompt))
+                    (unless cursor-id message-id))
+             :system-prompt (agent-shell--system-prompt)
+             :cursor-id cursor-id)
    :buffer (current-buffer)
    :on-success (lambda (acp-fork-response)
                  (let ((new-session-id (map-elt acp-fork-response 'sessionId)))

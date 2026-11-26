@@ -54,6 +54,7 @@
 (declare-function agent-shell--turn-at-index "agent-shell")
 (declare-function agent-shell--turn-position "agent-shell")
 (declare-function agent-shell--prompt-queue-replace "agent-shell-prompt-queue")
+(declare-function agent-shell--edit-prompt-submit "agent-shell-rewind")
 (declare-function agent-shell--prompt-queue-paused-p "agent-shell-prompt-queue")
 (declare-function agent-shell--prompt-queue-steer-at "agent-shell-prompt-queue")
 (declare-function agent-shell--prompt-send "agent-shell-prompt-queue")
@@ -171,6 +172,23 @@ this index instead of enqueueing a new one.")
 ;; Survives mode switches (edit <-> view) which clear buffer-local vars.
 (put 'agent-shell-viewport--edit-pending-prompt 'permanent-local t)
 
+(defvar-local agent-shell-viewport--edit-past-position nil
+  "Marker at the start of the earlier prompt this compose buffer edits, or nil.
+
+The marker is in the shell buffer.  When non-nil, sending the compose
+buffer runs the draft in place of that prompt: the session is rewound or
+forked before it (see `agent-shell-edit-prompt-at-point').  A position
+rather than the prompt's session cursor, since a prompt without one can
+still be forked at the agent message before it.
+
+Unlike `agent-shell-viewport--edit-pending-index', paging away from the
+compose page keeps it, as the parked draft is still the edit; so does
+recalling history into the draft.  Sending the edit, cancelling or
+overriding the draft, leaving the compose page with a blank draft, or
+starting another edit clears it.")
+;; Survives mode switches (edit <-> view) which clear buffer-local vars.
+(put 'agent-shell-viewport--edit-past-position 'permanent-local t)
+
 (defvar-local agent-shell-viewport--compose-disposition nil
   "What this compose buffer's send key does while a turn is running.
 
@@ -271,6 +289,8 @@ Returns an alist with insertion details or nil otherwise:
          (override
           (agent-shell-viewport-edit-mode)
           (agent-shell-viewport--initialize)
+          ;; The replaced draft took its edit along.
+          (setq agent-shell-viewport--edit-past-position nil)
           (setq insert-start (point))
           (insert override)
           (setq insert-end (point)))
@@ -351,19 +371,75 @@ Does nothing when no window shows the buffer."
       (goto-char pos)
       (recenter (when (= pos (point-max)) -1)))))
 
-(cl-defun agent-shell-viewport--compose-route (&key pending send)
+(cl-defun agent-shell-viewport--compose-route (&key pending past send)
   "Hand the composed draft to the handler for what it edits.
 
 Every compose send command delivers through here, so none can treat an
 edit as a new prompt.  When the draft edits a queued prompt (see
 `agent-shell-prompt-queue-edit'), calls PENDING with that prompt's
-index and original text.  Otherwise calls SEND with no arguments.
-Each handler reads and clears the edit state as its command needs."
-  (if agent-shell-viewport--edit-pending-index
-      (funcall pending
-               agent-shell-viewport--edit-pending-index
-               agent-shell-viewport--edit-pending-prompt)
-    (funcall send)))
+index and original text.  When it edits an earlier prompt (see
+`agent-shell-edit-prompt-at-point'), calls PAST with no arguments, or
+signals a `user-error' without PAST: queueing or steering has no turn
+to join, as the edit replaces a finished one.  Otherwise calls SEND
+with no arguments.  Each handler reads and clears the edit state as its
+command needs.
+
+Returns nil when PAST ran, since that edit completes later and owns the
+compose buffer until then: the caller must leave the buffer alone.
+Returns non-nil otherwise."
+  (cond
+   (agent-shell-viewport--edit-pending-index
+    (funcall pending
+             agent-shell-viewport--edit-pending-index
+             agent-shell-viewport--edit-pending-prompt)
+    t)
+   (agent-shell-viewport--edit-past-position
+    (unless past
+      (user-error "An edit of an earlier prompt can only be sent, not queued or steered"))
+    (funcall past)
+    nil)
+   (t
+    (funcall send)
+    t)))
+
+(defun agent-shell-viewport--drop-blank-past-edit ()
+  "Forget the earlier prompt this compose buffer edits when its draft is blank.
+Run on leaving the compose page: a draft with text is parked and comes
+back as the edit, while a blank one parks nothing, so the next draft
+would otherwise inherit the edit."
+  (when (string-empty-p (string-trim (buffer-string)))
+    (setq agent-shell-viewport--edit-past-position nil)))
+
+(cl-defun agent-shell-viewport--compose-send-past-edit (&key keep-composing)
+  "Run the composed draft in place of the earlier prompt it edits.
+
+Rewinds or forks the session before that prompt (see
+`agent-shell--edit-prompt-submit').  Once the edit is on its way, the
+draft and the edit state are cleared and, unless KEEP-COMPOSING, the
+compose window is dismissed, as the result shows in the reloaded or
+forked shell.  A refused or declined edit leaves both, so nothing typed
+is lost and sending again retries it."
+  (let ((viewport-buffer (current-buffer))
+        (shell-buffer (agent-shell-viewport--shell-buffer))
+        (position agent-shell-viewport--edit-past-position))
+    (unless (and (buffer-live-p shell-buffer)
+                 (eq (marker-buffer position) shell-buffer))
+      (user-error "The prompt being edited is gone"))
+    (agent-shell--edit-prompt-submit
+     :shell-buffer shell-buffer
+     :position (marker-position position)
+     :prompt (string-trim (buffer-string))
+     :from-viewport t
+     :on-done
+     (lambda ()
+       ;; A rewind reloads the shell, which kills this buffer with the old one.
+       (when (buffer-live-p viewport-buffer)
+         (with-current-buffer viewport-buffer
+           (setq agent-shell-viewport--edit-past-position nil)
+           (agent-shell-viewport--reset-compose-state)
+           (agent-shell-viewport--initialize)
+           (unless keep-composing
+             (agent-shell-viewport--dismiss viewport-buffer))))))))
 
 (defun agent-shell-viewport-compose-send (&optional keep-composing)
   "Send the viewport composed prompt to the agent shell.
@@ -387,7 +463,7 @@ queued right away, regardless of `agent-shell-viewport-dismiss-on-send'."
     (agent-shell-viewport--reset-compose-state)
     (cond
      (keep-composing
-      (agent-shell-viewport--compose-deliver))
+      (agent-shell-viewport--compose-deliver :keep-composing t))
      (agent-shell-viewport-dismiss-on-send
       (agent-shell-viewport-compose-send-and-dismiss))
      (agent-shell-prefer-viewport-interaction
@@ -432,32 +508,33 @@ make the promise depend on which key sent it."
         (viewport-buffer (current-buffer))
         (disposition agent-shell-viewport--compose-disposition)
         (prompt (string-trim (buffer-string))))
-    (agent-shell-viewport--compose-route
-     :pending
-     (lambda (index expected)
-       (setq agent-shell-viewport--edit-pending-index nil
-             agent-shell-viewport--edit-pending-prompt nil)
-       (with-current-buffer shell-buffer
-         (agent-shell--prompt-queue-replace
-          :index index :expected expected :prompt prompt)))
-     :send
-     (lambda ()
-       (with-current-buffer shell-buffer
-         (if (agent-shell-viewport--hold-p)
-             (agent-shell--prompt-send :prompt prompt :disposition disposition)
-           (agent-shell--insert-to-shell-buffer
-            :text prompt
-            :submit t)))))
-    ;; Sending and killing viewport should not
-    ;; ask user if they want to kill the shell also.
-    ;; The intent is clear that they do not want that
-    ;; since they are sending a prompt.
-    (with-current-buffer viewport-buffer
-      (let ((agent-shell-viewport--clean-up nil))
-        (kill-buffer viewport-buffer)))
-    (pop-to-buffer shell-buffer)))
+    (when (agent-shell-viewport--compose-route
+           :pending
+           (lambda (index expected)
+             (setq agent-shell-viewport--edit-pending-index nil
+                   agent-shell-viewport--edit-pending-prompt nil)
+             (with-current-buffer shell-buffer
+               (agent-shell--prompt-queue-replace
+                :index index :expected expected :prompt prompt)))
+           :past #'agent-shell-viewport--compose-send-past-edit
+           :send
+           (lambda ()
+             (with-current-buffer shell-buffer
+               (if (agent-shell-viewport--hold-p)
+                   (agent-shell--prompt-send :prompt prompt :disposition disposition)
+                 (agent-shell--insert-to-shell-buffer
+                  :text prompt
+                  :submit t)))))
+      ;; Sending and killing viewport should not
+      ;; ask user if they want to kill the shell also.
+      ;; The intent is clear that they do not want that
+      ;; since they are sending a prompt.
+      (with-current-buffer viewport-buffer
+        (let ((agent-shell-viewport--clean-up nil))
+          (kill-buffer viewport-buffer)))
+      (pop-to-buffer shell-buffer))))
 
-(cl-defun agent-shell-viewport--compose-deliver (&key disposition)
+(cl-defun agent-shell-viewport--compose-deliver (&key disposition keep-composing)
   "Deliver the composed prompt, then clear the compose buffer.
 
 While a turn is running, DISPOSITION decides whether the prompt joins it
@@ -474,31 +551,42 @@ as the active prompt, since the cleared compose buffer does not itself
 show what was submitted.  Queueing and steering echo their own outcome.
 
 A draft editing a pending prompt replaces that prompt instead, as every
-other send path does, so the original does not run as well."
+other send path does, so the original does not run as well.  A draft
+editing an earlier prompt runs in its place (see
+`agent-shell-viewport--compose-send-past-edit', which gets
+KEEP-COMPOSING), and is cleared only once that edit is on its way.
+
+Returns nil for such an edit, which owns the buffer until then, and
+non-nil otherwise."
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
         (prompt (string-trim (buffer-string)))
         (disposition (or disposition agent-shell-viewport--compose-disposition))
         (edited nil)
         ;; Sample state before the send below submits, queues or steers.
         (submitted (not (agent-shell-viewport--hold-p))))
-    (agent-shell-viewport--compose-route
-     :pending
-     (lambda (index expected)
-       (setq agent-shell-viewport--edit-pending-index nil
-             agent-shell-viewport--edit-pending-prompt nil
-             edited t)
-       (with-current-buffer shell-buffer
-         (agent-shell--prompt-queue-replace
-          :index index :expected expected :prompt prompt)))
-     :send
-     (lambda ()
-       (when (string-empty-p prompt)
-         (user-error "Nothing to send"))
-       (with-current-buffer shell-buffer
-         (agent-shell--prompt-send :prompt prompt :disposition disposition))))
-    (agent-shell-viewport--initialize)
-    (when (and submitted (not edited))
-      (agent-shell--prompt-queue-echo :active-prompt prompt))))
+    (when (agent-shell-viewport--compose-route
+           :pending
+           (lambda (index expected)
+             (setq agent-shell-viewport--edit-pending-index nil
+                   agent-shell-viewport--edit-pending-prompt nil
+                   edited t)
+             (with-current-buffer shell-buffer
+               (agent-shell--prompt-queue-replace
+                :index index :expected expected :prompt prompt)))
+           :past
+           (lambda ()
+             (agent-shell-viewport--compose-send-past-edit
+              :keep-composing keep-composing))
+           :send
+           (lambda ()
+             (when (string-empty-p prompt)
+               (user-error "Nothing to send"))
+             (with-current-buffer shell-buffer
+               (agent-shell--prompt-send :prompt prompt :disposition disposition))))
+      (agent-shell-viewport--initialize)
+      (when (and submitted (not edited))
+        (agent-shell--prompt-queue-echo :active-prompt prompt))
+      t)))
 
 (cl-defun agent-shell-viewport--compose-dispose (&key keep-composing shell-buffer)
   "Leave the compose buffer where `agent-shell-viewport-compose-send' would.
@@ -666,8 +754,8 @@ The compose window is dismissed, restoring the previous window layout."
   (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
     (user-error "Not in a shell viewport buffer"))
   (let ((viewport-buffer (current-buffer)))
-    (agent-shell-viewport--compose-deliver)
-    (agent-shell-viewport--dismiss viewport-buffer)))
+    (when (agent-shell-viewport--compose-deliver)
+      (agent-shell-viewport--dismiss viewport-buffer))))
 
 (defun agent-shell-viewport--dismiss (viewport-buffer)
   "Hide VIEWPORT-BUFFER's window, restoring the previous layout.
@@ -703,6 +791,7 @@ resolving to its shell on the next invocation."
          ;; edited prompt as a draft.
          (agent-shell-viewport--initialize)
          (agent-shell-viewport-view-last)))
+     :past #'agent-shell-viewport--compose-send-past-edit
      :send
      (lambda ()
        (when (string-empty-p prompt)
@@ -839,7 +928,38 @@ buffer."
       (when text
         (insert text))
       (setq agent-shell-viewport--edit-pending-index index
-            agent-shell-viewport--edit-pending-prompt text))
+            agent-shell-viewport--edit-pending-prompt text
+            agent-shell-viewport--edit-past-position nil))
+    viewport-buffer))
+
+(cl-defun agent-shell-viewport--prefill-past-edit (&key shell-buffer position text)
+  "Prepare SHELL-BUFFER's compose buffer to edit the earlier prompt at POSITION.
+
+Open the compose buffer, prefill it with TEXT, the prompt's text, and
+mark it as editing that prompt (see
+`agent-shell-viewport--edit-past-position').  A draft being composed,
+shown or parked, is replaced only once the user agrees.  Return the
+viewport buffer."
+  (let ((viewport-buffer (agent-shell-viewport--buffer :shell-buffer shell-buffer)))
+    (with-current-buffer viewport-buffer
+      (let ((draft (if (derived-mode-p 'agent-shell-viewport-edit-mode)
+                       (buffer-string)
+                     (map-elt agent-shell-viewport--compose-snapshot :content))))
+        (when (and draft
+                   (not (string-empty-p (string-trim draft)))
+                   (not (y-or-n-p "Replace the composed prompt with this edit? ")))
+          (user-error "Cancelled")))
+      (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
+        (agent-shell-viewport-edit-mode))
+      (agent-shell-viewport--reset-compose-state)
+      (agent-shell-viewport--initialize)
+      ;; The edit is sent, never queued or steered.
+      (setq agent-shell-viewport--compose-disposition nil)
+      (insert text)
+      (setq agent-shell-viewport--edit-past-position
+            (with-current-buffer shell-buffer
+              (copy-marker position)))
+      (agent-shell-viewport--update-header))
     viewport-buffer))
 
 (defun agent-shell-viewport--ensure-buffer ()
@@ -938,6 +1058,7 @@ its row's group) are left out."
            (derived-mode-p 'agent-shell-viewport-edit-mode))
       (when (or (string-empty-p (string-trim (buffer-string)))
                 (y-or-n-p "Discard composed prompt? "))
+        (setq agent-shell-viewport--edit-past-position nil)
         (agent-shell-viewport--initialize)
         (agent-shell-viewport--dismiss viewport-buffer)))
      ;; View mode
@@ -948,12 +1069,14 @@ its row's group) are left out."
         (not (shell-maker-history-position)))
       (when (or (string-empty-p (string-trim (buffer-string)))
                 (y-or-n-p "Discard composed prompt? "))
+        (setq agent-shell-viewport--edit-past-position nil)
         (agent-shell-viewport--initialize)
         (bury-buffer)))
      ;; Edit mode, has history
      (t
       (when (or (string-empty-p (string-trim (buffer-string)))
                 (y-or-n-p "Discard composed prompt? "))
+        (setq agent-shell-viewport--edit-past-position nil)
         (if agent-shell-prefer-viewport-interaction
             (progn
               ;; Clear first: leaving compose parks what it holds, which
@@ -2438,15 +2561,17 @@ page position and the animated busy frame."
 (defun agent-shell-viewport--header-inputs (shell-buffer)
   "Return what the viewport header model depends on, besides its position.
 
-Status and key hints follow the major mode, whether SHELL-BUFFER is busy
-and what a send would do then.  Everything else comes from the shell, so
+Status and key hints follow the major mode, whether the draft edits an
+earlier prompt, whether SHELL-BUFFER is busy and what a send would do
+then.  Everything else comes from the shell, so
 any full update of its own header (usage, model or mode changes) also
 invalidates the viewport's, as does a frame resize.
 
 For example:
 
-  (agent-shell-viewport-view-mode \"queue\" ((:buffer-name . ...) ...) 1920)"
+  (agent-shell-viewport-view-mode nil \"queue\" ((:buffer-name . ...) ...) 1920)"
   (list major-mode
+        (and agent-shell-viewport--edit-past-position t)
         (when (agent-shell-viewport--busy-p)
           (agent-shell-viewport--compose-disposition-label
            agent-shell-viewport--compose-disposition))
@@ -2467,6 +2592,10 @@ For example:
   "Return a full header model for this viewport, built in SHELL-BUFFER."
   (let* ((position-label (agent-shell-viewport--position-label))
          (status (cond
+                  ((and agent-shell-viewport--edit-past-position
+                        (derived-mode-p 'agent-shell-viewport-edit-mode))
+                   (propertize "Edit earlier prompt"
+                               'face 'agent-shell-viewport-status-edit))
                   ((and (agent-shell-viewport--busy-p)
                         (derived-mode-p 'agent-shell-viewport-edit-mode))
                    (propertize (format "Edit (%s)"
@@ -2615,6 +2744,7 @@ For example, offer to kill associated shell session."
   (add-hook 'completion-in-region-mode-hook #'agent-shell--prompt-suggestion-refresh nil t)
   ;; The gray text belongs to the compose page; view mode shows none.
   (add-hook 'change-major-mode-hook #'agent-shell--prompt-suggestion-remove nil t)
+  (add-hook 'change-major-mode-hook #'agent-shell-viewport--drop-blank-past-edit nil t)
   (agent-shell--prompt-suggestion-refresh)
   ;; A major-mode change keeps `buffer-undo-list', so without this undo
   ;; in compose brings back the pages view mode erased and inserted.
