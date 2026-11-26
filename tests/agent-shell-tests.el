@@ -12578,7 +12578,9 @@ Sending the edit as a new prompt instead would leave the original queued
 as well, so both versions would run."
   (dolist (send '(agent-shell-viewport-compose-send-and-kill
                   agent-shell-viewport--compose-deliver
-                  agent-shell-viewport-compose-send-and-dismiss))
+                  agent-shell-viewport-compose-send-and-dismiss
+                  agent-shell-viewport-compose-send-and-wait-for-response
+                  agent-shell-viewport-compose-queue))
     (let ((shell-buffer (generate-new-buffer " *test-shell*"))
           replaced sent)
       (unwind-protect
@@ -12600,6 +12602,7 @@ as well, so both versions would run."
                        (lambda (&rest _) t))
                       ((symbol-function 'agent-shell-viewport--initialize) #'ignore)
                       ((symbol-function 'agent-shell-viewport--dismiss) #'ignore)
+                      ((symbol-function 'agent-shell-viewport-view-last) #'ignore)
                       ((symbol-function 'kill-buffer) #'ignore)
                       ((symbol-function 'pop-to-buffer) #'ignore))
               (funcall send)
@@ -12610,6 +12613,116 @@ as well, so both versions would run."
               (should-not sent)
               (should-not agent-shell-viewport--edit-pending-index)
               (should-not agent-shell-viewport--edit-pending-prompt)))
+        (kill-buffer shell-buffer)))))
+
+;;; Tests for routing compose sends
+
+(defconst agent-shell-tests--compose-non-senders
+  '(agent-shell-viewport-compose-cancel
+    agent-shell-viewport-compose-help-menu)
+  "Compose commands that send nothing.")
+
+(defun agent-shell-tests--compose-send-commands ()
+  "Return every compose command that sends the draft.
+
+Every `agent-shell-viewport-compose-' command but
+`agent-shell-tests--compose-non-senders', so a new send command is
+covered without being listed."
+  (seq-difference (apropos-internal "\\`agent-shell-viewport-compose-" #'commandp)
+                  agent-shell-tests--compose-non-senders))
+
+(ert-deftest agent-shell-viewport-compose-send-commands-are-enumerated-test ()
+  "Test the compose keymap's sending keys are all in the enumerated set.
+
+A send key bound to a command named outside the
+`agent-shell-viewport-compose-' prefix would escape the route tests."
+  (let ((senders (agent-shell-tests--compose-send-commands))
+        (bound nil))
+    (should (memq 'agent-shell-viewport-compose-send senders))
+    (should (memq 'agent-shell-viewport-compose-send-and-kill senders))
+    (named-let walk ((keymap agent-shell-viewport-edit-mode-map))
+      (map-keymap
+       (lambda (_key binding)
+         (cond ((keymapp binding) (walk binding))
+               ((and (symbolp binding)
+                     (string-match-p "send\\|queue\\|steer" (symbol-name binding)))
+                (push binding bound))))
+       keymap))
+    ;; Bindings under C-c are reached too, not only top-level ones.
+    (should (memq 'agent-shell-viewport-compose-queue bound))
+    (dolist (command bound)
+      (should (memq command senders)))))
+
+(ert-deftest agent-shell-viewport-compose-sends-go-through-route-test ()
+  "Test every compose send command delivers through the route helper.
+
+`agent-shell-viewport--compose-route' is what checks for an edit, so a
+command that sent without it could deliver an edit as a new prompt."
+  (dolist (command (agent-shell-tests--compose-send-commands))
+    (let ((shell-buffer (generate-new-buffer " *test-shell*")))
+      (unwind-protect
+          (with-temp-buffer
+            (insert "draft")
+            (with-current-buffer shell-buffer
+              (setq-local agent-shell--state
+                          (list (cons :session (list (cons :id "s1"))))))
+            (cl-letf (((symbol-function 'derived-mode-p)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell-viewport--hold-p)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'agent-shell-viewport--compose-route)
+                       (lambda (&rest _) (throw 'routed command)))
+                      ((symbol-function 'agent-shell--prompt-send)
+                       (lambda (&rest _) (error "Sent without the route")))
+                      ((symbol-function 'agent-shell--prompt-steer)
+                       (lambda (&rest _) (error "Sent without the route")))
+                      ((symbol-function 'agent-shell--insert-to-shell-buffer)
+                       (lambda (&rest _) (error "Sent without the route"))))
+              (should (eq (catch 'routed (funcall command) 'not-routed)
+                          command))))
+        (kill-buffer shell-buffer)))))
+
+(ert-deftest agent-shell-viewport-compose-steer-edit-steers-the-entry-test ()
+  "Test steering an edited pending prompt steers that entry, not a copy.
+
+Delivery consumes the entry and clears the edit; a decline keeps the
+draft tracking the entry, now holding the edited text."
+  (dolist (outcome '(delivered declined))
+    (let ((shell-buffer (generate-new-buffer " *test-shell*"))
+          steered sent)
+      (unwind-protect
+          (with-temp-buffer
+            (insert "b-edited")
+            (setq agent-shell-viewport--edit-pending-index 1
+                  agent-shell-viewport--edit-pending-prompt "b")
+            (cl-letf (((symbol-function 'derived-mode-p)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'agent-shell-viewport--shell-buffer)
+                       (lambda (&rest _) shell-buffer))
+                      ((symbol-function 'agent-shell--prompt-queue-steer-at)
+                       (cl-function
+                        (lambda (&rest args &key on-delivered on-declined &allow-other-keys)
+                          (setq steered args)
+                          (if (eq outcome 'delivered)
+                              (funcall on-delivered 'ok)
+                            (funcall on-declined "busy" nil)))))
+                      ((symbol-function 'agent-shell--prompt-steer)
+                       (lambda (&rest _) (setq sent t)))
+                      ((symbol-function 'agent-shell--echo) #'ignore)
+                      ((symbol-function 'agent-shell-viewport--initialize) #'ignore)
+                      ((symbol-function 'agent-shell-viewport--compose-dispose) #'ignore))
+              (agent-shell-viewport-compose-steer)
+              (should (equal (list (plist-get steered :index)
+                                   (plist-get steered :expected)
+                                   (plist-get steered :prompt))
+                             '(1 "b" "b-edited")))
+              (should-not sent)
+              (if (eq outcome 'delivered)
+                  (should-not agent-shell-viewport--edit-pending-index)
+                (should (= agent-shell-viewport--edit-pending-index 1))
+                (should (equal agent-shell-viewport--edit-pending-prompt "b-edited")))))
         (kill-buffer shell-buffer)))))
 
 ;;; Tests for agent-shell--activity-group-id

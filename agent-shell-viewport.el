@@ -351,6 +351,20 @@ Does nothing when no window shows the buffer."
       (goto-char pos)
       (recenter (when (= pos (point-max)) -1)))))
 
+(cl-defun agent-shell-viewport--compose-route (&key pending send)
+  "Hand the composed draft to the handler for what it edits.
+
+Every compose send command delivers through here, so none can treat an
+edit as a new prompt.  When the draft edits a queued prompt (see
+`agent-shell-prompt-queue-edit'), calls PENDING with that prompt's
+index and original text.  Otherwise calls SEND with no arguments.
+Each handler reads and clears the edit state as its command needs."
+  (if agent-shell-viewport--edit-pending-index
+      (funcall pending
+               agent-shell-viewport--edit-pending-index
+               agent-shell-viewport--edit-pending-prompt)
+    (funcall send)))
+
 (defun agent-shell-viewport-compose-send (&optional keep-composing)
   "Send the viewport composed prompt to the agent shell.
 
@@ -416,23 +430,24 @@ make the promise depend on which key sent it."
     (user-error "Not in a shell viewport buffer"))
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
         (viewport-buffer (current-buffer))
-        (edit-index agent-shell-viewport--edit-pending-index)
-        (edit-prompt agent-shell-viewport--edit-pending-prompt)
         (disposition agent-shell-viewport--compose-disposition)
         (prompt (string-trim (buffer-string))))
-    (setq agent-shell-viewport--edit-pending-index nil
-          agent-shell-viewport--edit-pending-prompt nil)
-    (with-current-buffer shell-buffer
-      (cond
-       (edit-index
-        (agent-shell--prompt-queue-replace
-         :index edit-index :expected edit-prompt :prompt prompt))
-       ((agent-shell-viewport--hold-p)
-        (agent-shell--prompt-send :prompt prompt :disposition disposition))
-       (t
-        (agent-shell--insert-to-shell-buffer
-         :text prompt
-         :submit t))))
+    (agent-shell-viewport--compose-route
+     :pending
+     (lambda (index expected)
+       (setq agent-shell-viewport--edit-pending-index nil
+             agent-shell-viewport--edit-pending-prompt nil)
+       (with-current-buffer shell-buffer
+         (agent-shell--prompt-queue-replace
+          :index index :expected expected :prompt prompt)))
+     :send
+     (lambda ()
+       (with-current-buffer shell-buffer
+         (if (agent-shell-viewport--hold-p)
+             (agent-shell--prompt-send :prompt prompt :disposition disposition)
+           (agent-shell--insert-to-shell-buffer
+            :text prompt
+            :submit t)))))
     ;; Sending and killing viewport should not
     ;; ask user if they want to kill the shell also.
     ;; The intent is clear that they do not want that
@@ -463,22 +478,26 @@ other send path does, so the original does not run as well."
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
         (prompt (string-trim (buffer-string)))
         (disposition (or disposition agent-shell-viewport--compose-disposition))
-        (edit-index agent-shell-viewport--edit-pending-index)
-        (edit-prompt agent-shell-viewport--edit-pending-prompt)
+        (edited nil)
         ;; Sample state before the send below submits, queues or steers.
         (submitted (not (agent-shell-viewport--hold-p))))
-    (setq agent-shell-viewport--edit-pending-index nil
-          agent-shell-viewport--edit-pending-prompt nil)
-    (if edit-index
-        (with-current-buffer shell-buffer
-          (agent-shell--prompt-queue-replace
-           :index edit-index :expected edit-prompt :prompt prompt))
-      (when (string-empty-p prompt)
-        (user-error "Nothing to send"))
-      (with-current-buffer shell-buffer
-        (agent-shell--prompt-send :prompt prompt :disposition disposition)))
+    (agent-shell-viewport--compose-route
+     :pending
+     (lambda (index expected)
+       (setq agent-shell-viewport--edit-pending-index nil
+             agent-shell-viewport--edit-pending-prompt nil
+             edited t)
+       (with-current-buffer shell-buffer
+         (agent-shell--prompt-queue-replace
+          :index index :expected expected :prompt prompt)))
+     :send
+     (lambda ()
+       (when (string-empty-p prompt)
+         (user-error "Nothing to send"))
+       (with-current-buffer shell-buffer
+         (agent-shell--prompt-send :prompt prompt :disposition disposition))))
     (agent-shell-viewport--initialize)
-    (when (and submitted (not edit-index))
+    (when (and submitted (not edited))
       (agent-shell--prompt-queue-echo :active-prompt prompt))))
 
 (cl-defun agent-shell-viewport--compose-dispose (&key keep-composing shell-buffer)
@@ -530,19 +549,22 @@ than queueing a second copy of it."
   (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
     (user-error "Not in a shell viewport buffer"))
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
-        (prompt (string-trim (buffer-string)))
-        (edit-index agent-shell-viewport--edit-pending-index)
-        (edit-prompt agent-shell-viewport--edit-pending-prompt))
+        (prompt (string-trim (buffer-string))))
     (when (string-empty-p prompt)
       (user-error "Nothing to send"))
-    (setq agent-shell-viewport--edit-pending-index nil
-          agent-shell-viewport--edit-pending-prompt nil)
     (agent-shell-viewport--reset-compose-state)
-    (with-current-buffer shell-buffer
-      (if edit-index
-          (agent-shell--prompt-queue-replace
-           :index edit-index :expected edit-prompt :prompt prompt)
-        (agent-shell--prompt-send :prompt prompt :disposition 'queue)))
+    (agent-shell-viewport--compose-route
+     :pending
+     (lambda (index expected)
+       (setq agent-shell-viewport--edit-pending-index nil
+             agent-shell-viewport--edit-pending-prompt nil)
+       (with-current-buffer shell-buffer
+         (agent-shell--prompt-queue-replace
+          :index index :expected expected :prompt prompt)))
+     :send
+     (lambda ()
+       (with-current-buffer shell-buffer
+         (agent-shell--prompt-send :prompt prompt :disposition 'queue))))
     (agent-shell-viewport--initialize)
     (agent-shell-viewport--compose-dispose :keep-composing keep-composing
                                            :shell-buffer shell-buffer)))
@@ -582,47 +604,52 @@ entry; a decline restores the edited draft as that single queued entry."
     (user-error "Steer still pending"))
   (let ((shell-buffer (agent-shell-viewport--shell-buffer))
         (viewport-buffer (current-buffer))
-        (prompt (string-trim (buffer-string)))
-        (edit-index agent-shell-viewport--edit-pending-index)
-        (edit-prompt agent-shell-viewport--edit-pending-prompt))
+        (prompt (string-trim (buffer-string))))
     (when (string-empty-p prompt)
       (user-error "Nothing to send"))
     (agent-shell-viewport--reset-compose-state)
     (setq agent-shell-viewport--steer-pending t
           buffer-read-only t)
     (condition-case err
-        (with-current-buffer shell-buffer
-          (let ((delivered
-                 (lambda (_outcome)
-                   (when (buffer-live-p viewport-buffer)
-                     (with-current-buffer viewport-buffer
-                       (setq buffer-read-only nil
-                             agent-shell-viewport--steer-pending nil
-                             agent-shell-viewport--edit-pending-index nil
-                             agent-shell-viewport--edit-pending-prompt nil)
-                       (agent-shell-viewport--initialize)
-                       (agent-shell-viewport--compose-dispose
-                        :keep-composing keep-composing
-                        :shell-buffer shell-buffer)))))
-                (declined
-                 (lambda (reason _outcome)
-                   (when (buffer-live-p viewport-buffer)
-                     (with-current-buffer viewport-buffer
-                       (setq buffer-read-only nil
-                             agent-shell-viewport--steer-pending nil)
-                       ;; The queue entry went back, so the draft has to
-                       ;; keep tracking it or a later send queues a second
-                       ;; copy.
-                       (when edit-index
-                         (setq agent-shell-viewport--edit-pending-prompt prompt))))
-                   (agent-shell--echo "Steer declined (%s): draft kept"
-                                      (or reason "no outcome")))))
-            (if edit-index
-                (agent-shell--prompt-queue-steer-at
-                 :index edit-index :prompt prompt :expected edit-prompt
-                 :on-delivered delivered :on-declined declined)
-              (agent-shell--prompt-steer
-               :prompt prompt :on-delivered delivered :on-declined declined))))
+        (let* ((edited nil)
+               (delivered
+                (lambda (_outcome)
+                  (when (buffer-live-p viewport-buffer)
+                    (with-current-buffer viewport-buffer
+                      (setq buffer-read-only nil
+                            agent-shell-viewport--steer-pending nil
+                            agent-shell-viewport--edit-pending-index nil
+                            agent-shell-viewport--edit-pending-prompt nil)
+                      (agent-shell-viewport--initialize)
+                      (agent-shell-viewport--compose-dispose
+                       :keep-composing keep-composing
+                       :shell-buffer shell-buffer)))))
+               (declined
+                (lambda (reason _outcome)
+                  (when (buffer-live-p viewport-buffer)
+                    (with-current-buffer viewport-buffer
+                      (setq buffer-read-only nil
+                            agent-shell-viewport--steer-pending nil)
+                      ;; The queue entry went back, so the draft has to
+                      ;; keep tracking it or a later send queues a second
+                      ;; copy.
+                      (when edited
+                        (setq agent-shell-viewport--edit-pending-prompt prompt))))
+                  (agent-shell--echo "Steer declined (%s): draft kept"
+                                     (or reason "no outcome")))))
+          (agent-shell-viewport--compose-route
+           :pending
+           (lambda (index expected)
+             (setq edited t)
+             (with-current-buffer shell-buffer
+               (agent-shell--prompt-queue-steer-at
+                :index index :prompt prompt :expected expected
+                :on-delivered delivered :on-declined declined)))
+           :send
+           (lambda ()
+             (with-current-buffer shell-buffer
+               (agent-shell--prompt-steer
+                :prompt prompt :on-delivered delivered :on-declined declined)))))
       (error
        (when (buffer-live-p viewport-buffer)
          (with-current-buffer viewport-buffer
@@ -656,62 +683,62 @@ resolving to its shell on the next invocation."
   "Send the viewport composed prompt and display response in viewport."
   (declare (modes agent-shell-viewport-edit-mode))
   (interactive)
-  (catch 'exit
-    (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
-      (user-error "Not in a shell viewport buffer"))
-    (let ((shell-buffer (agent-shell-viewport--shell-buffer))
-          (viewport-buffer (current-buffer))
-          (edit-index agent-shell-viewport--edit-pending-index)
-          (edit-prompt agent-shell-viewport--edit-pending-prompt)
-          (prompt (string-trim (buffer-string))))
-      (setq agent-shell-viewport--edit-pending-index nil
-            agent-shell-viewport--edit-pending-prompt nil)
-      ;; Editing keeps the prompt unchanged on empty input rather than
-      ;; erroring (`agent-shell--prompt-queue-replace' no-ops on empty).
-      (when (and (not edit-index) (string-empty-p prompt))
-        (agent-shell-viewport--initialize)
-        (user-error "Nothing to send"))
-      (when edit-index
-        (with-current-buffer shell-buffer
-          (agent-shell--prompt-queue-replace
-           :index edit-index :expected edit-prompt :prompt prompt))
-        (with-current-buffer viewport-buffer
-          ;; Clear first, or `agent-shell-viewport-view-last' parks the
-          ;; edited prompt as a draft.
-          (agent-shell-viewport--initialize)
-          (agent-shell-viewport-view-last))
-        (throw 'exit nil))
-      (when (agent-shell-viewport--hold-p)
-        (let ((disposition agent-shell-viewport--compose-disposition))
-          (with-current-buffer shell-buffer
-            (agent-shell--prompt-send :prompt prompt :disposition disposition)))
-        (with-current-buffer viewport-buffer
-          ;; Clear first, or `agent-shell-viewport-view-last' parks the
-          ;; sent prompt as a draft.
-          (agent-shell-viewport--initialize)
-          (agent-shell-viewport-view-last))
-        (throw 'exit nil))
-      (if (derived-mode-p 'agent-shell-viewport-view-mode)
-          (progn
-            (agent-shell-viewport-edit-mode)
-            (agent-shell-viewport--initialize))
-        (agent-shell-viewport-view-mode)
-        (agent-shell-viewport--initialize :prompt prompt)
-        ;; (setq view-exit-action 'kill-buffer) TODO
-        (when (string-equal prompt "clear")
-          ;; Page indexes restart after a clear.
-          (setq agent-shell-viewport--page-points nil)
-          (agent-shell-viewport-edit-mode)
-          (agent-shell-viewport--initialize))
-        (agent-shell-viewport--recenter)
-        (agent-shell--insert-to-shell-buffer
-         :shell-buffer (agent-shell-viewport--shell-buffer)
-         :text prompt
-         :submit t
-         :no-focus t)
-        ;; TODO: Point should go to beginning of response after submission.
-        ;; TODO: Render prompt markdown?
-        ))))
+  (unless (derived-mode-p 'agent-shell-viewport-edit-mode)
+    (user-error "Not in a shell viewport buffer"))
+  (let ((shell-buffer (agent-shell-viewport--shell-buffer))
+        (viewport-buffer (current-buffer))
+        (prompt (string-trim (buffer-string))))
+    (agent-shell-viewport--compose-route
+     :pending
+     (lambda (index expected)
+       (setq agent-shell-viewport--edit-pending-index nil
+             agent-shell-viewport--edit-pending-prompt nil)
+       ;; Editing keeps the prompt unchanged on empty input rather than
+       ;; erroring (`agent-shell--prompt-queue-replace' no-ops on empty).
+       (with-current-buffer shell-buffer
+         (agent-shell--prompt-queue-replace
+          :index index :expected expected :prompt prompt))
+       (with-current-buffer viewport-buffer
+         ;; Clear first, or `agent-shell-viewport-view-last' parks the
+         ;; edited prompt as a draft.
+         (agent-shell-viewport--initialize)
+         (agent-shell-viewport-view-last)))
+     :send
+     (lambda ()
+       (when (string-empty-p prompt)
+         (agent-shell-viewport--initialize)
+         (user-error "Nothing to send"))
+       (cond
+        ((agent-shell-viewport--hold-p)
+         (let ((disposition agent-shell-viewport--compose-disposition))
+           (with-current-buffer shell-buffer
+             (agent-shell--prompt-send :prompt prompt :disposition disposition)))
+         (with-current-buffer viewport-buffer
+           ;; Clear first, or `agent-shell-viewport-view-last' parks the
+           ;; sent prompt as a draft.
+           (agent-shell-viewport--initialize)
+           (agent-shell-viewport-view-last)))
+        ((derived-mode-p 'agent-shell-viewport-view-mode)
+         (agent-shell-viewport-edit-mode)
+         (agent-shell-viewport--initialize))
+        (t
+         (agent-shell-viewport-view-mode)
+         (agent-shell-viewport--initialize :prompt prompt)
+         ;; (setq view-exit-action 'kill-buffer) TODO
+         (when (string-equal prompt "clear")
+           ;; Page indexes restart after a clear.
+           (setq agent-shell-viewport--page-points nil)
+           (agent-shell-viewport-edit-mode)
+           (agent-shell-viewport--initialize))
+         (agent-shell-viewport--recenter)
+         (agent-shell--insert-to-shell-buffer
+          :shell-buffer (agent-shell-viewport--shell-buffer)
+          :text prompt
+          :submit t
+          :no-focus t)
+         ;; TODO: Point should go to beginning of response after submission.
+         ;; TODO: Render prompt markdown?
+         ))))))
 
 (defun agent-shell-viewport-interrupt ()
   "Interrupt active agent shell request."
